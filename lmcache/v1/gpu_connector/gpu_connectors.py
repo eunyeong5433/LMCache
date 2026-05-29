@@ -2,6 +2,8 @@
 # Standard
 from typing import List, Optional, Tuple, Union
 import abc
+import builtins
+import os
 
 # Third Party
 import torch
@@ -353,7 +355,6 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
-
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
@@ -714,6 +715,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 kv_caches, EngineType.VLLM, layout_hints=self.layout_hints
             )
             assert_is_vllm_flash_attn_or_flash_infer(self.gpu_kv_format)
+            self.block_size = get_block_size(kv_caches, self.gpu_kv_format)
             self.tokens_per_layer = get_tokens_per_layer(kv_caches, self.gpu_kv_format)
             self.elements_per_layer = get_elements_per_layer(
                 kv_caches, self.gpu_kv_format
@@ -769,6 +771,12 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
+        # Capture the destination KV tensors for this generator. Layerwise
+        # loads for multiple requests can coexist in one forward step
+        # (SpecAgent scratch fetch plus normal paged LMCache load). The
+        # connector object is shared, so a later retriever may overwrite
+        # self.kvcaches while this generator is still advancing layer by layer.
+        kvcaches = self.kvcaches
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
@@ -783,7 +791,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        self._lazy_initialize_buffer(self.kvcaches)
+        self._lazy_initialize_buffer(kvcaches)
 
         num_all_tokens = ends[-1] - starts[0]
         slot_mapping_full = slot_mapping[starts[0] : ends[-1]]
@@ -802,7 +810,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         buf_offset = starts[0]
         if self.cache_positions:
             new_positions_full = torch.arange(
-                starts[0], ends[-1], dtype=torch.int64, device=self.kvcaches[0].device
+                starts[0], ends[-1], dtype=torch.int64, device=kvcaches[0].device
             )
 
         buffer_shape = self.get_shape(num_all_tokens)
@@ -826,13 +834,13 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         if self.cache_positions:
             old_positions_full = torch.zeros(
-                (num_all_tokens,), dtype=torch.int64, device=self.kvcaches[0].device
+                (num_all_tokens,), dtype=torch.int64, device=kvcaches[0].device
             )
         for layer_id in range(self.num_layers + 2):
             if layer_id > 1:
                 lmc_ops.single_layer_kv_transfer(
                     self.buffer_mapping[layer_id - 2].tensor,
-                    self.kvcaches[layer_id - 2],
+                    kvcaches[layer_id - 2],
                     slot_mapping_full,
                     lmc_ops.TransferDirection.H2D,
                     self.gpu_kv_format,
@@ -946,13 +954,19 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
+        # Capture the destination KV tensors for this generator. Layerwise
+        # loads for multiple requests can coexist in one forward step
+        # (SpecAgent scratch fetch plus normal paged LMCache load). The
+        # connector object is shared, so a later retriever may overwrite
+        # self.kvcaches while this generator is still advancing layer by layer.
+        kvcaches = self.kvcaches
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        self._lazy_initialize_buffer(self.kvcaches)
+        self._lazy_initialize_buffer(kvcaches)
 
         buf_start = 0
         slot_mapping_chunks = []
@@ -966,7 +980,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             if self.cache_positions:
                 old_positions_chunks.append(
                     torch.arange(
-                        start, end, device=self.kvcaches[0].device, dtype=torch.int64
+                        start, end, device=kvcaches[0].device, dtype=torch.int64
                     )
                 )
 
@@ -984,6 +998,44 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         assert tmp_gpu_buffer_obj.tensor is not None
 
         current_stream = torch.cuda.current_stream()
+        if kwargs.get("specagent_save_current_layer_only", False):
+            for layer_id in range(self.num_layers):
+                memory_objs_layer = memory_objs[layer_id]
+                with torch.cuda.stream(self.store_stream):
+                    self.store_stream.wait_stream(current_stream)
+                    lmc_ops.single_layer_kv_transfer(
+                        tmp_gpu_buffer_obj.tensor,
+                        kvcaches[layer_id],
+                        slot_mapping_full,
+                        lmc_ops.TransferDirection.D2H,
+                        self.gpu_kv_format,
+                        token_major=False,
+                    )
+                    for (buf_start, buf_end), memory_obj, old_positions in zip(
+                        buf_starts_ends,
+                        memory_objs_layer,
+                        old_positions_chunks,
+                        strict=False,
+                    ):
+                        assert memory_obj.tensor is not None
+                        memory_obj.tensor[0].copy_(
+                            tmp_gpu_buffer_obj.tensor[0][buf_start:buf_end],
+                            non_blocking=True,
+                        )
+                        memory_obj.tensor[1].copy_(
+                            tmp_gpu_buffer_obj.tensor[1][buf_start:buf_end],
+                            non_blocking=True,
+                        )
+                        if self.cache_positions:
+                            memory_obj.metadata.cached_positions = old_positions
+
+                self.store_stream.synchronize()
+                logger.debug(f"Finished offloading layer {layer_id}")
+                yield
+
+            tmp_gpu_buffer_obj.ref_count_down()
+            yield
+            return
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
@@ -992,7 +1044,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 self.store_stream.wait_stream(current_stream)
                 lmc_ops.single_layer_kv_transfer(
                     tmp_gpu_buffer_obj.tensor,
-                    self.kvcaches[layer_id],
+                    kvcaches[layer_id],
                     slot_mapping_full,
                     lmc_ops.TransferDirection.D2H,
                     self.gpu_kv_format,
@@ -1064,10 +1116,47 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         # All sizes are in bytes
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
 
-        self.load_stream = torch.cuda.Stream()
+        if os.environ.get("SPECAGENT_LOW_PRIORITY_LOAD_STREAM"):
+            least_priority, _ = torch.cuda.Stream.priority_range()
+            self.load_stream = torch.cuda.Stream(priority=least_priority)
+            logger.info(
+                "[SpecAgent][LMC-STREAM] using low-priority layerwise "
+                "load stream priority=%s",
+                least_priority,
+            )
+        else:
+            self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
+        self._specagent_pending_store_buffer_frees: list[
+            tuple[torch.cuda.Event, MemoryObj]
+        ] = []
 
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
+
+    def _specagent_release_completed_store_buffers(self) -> None:
+        if not self._specagent_pending_store_buffer_frees:
+            return
+        pending: list[tuple[torch.cuda.Event, MemoryObj]] = []
+        for event, memory_obj in self._specagent_pending_store_buffer_frees:
+            if event.query():
+                memory_obj.ref_count_down()
+            else:
+                pending.append((event, memory_obj))
+        self._specagent_pending_store_buffer_frees = pending
+
+    def _specagent_defer_store_buffer_free(self, memory_obj: MemoryObj) -> None:
+        event = torch.cuda.Event()
+        with torch.cuda.stream(self.store_stream):
+            event.record(self.store_stream)
+        self._specagent_pending_store_buffer_frees.append((event, memory_obj))
+
+    def _specagent_wait_one_store_buffer(self) -> None:
+        if not self._specagent_pending_store_buffer_frees:
+            return
+        event, memory_obj = self._specagent_pending_store_buffer_frees.pop(0)
+        event.synchronize()
+        memory_obj.ref_count_down()
+        self._specagent_release_completed_store_buffers()
 
     @classmethod
     def from_metadata(
@@ -1130,6 +1219,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 kv_caches, EngineType.VLLM, layout_hints=self.layout_hints
             )
             assert_is_vllm_flash_attn_or_flash_infer(self.gpu_kv_format)
+            self.block_size = get_block_size(kv_caches, self.gpu_kv_format)
             self.tokens_per_layer = get_tokens_per_layer(kv_caches, self.gpu_kv_format)
             self.elements_per_layer = get_elements_per_layer(
                 kv_caches, self.gpu_kv_format
@@ -1173,10 +1263,15 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
 
+        self._specagent_release_completed_store_buffers()
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
+        # Keep this generator bound to the destination passed at creation.
+        # Another concurrent layerwise retriever may later repoint
+        # self.kvcaches to a different destination.
+        kvcaches = self.kvcaches
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
@@ -1186,12 +1281,24 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
+        offset: int = int(kwargs.get("offset", 0) or 0)
+        defer_tmp_buffer_free = bool(
+            kwargs.get("specagent_defer_store_tmp_buffer_free", True)
+        )
 
-        self._lazy_initialize_buffer(self.kvcaches)
+        self._lazy_initialize_buffer(kvcaches)
 
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
-            slot_mapping_chunks.append(slot_mapping[start:end])
+            local_start = start - offset
+            local_end = end - offset
+            if local_start < 0 or local_end > len(slot_mapping):
+                raise ValueError(
+                    "Invalid layerwise store range after offset adjustment: "
+                    f"start={start} end={end} offset={offset} "
+                    f"slot_mapping_len={len(slot_mapping)}"
+                )
+            slot_mapping_chunks.append(slot_mapping[local_start:local_end])
 
         # TODO(Jiayi): Optimize away this `cat`
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
@@ -1202,29 +1309,67 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         if self.use_gpu:
             buffer_shape = self.get_shape(num_tokens)
             assert self.gpu_buffer_allocator is not None
+            self._specagent_release_completed_store_buffers()
             tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
                 buffer_shape, self.dtype, MemoryFormat.KV_T2D
             )
+            if tmp_gpu_buffer_obj is None:
+                self._specagent_wait_one_store_buffer()
+                tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                    buffer_shape, self.dtype, MemoryFormat.KV_T2D
+                )
             assert tmp_gpu_buffer_obj is not None, (
                 "Failed to allocate GPU buffer in GPUConnector"
             )
             assert tmp_gpu_buffer_obj.tensor is not None
 
-        offset = starts[0]
         current_stream = torch.cuda.current_stream()
+        debug_transfer = bool(os.environ.get("SPECAGENT_LMCACHE_TRANSFER_DEBUG"))
+        debug_limit = int(os.environ.get("SPECAGENT_LMCACHE_TRANSFER_DEBUG_MAX", "8"))
+        debug_target_token_raw = os.environ.get(
+            "SPECAGENT_LMCACHE_TRANSFER_DEBUG_TOKEN")
+        debug_target_token = (
+            int(debug_target_token_raw)
+            if debug_target_token_raw not in (None, "") else None
+        )
+        debug_count = 0
+        bw_profile = bool(os.environ.get("SPECAGENT_BW_PROFILE"))
+        bw_profile_records = []
+        specagent_layer_events = kwargs.get("specagent_layer_events")
+        event_synchronized_load = isinstance(specagent_layer_events, list)
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
-            if sync:
+            if sync and not event_synchronized_load:
                 current_stream.wait_stream(self.load_stream)
             if layer_id > 0:
                 logger.debug(f"Finished loading layer {layer_id - 1}")
 
             # memobj -> gpu_buffer -> kvcaches
+            prof_start = prof_end = None
+            prof_h2d_bytes = 0
+            prof_gpu_copy_bytes = 0
+            if bw_profile:
+                prof_start = torch.cuda.Event(enable_timing=True)
+                prof_end = torch.cuda.Event(enable_timing=True)
             with torch.cuda.stream(self.load_stream):
+                if prof_start is not None:
+                    prof_start.record(self.load_stream)
+                buffer_offset = 0
+                debug_first: Optional[tuple[int, int, int, int]] = None
+                debug_targets: list[tuple[int, int, int, int, int]] = []
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
                 ):
+                    local_start = start - offset
+                    local_end = end - offset
+                    if local_start < 0 or local_end > len(slot_mapping):
+                        raise ValueError(
+                            "Invalid layerwise load range after offset adjustment: "
+                            f"start={start} end={end} offset={offset} "
+                            f"slot_mapping_len={len(slot_mapping)}"
+                        )
+                    chunk_len = local_end - local_start
                     # Validate memory format
                     if self.use_mla:
                         assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT, (
@@ -1236,15 +1381,61 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             f"Expected memory format {MemoryFormat.KV_T2D}, "
                             f"got {memory_obj.metadata.fmt}"
                         )
+                    if bw_profile:
+                        prof_h2d_bytes += int(memory_obj.get_size())
                     if self.use_gpu:
-                        tmp_gpu_buffer_obj.tensor[start - offset : end - offset].copy_(
-                            memory_obj.tensor, non_blocking=True
-                        )
+                        tmp_gpu_buffer_obj.tensor[
+                            buffer_offset : buffer_offset + chunk_len
+                        ].copy_(memory_obj.tensor, non_blocking=True)
+                        if debug_transfer and debug_count < debug_limit:
+                            first_slot = int(slot_mapping[local_start].item())
+                            last_slot = int(slot_mapping[local_end - 1].item())
+                            if debug_first is None:
+                                debug_first = (
+                                    buffer_offset,
+                                    first_slot,
+                                    first_slot // max(1, self.block_size),
+                                    first_slot % max(1, self.block_size),
+                                )
+                            if (
+                                debug_target_token is not None
+                                and start <= debug_target_token < end
+                            ):
+                                target_local = debug_target_token - offset
+                                target_slot = int(slot_mapping[target_local].item())
+                                debug_targets.append((
+                                    debug_target_token,
+                                    buffer_offset + debug_target_token - start,
+                                    target_slot,
+                                    target_slot // max(1, self.block_size),
+                                    target_slot % max(1, self.block_size),
+                                ))
+                            logger.warning(
+                                "[SpecAgent][LMC-H2D-PLAN] layer=%d "
+                                "start=%d end=%d offset=%d local=[%d,%d) "
+                                "chunk_len=%d buffer_offset=%d "
+                                "slot_first=%d slot_last=%d block_first=%d "
+                                "block_last=%d fmt=%s",
+                                layer_id,
+                                start,
+                                end,
+                                offset,
+                                local_start,
+                                local_end,
+                                chunk_len,
+                                buffer_offset,
+                                first_slot,
+                                last_slot,
+                                first_slot // max(1, self.block_size),
+                                last_slot // max(1, self.block_size),
+                                memory_obj.metadata.fmt,
+                            )
+                        buffer_offset += chunk_len
                     else:
                         lmc_ops.single_layer_kv_transfer(
                             memory_obj.tensor,
-                            self.kvcaches[layer_id],
-                            slot_mapping_full,
+                            kvcaches[layer_id],
+                            slot_mapping[local_start:local_end],
                             lmc_ops.TransferDirection.H2D,
                             self.gpu_kv_format,
                             token_major=True,
@@ -1253,17 +1444,173 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 if self.use_gpu:
                     lmc_ops.single_layer_kv_transfer(
                         tmp_gpu_buffer_obj.tensor,
-                        self.kvcaches[layer_id],
+                        kvcaches[layer_id],
                         slot_mapping_full,
                         lmc_ops.TransferDirection.H2D,
                         self.gpu_kv_format,
                         token_major=True,
                     )
+                    if bw_profile:
+                        prof_gpu_copy_bytes = int(
+                            tmp_gpu_buffer_obj.tensor.numel()
+                            * tmp_gpu_buffer_obj.tensor.element_size()
+                        )
+                    if (debug_transfer and debug_count < debug_limit
+                            and debug_first is not None):
+                        debug_points = [
+                            ("CHECK", -1, *debug_first),
+                            *[
+                                ("TARGET", token, buf_idx, slot, block, block_offset)
+                                for token, buf_idx, slot, block, block_offset
+                                in debug_targets
+                            ],
+                        ]
+                        for (
+                            debug_kind,
+                            token,
+                            buf_idx,
+                            slot,
+                            block,
+                            block_offset,
+                        ) in debug_points:
+                            try:
+                                buf = tmp_gpu_buffer_obj.tensor
+                                if buf.dim() == 3 and buf.shape[0] == 2:
+                                    src = buf[:, buf_idx, :].reshape(-1).float()
+                                elif buf.dim() == 3 and buf.shape[1] == 2:
+                                    src = buf[buf_idx, :, :].reshape(-1).float()
+                                else:
+                                    src = buf.reshape(-1).float()[
+                                        buf_idx * 2 * self.hidden_dim_size:
+                                        (buf_idx + 1) * 2 * self.hidden_dim_size
+                                    ]
+                                dst = kvcaches[layer_id][
+                                    :, block, block_offset
+                                ].reshape(-1).float()
+                                max_delta = float((src - dst).abs().max().item())
+                                src_sum = float(src.sum().item())
+                                dst_sum = float(dst.sum().item())
+                                src_zero = int((src == 0).sum().item())
+                                dst_zero = int((dst == 0).sum().item())
+                                src_numel = int(src.numel())
+                                dst_numel = int(dst.numel())
+                            except Exception as exc:  # pragma: no cover - debug only
+                                logger.warning(
+                                    "[SpecAgent][LMC-H2D-%s] failed layer=%d "
+                                    "token=%d buf_idx=%d slot=%d block=%d "
+                                    "block_offset=%d buf_shape=%s dst_shape=%s err=%r",
+                                    debug_kind,
+                                    layer_id,
+                                    token,
+                                    buf_idx,
+                                    slot,
+                                    block,
+                                    block_offset,
+                                    tuple(tmp_gpu_buffer_obj.tensor.shape),
+                                    tuple(kvcaches[layer_id].shape),
+                                    exc,
+                                )
+                            else:
+                                logger.warning(
+                                    "[SpecAgent][LMC-H2D-%s] layer=%d "
+                                    "token=%d buf_idx=%d slot=%d block=%d "
+                                    "block_offset=%d buf_shape=%s dst_shape=%s "
+                                    "src_sum=%.6g dst_sum=%.6g max_delta=%.6g "
+                                    "src_zero=%d/%d dst_zero=%d/%d",
+                                    debug_kind,
+                                    layer_id,
+                                    token,
+                                    buf_idx,
+                                    slot,
+                                    block,
+                                    block_offset,
+                                    tuple(tmp_gpu_buffer_obj.tensor.shape),
+                                    tuple(kvcaches[layer_id].shape),
+                                    src_sum,
+                                    dst_sum,
+                                    max_delta,
+                                    src_zero,
+                                    src_numel,
+                                    dst_zero,
+                                    dst_numel,
+                                )
+                        debug_count += 1
+                if os.environ.get("SPECAGENT_SCRATCH_TAG_DEBUG"):
+                    tag_store = getattr(
+                        builtins, "_specagent_scratch_layer_tags", None)
+                    if not isinstance(tag_store, dict):
+                        tag_store = {}
+                        setattr(
+                            builtins, "_specagent_scratch_layer_tags",
+                            tag_store,
+                        )
+                    kv = kvcaches[layer_id]
+                    tag_store[int(kv[0].data_ptr())] = {
+                        "loaded_layer": int(layer_id),
+                        "slot": int(layer_id % max(1, len(kvcaches))),
+                        "num_tokens": int(num_tokens),
+                        "starts": [int(x) for x in starts],
+                        "ends": [int(x) for x in ends],
+                    }
+                if prof_end is not None:
+                    prof_end.record(self.load_stream)
+                if isinstance(specagent_layer_events, list):
+                    event = torch.cuda.Event()
+                    event.record(self.load_stream)
+                    if layer_id < len(specagent_layer_events):
+                        specagent_layer_events[layer_id] = event
+            if bw_profile and prof_start is not None and prof_end is not None:
+                bw_profile_records.append(
+                    (layer_id, prof_h2d_bytes, prof_gpu_copy_bytes,
+                     prof_start, prof_end)
+                )
         yield
 
         # synchronize the last layer
         if sync:
             current_stream.wait_stream(self.load_stream)
+        if bw_profile and bw_profile_records:
+            total_h2d = 0
+            total_gpu_copy = 0
+            total_ms = 0.0
+            for (
+                layer_id,
+                h2d_bytes,
+                gpu_copy_bytes,
+                start_event,
+                end_event,
+            ) in bw_profile_records:
+                end_event.synchronize()
+                elapsed_ms = float(start_event.elapsed_time(end_event))
+                total_h2d += h2d_bytes
+                total_gpu_copy += gpu_copy_bytes
+                total_ms += elapsed_ms
+                if layer_id < 4 or layer_id == self.num_layers - 1:
+                    logger.info(
+                        "[SpecAgent][LMC-BW] layer=%d h2d_bytes=%d "
+                        "gpu_copy_bytes=%d elapsed_ms=%.3f h2d_gbps=%.3f "
+                        "combined_gbps=%.3f",
+                        layer_id,
+                        h2d_bytes,
+                        gpu_copy_bytes,
+                        elapsed_ms,
+                        h2d_bytes / elapsed_ms / 1.0e6
+                        if elapsed_ms > 0 else 0.0,
+                        (h2d_bytes + gpu_copy_bytes) / elapsed_ms / 1.0e6
+                        if elapsed_ms > 0 else 0.0,
+                    )
+            logger.info(
+                "[SpecAgent][LMC-BW] summary layers=%d h2d_bytes=%d "
+                "gpu_copy_bytes=%d elapsed_ms_sum=%.3f h2d_gbps=%.3f "
+                "combined_gbps=%.3f",
+                len(bw_profile_records),
+                total_h2d,
+                total_gpu_copy,
+                total_ms,
+                total_h2d / total_ms / 1.0e6 if total_ms > 0 else 0.0,
+                (total_h2d + total_gpu_copy) / total_ms / 1.0e6
+                if total_ms > 0 else 0.0,
+            )
 
         # free the buffer memory
         if tmp_gpu_buffer_obj is not None:
@@ -1317,12 +1664,24 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
+        offset: int = int(kwargs.get("offset", 0) or 0)
+        defer_tmp_buffer_free = bool(
+            kwargs.get("specagent_defer_store_tmp_buffer_free", True)
+        )
 
         self._lazy_initialize_buffer(self.kvcaches)
 
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
-            slot_mapping_chunks.append(slot_mapping[start:end])
+            local_start = start - offset
+            local_end = end - offset
+            if local_start < 0 or local_end > len(slot_mapping):
+                raise ValueError(
+                    "Invalid layerwise store range after offset adjustment: "
+                    f"start={start} end={end} offset={offset} "
+                    f"slot_mapping_len={len(slot_mapping)}"
+                )
+            slot_mapping_chunks.append(slot_mapping[local_start:local_end])
 
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
 
@@ -1332,15 +1691,20 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         if self.use_gpu:
             buffer_shape = self.get_shape(num_tokens)
             assert self.gpu_buffer_allocator is not None
+            self._specagent_release_completed_store_buffers()
             tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
                 buffer_shape, self.dtype, MemoryFormat.KV_T2D
             )
+            if tmp_gpu_buffer_obj is None:
+                self._specagent_wait_one_store_buffer()
+                tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                    buffer_shape, self.dtype, MemoryFormat.KV_T2D
+                )
             assert tmp_gpu_buffer_obj is not None, (
                 "Failed to allocate GPU buffer in GPUConnector"
             )
             assert tmp_gpu_buffer_obj.tensor is not None
 
-        offset = starts[0]
         current_stream = torch.cuda.current_stream()
 
         for layer_id in range(self.num_layers):
@@ -1357,36 +1721,56 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         self.gpu_kv_format,
                         token_major=True,
                     )
-                for start, end, memory_obj in zip(
-                    starts, ends, memory_objs_layer, strict=False
-                ):
-                    assert memory_obj.tensor is not None
-                    if self.use_gpu:
-                        memory_obj.tensor.copy_(
-                            tmp_gpu_buffer_obj.tensor[start - offset : end - offset],
-                            non_blocking=True,
-                        )
-                    else:
-                        lmc_ops.single_layer_kv_transfer(
-                            memory_obj.tensor,
-                            self.kvcaches[layer_id],
-                            slot_mapping[start:end],
-                            lmc_ops.TransferDirection.D2H,
-                            self.gpu_kv_format,
-                            token_major=True,
+                    buffer_offset = 0
+                    for start, end, memory_obj in zip(
+                        starts, ends, memory_objs_layer, strict=False
+                    ):
+                        local_start = start - offset
+                        local_end = end - offset
+                        if local_start < 0 or local_end > len(slot_mapping):
+                            raise ValueError(
+                                "Invalid layerwise store range after offset adjustment: "
+                                f"start={start} end={end} offset={offset} "
+                                f"slot_mapping_len={len(slot_mapping)}"
+                            )
+                        chunk_len = local_end - local_start
+                        assert memory_obj.tensor is not None
+                        if self.use_gpu:
+                            memory_obj.tensor.copy_(
+                                tmp_gpu_buffer_obj.tensor[
+                                    buffer_offset : buffer_offset + chunk_len
+                                ],
+                                non_blocking=True,
+                            )
+                            buffer_offset += chunk_len
+                        else:
+                            lmc_ops.single_layer_kv_transfer(
+                                memory_obj.tensor,
+                                self.kvcaches[layer_id],
+                                slot_mapping[local_start:local_end],
+                                lmc_ops.TransferDirection.D2H,
+                                self.gpu_kv_format,
+                                token_major=True,
                         )
                     # Set metadata format
                     if self.use_mla:
                         memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
             yield
-            if sync:
+            if sync and not (
+                defer_tmp_buffer_free
+                and self.use_gpu
+                and layer_id == self.num_layers - 1
+            ):
                 self.store_stream.synchronize()
             logger.debug(f"Finished offloading layer {layer_id}")
 
         # free the buffer memory
         if tmp_gpu_buffer_obj is not None:
-            tmp_gpu_buffer_obj.ref_count_down()
+            if defer_tmp_buffer_free:
+                self._specagent_defer_store_buffer_free(tmp_gpu_buffer_obj)
+            else:
+                tmp_gpu_buffer_obj.ref_count_down()
 
         yield
 

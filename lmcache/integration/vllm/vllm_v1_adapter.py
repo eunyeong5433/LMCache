@@ -3,7 +3,9 @@
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+import builtins
 import os
+import time
 
 # Third Party
 from vllm.config import (
@@ -17,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.parallel_state import (
     get_pp_group,
 )
+from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
@@ -56,6 +59,111 @@ if TYPE_CHECKING:
     from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 
 logger = init_logger(__name__)
+
+
+def _specagent_layer_index(layer_name: str) -> Optional[int]:
+    for part in layer_name.split("."):
+        if part.isdigit():
+            return int(part)
+    return None
+
+
+def _specagent_env_layer_enabled(
+    env_name: str,
+    legacy_env_name: str,
+    layer_idx: Optional[int],
+) -> bool:
+    if layer_idx is None or not os.environ.get("SPECAGENT_KV_FINGERPRINT"):
+        return False
+    layer_spec = os.environ.get(env_name)
+    if layer_spec is None:
+        layer_spec = os.environ.get(legacy_env_name, "0")
+    layer_spec = layer_spec.strip()
+    if layer_spec.lower() in {"all", "*"}:
+        return True
+    try:
+        return int(layer_spec) == layer_idx
+    except ValueError:
+        pass
+    for part in layer_spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, end_s = part.split("-", 1)
+            try:
+                if int(start_s) <= layer_idx <= int(end_s):
+                    return True
+            except ValueError:
+                continue
+        else:
+            try:
+                if int(part) == layer_idx:
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def _specagent_fp_enabled(layer_idx: Optional[int]) -> bool:
+    return _specagent_env_layer_enabled(
+        "SPECAGENT_KV_FINGERPRINT_LAYERS",
+        "SPECAGENT_KV_FINGERPRINT_LAYER",
+        layer_idx,
+    )
+
+
+def _specagent_kv_fp_store() -> dict:
+    store = getattr(builtins, "_specagent_kv_fingerprints", None)
+    if store is None:
+        store = {}
+        setattr(builtins, "_specagent_kv_fingerprints", store)
+    return store
+
+
+def _specagent_cpu_saved_block_store() -> set[tuple[int, int]]:
+    store = getattr(builtins, "_specagent_cpu_saved_blocks", None)
+    if store is None:
+        store = set()
+        setattr(builtins, "_specagent_cpu_saved_blocks", store)
+    return store
+
+
+def _specagent_cpu_saved_chunk_store() -> set[tuple[int, int]]:
+    store = getattr(builtins, "_specagent_cpu_saved_chunks", None)
+    if store is None:
+        store = set()
+        setattr(builtins, "_specagent_cpu_saved_chunks", store)
+    return store
+
+
+def _specagent_kv_fingerprint(
+    key_tokens: torch.Tensor,
+    value_tokens: torch.Tensor,
+) -> tuple[float, float, float, float]:
+    key_f = key_tokens.float()
+    value_f = value_tokens.float()
+    return (
+        float(key_f.sum().item()),
+        float(value_f.sum().item()),
+        float((key_f * key_f).sum().item()),
+        float((value_f * value_f).sum().item()),
+    )
+
+
+def _specagent_kv_fp_delta(
+    lhs: tuple,
+    rhs: tuple,
+) -> tuple[float, float]:
+    sum_delta = max(
+        abs(float(lhs[1]) - float(rhs[1])),
+        abs(float(lhs[2]) - float(rhs[2])),
+    )
+    norm_delta = max(
+        abs(float(lhs[3]) - float(rhs[3])),
+        abs(float(lhs[4]) - float(rhs[4])),
+    )
+    return sum_delta, norm_delta
 
 
 @dataclass
@@ -357,7 +465,44 @@ class ReqMeta:
         else:
             num_tokens_to_save = input_token_len
 
-        # If we need to save, update the number of saved tokens
+        if (
+            tracker.is_decode_phase
+            and tracker.disagg_spec is None
+            and os.environ.get("SPECAGENT_ENABLE_DECODE_SAVE_CLAMP")
+        ):
+            # Decode-time token_ids can include generated suffix tokens before
+            # that suffix is a stable prefix for the next turn. Save only the
+            # stable prompt here; generated chunks are saved when they re-enter
+            # through the next prompt/prefill path.
+            stable_prompt_tokens = tracker.prompt_len
+            if discard_partial_chunks:
+                stable_prompt_tokens = (
+                    stable_prompt_tokens // lmcache_chunk_size
+                    * lmcache_chunk_size
+                )
+            num_tokens_to_save = min(num_tokens_to_save, stable_prompt_tokens)
+
+        num_blocks = len(tracker.allocated_block_ids)
+        max_slot_tokens = num_blocks * block_size
+        if num_tokens_to_save > max_slot_tokens:
+            logger.warning(
+                "[SpecAgent][SAVE-CLAMP] req=%s save_tokens=%d "
+                "slot_capacity=%d blocks=%d block_size=%d reason=no_paged_slot",
+                tracker.req_id,
+                num_tokens_to_save,
+                max_slot_tokens,
+                num_blocks,
+                block_size,
+            )
+            num_tokens_to_save = max_slot_tokens
+            if discard_partial_chunks:
+                num_tokens_to_save = (
+                    num_tokens_to_save // lmcache_chunk_size * lmcache_chunk_size
+                )
+            if skip_leading_tokens > num_tokens_to_save:
+                skip_leading_tokens = num_tokens_to_save
+
+        # If we need to save, update the number of saved tokens.
         if not skip_save:
             tracker.num_saved_tokens = num_tokens_to_save
         save_spec = SaveSpec(skip_leading_tokens, not skip_save)
@@ -376,8 +521,6 @@ class ReqMeta:
                 token_ids, tracker.mm_hashes, tracker.mm_positions
             )
             token_ids = token_ids.tolist()
-
-        num_blocks = len(tracker.allocated_block_ids)
 
         if len(token_ids) > num_blocks * block_size:
             logger.error(
@@ -510,6 +653,8 @@ class LMCacheConnectorV1Impl:
         self.layerwise_retrievers: list[
             Generator[Optional[torch.Tensor], None, None]
         ] = []
+        self._specagent_layerwise_meta: list[dict[str, object]] = []
+        self._specagent_layerwise_check_period = 0
         self._layerwise_save_storers: dict[
             str, Generator[Optional[torch.Tensor], None, None]
         ] = {}
@@ -764,6 +909,14 @@ class LMCacheConnectorV1Impl:
 
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
+        sa_extra = forward_context.additional_kwargs or {}
+        sa_dest_kvcaches = sa_extra.get("destination_kvcaches")
+        sa_dest_slot_mapping = sa_extra.get("destination_slot_mapping") or {}
+        sa_fetch_reqs = sa_extra.get("specagent_fetch_reqs") or {}
+        sa_fetch_token_ranges = sa_extra.get("specagent_fetch_token_ranges") or {}
+        sa_cascade_maps = sa_extra.get("specagent_cascade_maps") or {}
+        sa_fetch_buf_blocks = sa_extra.get("specagent_fetch_buf_blocks")
+        sa_fetch_paged_blocks = sa_extra.get("specagent_fetch_paged_blocks")
 
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
@@ -773,9 +926,32 @@ class LMCacheConnectorV1Impl:
         assert self.lmcache_engine is not None
 
         self.layerwise_retrievers = []
+        self._specagent_layerwise_meta = []
+        sa_lead = max(1, int(sa_extra.get("layer_prefetch_granularity", 2)))
+        self._specagent_prefetch_lead = sa_lead
+        self._specagent_layerwise_check_period = max(1, 2 * sa_lead)
+        if sa_fetch_reqs:
+            logger.info(
+                "[SpecAgent][FETCH-ADAPTER] fetch_reqs=%s metadata_reqs=%s "
+                "has_dest=%s has_slot=%s",
+                list(sa_fetch_reqs.keys()),
+                [req.req_id for req in metadata.requests],
+                sa_dest_kvcaches is not None,
+                list(sa_dest_slot_mapping.keys()),
+            )
 
         for idx, request in enumerate(metadata.requests):
             if request.load_spec is None or not request.load_spec.can_load:
+                if (
+                    request.req_id in sa_fetch_reqs
+                    and os.environ.get("SPECAGENT_FETCH_DEBUG")
+                ):
+                    logger.warning(
+                        "[SpecAgent][FETCH-MASK] skipped req=%s reason=no_load_spec "
+                        "fetch_reason=%s",
+                        request.req_id,
+                        sa_fetch_reqs.get(request.req_id),
+                    )
                 continue
             last_idx = idx
 
@@ -790,12 +966,37 @@ class LMCacheConnectorV1Impl:
                 )
 
             if request.load_spec is None or not request.load_spec.can_load:
+                if (
+                    request.req_id in sa_fetch_reqs
+                    and os.environ.get("SPECAGENT_FETCH_DEBUG")
+                ):
+                    logger.warning(
+                        "[SpecAgent][FETCH-MASK] skipped req=%s reason=no_load_spec "
+                        "fetch_reason=%s",
+                        request.req_id,
+                        sa_fetch_reqs.get(request.req_id),
+                    )
                 continue
 
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = request.slot_mapping.to(self.device)
-            assert len(tokens) == len(slot_mapping)
+            use_specagent_buf = (
+                sa_dest_kvcaches is not None
+                and request.req_id in sa_fetch_reqs
+                and request.req_id in sa_dest_slot_mapping
+            )
+            use_specagent_sparse_mask = (
+                request.req_id in sa_fetch_reqs
+                and request.req_id in sa_fetch_token_ranges
+            )
+            if use_specagent_buf:
+                target_kvcaches = sa_dest_kvcaches
+                slot_mapping = sa_dest_slot_mapping[request.req_id].to(self.device)
+            else:
+                target_kvcaches = kvcaches
+                slot_mapping = request.slot_mapping.to(self.device)
+            if not use_specagent_buf:
+                assert len(tokens) == len(slot_mapping)
 
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
             masked_token_count = (
@@ -806,6 +1007,223 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            if use_specagent_sparse_mask:
+                clipped_ranges = []
+                for start, end in sa_fetch_token_ranges.get(request.req_id, []):
+                    start = max(0, int(start))
+                    end = min(
+                        int(end),
+                        len(tokens),
+                        len(slot_mapping),
+                    )
+                    if start < end:
+                        clipped_ranges.append((start, end))
+                chunk_segments = set()
+                spec_map = sa_cascade_maps.get(request.req_id) or {}
+                # Fetch only the previous-prefix region described by the
+                # SpecAgent block map.  The current observation/prefill suffix
+                # is already being computed by vLLM in this step; including it
+                # in the LMCache mask makes the final partial chunk request a
+                # different key from the CPU-saved prefix.
+                prefix_len = int(spec_map.get("prefix_len", 0) or 0)
+                fetch_prefix_limit = min(
+                    len(tokens), len(slot_mapping), lmcache_cached_tokens
+                )
+                if prefix_len > 0:
+                    fetch_prefix_limit = min(fetch_prefix_limit, prefix_len)
+                for start, end in clipped_ranges:
+                    chunk_start = (
+                        start // self._lmcache_chunk_size
+                        * self._lmcache_chunk_size
+                    )
+                    chunk_end = cdiv(end, self._lmcache_chunk_size) * (
+                        self._lmcache_chunk_size
+                    )
+                    chunk_end = min(
+                        chunk_end,
+                        len(tokens),
+                        len(slot_mapping),
+                        fetch_prefix_limit,
+                    )
+                    if chunk_start < chunk_end:
+                        cur = chunk_start
+                        while cur < chunk_end:
+                            nxt = min(cur + self._lmcache_chunk_size,
+                                      chunk_end)
+                            chunk_segments.add((cur, nxt))
+                            cur = nxt
+                effective_chunk_segments = sorted(chunk_segments)
+                if effective_chunk_segments:
+                    merged_segments = []
+                    cur_start, cur_end = effective_chunk_segments[0]
+                    for seg_start, seg_end in effective_chunk_segments[1:]:
+                        if seg_start <= cur_end:
+                            cur_end = max(cur_end, seg_end)
+                        else:
+                            merged_segments.append((cur_start, cur_end))
+                            cur_start, cur_end = seg_start, seg_end
+                    merged_segments.append((cur_start, cur_end))
+                    effective_chunk_segments = merged_segments
+                fetch_tokens = sum(
+                    end - start for start, end in effective_chunk_segments
+                )
+                logger.info(
+                    "[SpecAgent][FETCH-MASK] req=%s fetch_reason=%s "
+                    "ranges=%s chunk_segments=%s fetch_tokens=%d "
+                    "lmcache_cached_tokens=%d vllm_cached_tokens=%d "
+                    "slot_len=%d target=%s",
+                    request.req_id,
+                    sa_fetch_reqs.get(request.req_id),
+                    clipped_ranges,
+                    effective_chunk_segments,
+                    fetch_tokens,
+                    lmcache_cached_tokens,
+                    request.load_spec.vllm_cached_tokens,
+                    len(slot_mapping),
+                    "scratch" if use_specagent_buf else "paged",
+                )
+                if not effective_chunk_segments:
+                    if os.environ.get("SPECAGENT_FETCH_DEBUG"):
+                        logger.warning(
+                            "[SpecAgent][FETCH-MASK] skipped req=%s "
+                            "reason=no_missing_ranges fetch_reason=%s "
+                            "lmcache_cached_tokens=%d",
+                            request.req_id,
+                            sa_fetch_reqs.get(request.req_id),
+                            lmcache_cached_tokens,
+                        )
+                    continue
+                for seg_i, (seg_start, seg_end) in enumerate(
+                    effective_chunk_segments
+                ):
+                    saved_chunk_store = _specagent_cpu_saved_chunk_store()
+                    never_saved_chunks = []
+                    for chunk_end in range(
+                        seg_start + self._lmcache_chunk_size,
+                        seg_end + 1,
+                        self._lmcache_chunk_size,
+                    ):
+                        token_hash = hash(tuple(
+                            int(t) for t in tokens[:chunk_end]
+                        ))
+                        if (chunk_end, token_hash) not in saved_chunk_store:
+                            never_saved_chunks.append(
+                                (
+                                    chunk_end - self._lmcache_chunk_size,
+                                    chunk_end,
+                                )
+                            )
+                    if never_saved_chunks:
+                        raise RuntimeError(
+                            "[SpecAgent][FETCH-UNAVAILABLE] req=%s "
+                            "fetch_reason=%s segment=[%d,%d) "
+                            "never_saved_chunks=%s. Scheduler advertised "
+                            "these missing blocks as CPU-fetchable, but "
+                            "LMCache save path has no proof that the aligned "
+                            "chunks were ever saved in this process."
+                            % (
+                                request.req_id,
+                                sa_fetch_reqs.get(request.req_id),
+                                seg_start,
+                                seg_end,
+                                never_saved_chunks,
+                            )
+                        )
+                    seg_token_mask = torch.ones(seg_end, dtype=torch.bool)
+                    seg_token_mask[:seg_start] = False
+                    if self.use_layerwise:
+                        # SpecAgent scratch attention may read every fetched
+                        # segment in the current layer.  The generic LMCache
+                        # path only synchronizes the final retriever, but that
+                        # leaves earlier scratch segments on the load stream
+                        # without a current-stream dependency.  Correctness
+                        # requires the layer's scratch blocks to be visible
+                        # before attention consumes them; later this can be
+                        # relaxed with per-segment events/double buffering.
+                        sync = True
+                        layer_events: list[Any] = [None] * self.num_layers
+                        layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                            tokens[:seg_end],
+                            seg_token_mask,
+                            kvcaches=target_kvcaches,
+                            slot_mapping=slot_mapping[:seg_end],
+                            vllm_cached_tokens=seg_start,
+                            sync=sync,
+                            specagent_layer_events=layer_events,
+                        )
+                        first_ret = next(layerwise_retriever)
+                        num_retrieved_tokens = (
+                            int(first_ret.item())
+                            if hasattr(first_ret, "item")
+                            else 0
+                        )
+                        num_expected_tokens = int(seg_token_mask.sum().item())
+                        if num_retrieved_tokens < num_expected_tokens:
+                            raise RuntimeError(
+                                "[SpecAgent][FETCH-INCOMPLETE] req=%s "
+                                "fetch_reason=%s segment=[%d,%d) "
+                                "retrieved=%d expected=%d. Scratch attention "
+                                "for this step is not fully valid unless the "
+                                "missing logical blocks are excluded or recomputed."
+                                % (
+                                    request.req_id,
+                                    sa_fetch_reqs.get(request.req_id),
+                                    seg_start,
+                                    seg_end,
+                                    num_retrieved_tokens,
+                                    num_expected_tokens,
+                                )
+                            )
+                        next(layerwise_retriever)
+                        self.layerwise_retrievers.append(layerwise_retriever)
+                        self._specagent_layerwise_meta.append({
+                            "req_id": request.req_id,
+                            "segment": (seg_start, seg_end),
+                            "expected_tokens": num_expected_tokens,
+                            "layer_events": layer_events,
+                            "copy_to_paged": (
+                                bool(
+                                    use_specagent_buf
+                                    and str(sa_fetch_reqs.get(request.req_id))
+                                    in {
+                                        "observation_paged_restore",
+                                        "verify_paged_restore",
+                                    }
+                                    and sa_fetch_buf_blocks is not None
+                                    and sa_fetch_paged_blocks is not None
+                                )
+                            ),
+                            "src_kvcaches": target_kvcaches,
+                            "dst_kvcaches": kvcaches,
+                            "src_blocks": sa_fetch_buf_blocks,
+                            "dst_blocks": sa_fetch_paged_blocks,
+                        })
+                    else:
+                        ret_token_mask = self.lmcache_engine.retrieve(
+                            tokens[:seg_end],
+                            seg_token_mask,
+                            kvcaches=target_kvcaches,
+                            slot_mapping=slot_mapping[:seg_end],
+                            vllm_cached_tokens=seg_start,
+                            request_configs=request.request_configs,
+                            req_id=request.req_id,
+                        )
+                        num_retrieved_tokens = ret_token_mask.sum().item()
+                        num_expected_tokens = int(seg_token_mask.sum().item())
+                        if num_retrieved_tokens < num_expected_tokens:
+                            raise RuntimeError(
+                                "Request %s retrieved %d tokens, expected %d "
+                                "for SpecAgent segment [%d, %d)"
+                                % (
+                                    request.req_id,
+                                    num_retrieved_tokens,
+                                    num_expected_tokens,
+                                    seg_start,
+                                    seg_end,
+                                )
+                )
+                continue
+
             if self.use_layerwise:
                 if idx == last_idx:
                     sync = True
@@ -817,7 +1235,7 @@ class LMCacheConnectorV1Impl:
                     self.blender.blend(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
-                        kvcaches=kvcaches,
+                        kvcaches=target_kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     )
@@ -825,7 +1243,7 @@ class LMCacheConnectorV1Impl:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
-                        kvcaches=kvcaches,
+                        kvcaches=target_kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
@@ -834,11 +1252,12 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
+                    self._specagent_layerwise_meta.append(None)
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens[:lmcache_cached_tokens],
                     token_mask[:lmcache_cached_tokens],
-                    kvcaches=kvcaches,
+                    kvcaches=target_kvcaches,
                     slot_mapping=slot_mapping[:lmcache_cached_tokens],
                     vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     request_configs=request.request_configs,
@@ -957,17 +1376,359 @@ class LMCacheConnectorV1Impl:
         Args:
             layer_name: the name of that layer
         """
+        requested_layer = _specagent_layer_index(layer_name)
+        if requested_layer is None:
+            requested_layer = self.current_layer
+        requested_layer = max(0, min(int(requested_layer), self.num_layers - 1))
+
+        # retrieve_layer() is already advanced through layer 0 in
+        # start_load_kv().  Each later advance sends the next layer to the GPU
+        # connector, and the connector waits for the previous layer's load
+        # stream before launching that copy.  Therefore one advance per
+        # requested layer is enough to make that layer visible.
+        #
+        # Advancing one layer too far is not just wasted work for SpecAgent:
+        # the scratch ring is indexed by layer % granularity.  With
+        # granularity=2, advancing through layer L+2 before layer L attention
+        # consumes scratch overwrites the exact slot layer L is about to read.
+        # The final layer is the only special case; it needs the generator's
+        # final synchronization advance because there is no layer L+1 copy to
+        # wait on it.
+        target_layer = requested_layer
+        if requested_layer == self.num_layers - 1:
+            target_layer = self.num_layers
+        start_layer = self.current_layer
+        t0 = time.perf_counter()
+        while self.layerwise_retrievers and self.current_layer <= target_layer:
+            self._wait_for_next_layer_load()
+
+        # Wait only for the layer being consumed.  A stream-wide wait would also
+        # wait for the one-group-ahead prefetch launched above, defeating the
+        # overlap we are trying to create.
+        current_stream = torch.cuda.current_stream(self.device)
+        missing_event_dependency = False
+        waited_event = False
+        for meta in self._specagent_layerwise_meta:
+            if meta is None:
+                missing_event_dependency = True
+                continue
+            events = meta.get("layer_events")
+            event = (
+                events[requested_layer]
+                if isinstance(events, list) and requested_layer < len(events)
+                else None
+            )
+            if event is None:
+                missing_event_dependency = True
+                continue
+            current_stream.wait_event(event)
+            waited_event = True
+
+        try:
+            gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
+            load_stream = getattr(gpu_connector, "load_stream", None)
+            if missing_event_dependency and load_stream is not None:
+                current_stream.wait_stream(load_stream)
+        except Exception:
+            logger.exception(
+                "[SpecAgent][FETCH-SYNC] failed to synchronize load stream "
+                "for layer=%s requested_layer=%d target_layer=%d",
+                layer_name,
+                requested_layer,
+                target_layer,
+            )
+            raise
+
+        if os.environ.get("SPECAGENT_OVERLAP_DEBUG"):
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            if requested_layer < 4 or requested_layer == self.num_layers - 1:
+                logger.info(
+                    "[SpecAgent][OVERLAP-WAIT] requested_layer=%d "
+                    "target_layer=%d advanced=%d start_layer=%d end_layer=%d "
+                    "wait_ms=%.3f active_retrievers=%d",
+                    requested_layer,
+                    target_layer,
+                    max(0, self.current_layer - start_layer),
+                    start_layer,
+                    self.current_layer,
+                    elapsed_ms,
+                    len(self.layerwise_retrievers),
+                )
+            if missing_event_dependency and waited_event:
+                logger.warning(
+                    "[SpecAgent][OVERLAP-WAIT] layer=%d used_event_wait=True "
+                    "fallback_stream_wait=True",
+                    requested_layer,
+                )
+
+        return
+
+    def prefetch_next_layer_load(
+        self,
+        layer_name: str,
+        attention_done_event: object | None = None,
+    ) -> None:
+        """Enqueue the next layer's SpecAgent scratch load after attention.
+
+        By default this advances only layer+1.  With a modulo scratch ring,
+        layer+2 reuses the current layer's scratch slot when granularity=2, so
+        it is only safe if the caller provides an event recorded after the
+        current attention kernel.  In that case the load stream waits on the
+        event before enqueuing layer+2, allowing the copy to overlap with FFN
+        without overwriting KV still being consumed by attention.
+        """
+        if not os.environ.get("SPECAGENT_POST_ATTN_PREFETCH"):
+            return
+        requested_layer = _specagent_layer_index(layer_name)
+        if requested_layer is None:
+            requested_layer = self.current_layer
+        requested_layer = max(0, min(int(requested_layer), self.num_layers - 1))
+        min_tokens = int(os.environ.get(
+            "SPECAGENT_POST_ATTN_PREFETCH_MIN_TOKENS", "0"))
+        if min_tokens > 0:
+            total_expected_tokens = sum(
+                int(meta.get("expected_tokens", 0))
+                for meta in self._specagent_layerwise_meta
+                if isinstance(meta, dict)
+            )
+            if total_expected_tokens < min_tokens:
+                return
+        prefetch_ahead = max(1, int(os.environ.get(
+            "SPECAGENT_POST_ATTN_PREFETCH_AHEAD", "1")))
+        first_target_layer = min(requested_layer + 1, self.num_layers - 1)
+        if first_target_layer <= requested_layer:
+            return
+
+        start_layer = self.current_layer
+        t0 = time.perf_counter()
+        while (self.layerwise_retrievers
+               and self.current_layer <= first_target_layer):
+            self._wait_for_next_layer_load()
+
+        second_target_layer = first_target_layer
+        if prefetch_ahead >= 2 and attention_done_event is not None:
+            second_target_layer = min(requested_layer + 2, self.num_layers - 1)
+            if second_target_layer > first_target_layer:
+                try:
+                    gpu_connector = getattr(
+                        self.lmcache_engine, "gpu_connector", None)
+                    load_stream = getattr(gpu_connector, "load_stream", None)
+                    if load_stream is not None:
+                        load_stream.wait_event(attention_done_event)
+                except Exception:
+                    logger.exception(
+                        "[SpecAgent][OVERLAP-PREFETCH] failed to add "
+                        "attention_done dependency for layer=%s",
+                        layer_name,
+                    )
+                    raise
+                while (self.layerwise_retrievers
+                       and self.current_layer <= second_target_layer):
+                    self._wait_for_next_layer_load()
+
+        if os.environ.get("SPECAGENT_OVERLAP_DEBUG") and requested_layer < 4:
+            logger.info(
+                "[SpecAgent][OVERLAP-PREFETCH] requested_layer=%d "
+                "target_layer=%d prefetch_ahead=%d advanced=%d "
+                "start_layer=%d end_layer=%d enqueue_ms=%.3f "
+                "active_retrievers=%d",
+                requested_layer,
+                second_target_layer,
+                prefetch_ahead,
+                max(0, self.current_layer - start_layer),
+                start_layer,
+                self.current_layer,
+                (time.perf_counter() - t0) * 1000.0,
+                len(self.layerwise_retrievers),
+            )
+
+    def _wait_for_next_layer_load(self) -> None:
         if self.layerwise_retrievers:
-            logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
+            logger.debug("Waiting for layer %d to be loaded", self.current_layer)
 
         # Wait for the layer to be loaded
-        for layerwise_retriever in self.layerwise_retrievers:
-            ret_token_mask = next(layerwise_retriever)
+        active_retrievers = []
+        active_meta = []
+        for idx, layerwise_retriever in enumerate(self.layerwise_retrievers):
+            try:
+                ret_token_mask = next(layerwise_retriever)
+            except StopIteration:
+                continue
+
+            meta = (
+                self._specagent_layerwise_meta[idx]
+                if idx < len(self._specagent_layerwise_meta) else None
+            )
+            if meta is not None:
+                fetched_tokens = None
+                if ret_token_mask is not None:
+                    if hasattr(ret_token_mask, "sum"):
+                        fetched_tokens = int(ret_token_mask.sum().item())
+                    elif hasattr(ret_token_mask, "item"):
+                        fetched_tokens = int(ret_token_mask.item())
+                expected_tokens = int(meta.get("expected_tokens") or 0)
+                if (
+                    fetched_tokens is not None
+                    and fetched_tokens < expected_tokens
+                ):
+                    raise RuntimeError(
+                        "[SpecAgent][FETCH-INCOMPLETE] req=%s layer=%d "
+                        "segment=%s fetched=%d expected=%d"
+                        % (
+                            meta.get("req_id"),
+                            self.current_layer,
+                            meta.get("segment"),
+                            fetched_tokens,
+                            expected_tokens,
+                        )
+                    )
+                should_log_ready = (
+                    self.current_layer == 0
+                    or self.current_layer == self.num_layers - 1
+                )
+                if should_log_ready:
+                    logger.info(
+                        "[SpecAgent][FETCH-READY] req=%s layer=%d "
+                        "segment=%s expected_tokens=%d ret_tokens=%s",
+                        meta.get("req_id"),
+                        self.current_layer,
+                        meta.get("segment"),
+                        expected_tokens,
+                        (
+                            "deferred"
+                            if fetched_tokens is None else str(fetched_tokens)
+                        ),
+                    )
+                if (
+                    meta.get("copy_to_paged")
+                    and self.current_layer != self.num_layers - 1
+                ):
+                    events = meta.get("layer_events")
+                    event = (
+                        events[self.current_layer]
+                        if isinstance(events, list)
+                        and self.current_layer < len(events)
+                        else None
+                    )
+                    current_stream = torch.cuda.current_stream()
+                    if event is not None:
+                        current_stream.wait_event(event)
+                    src_blocks = meta.get("src_blocks")
+                    dst_blocks = meta.get("dst_blocks")
+                    src_kvcaches = meta.get("src_kvcaches")
+                    dst_kvcaches = meta.get("dst_kvcaches")
+                    if (
+                        src_blocks is not None
+                        and dst_blocks is not None
+                        and src_kvcaches
+                        and dst_kvcaches
+                    ):
+                        layer_idx = self.current_layer
+                        current_platform.insert_blocks_to_device(
+                            src_kvcaches[layer_idx],
+                            dst_kvcaches[layer_idx],
+                            src_blocks,
+                            dst_blocks,
+                        )
+                        if isinstance(events, list):
+                            copied_event = torch.cuda.Event()
+                            copied_event.record(current_stream)
+                            events[layer_idx] = copied_event
+                        if os.environ.get("SPECAGENT_FETCH_DEBUG") and (
+                            layer_idx == 0
+                            or layer_idx == self.num_layers - 1
+                        ):
+                            logger.info(
+                                "[SpecAgent][PAGED-RESTORE-COPY] req=%s "
+                                "layer=%d blocks=%d",
+                                meta.get("req_id"),
+                                layer_idx,
+                                int(src_blocks.numel())
+                                if hasattr(src_blocks, "numel") else 0,
+                            )
 
             if self.current_layer == self.num_layers - 1:
-                assert ret_token_mask is not None
-                num_retrieved_tokens = ret_token_mask.sum().item()
+                final_ret = ret_token_mask
+                while True:
+                    try:
+                        next_ret = next(layerwise_retriever)
+                    except StopIteration:
+                        break
+                    if next_ret is not None:
+                        final_ret = next_ret
+
+                if meta is not None and final_ret is not None:
+                    if hasattr(final_ret, "sum"):
+                        final_tokens = int(final_ret.sum().item())
+                    elif hasattr(final_ret, "item"):
+                        final_tokens = int(final_ret.item())
+                    else:
+                        final_tokens = 0
+                    expected_tokens = int(meta.get("expected_tokens") or 0)
+                    if final_tokens < expected_tokens:
+                        raise RuntimeError(
+                            "[SpecAgent][FETCH-INCOMPLETE] req=%s layer=%d "
+                            "segment=%s final_fetched=%d expected=%d"
+                            % (
+                                meta.get("req_id"),
+                                self.current_layer,
+                                meta.get("segment"),
+                                final_tokens,
+                                expected_tokens,
+                            )
+                        )
+                    logger.info(
+                        "[SpecAgent][FETCH-READY] req=%s layer=%d "
+                        "segment=%s expected_tokens=%d ret_tokens=%d final=True",
+                        meta.get("req_id"),
+                        self.current_layer,
+                        meta.get("segment"),
+                        expected_tokens,
+                        final_tokens,
+                    )
+                    if meta.get("copy_to_paged"):
+                        src_blocks = meta.get("src_blocks")
+                        dst_blocks = meta.get("dst_blocks")
+                        src_kvcaches = meta.get("src_kvcaches")
+                        dst_kvcaches = meta.get("dst_kvcaches")
+                        if (
+                            src_blocks is not None
+                            and dst_blocks is not None
+                            and src_kvcaches
+                            and dst_kvcaches
+                        ):
+                            layer_idx = self.current_layer
+                            current_platform.insert_blocks_to_device(
+                                src_kvcaches[layer_idx],
+                                dst_kvcaches[layer_idx],
+                                src_blocks,
+                                dst_blocks,
+                            )
+                            events = meta.get("layer_events")
+                            if isinstance(events, list):
+                                copied_event = torch.cuda.Event()
+                                copied_event.record(torch.cuda.current_stream())
+                                events[layer_idx] = copied_event
+                            if os.environ.get("SPECAGENT_FETCH_DEBUG"):
+                                logger.info(
+                                    "[SpecAgent][PAGED-RESTORE-COPY] req=%s "
+                                    "layer=%d blocks=%d final=True",
+                                    meta.get("req_id"),
+                                    layer_idx,
+                                    int(src_blocks.numel())
+                                    if hasattr(src_blocks, "numel") else 0,
+                                )
+                num_retrieved_tokens = (
+                    final_ret.sum().item()
+                    if final_ret is not None and hasattr(final_ret, "sum") else 0
+                )
                 logger.info(f"Retrieved {num_retrieved_tokens} tokens")
+                continue
+            active_retrievers.append(layerwise_retriever)
+            active_meta.append(meta)
+
+        self.layerwise_retrievers = active_retrievers
+        self._specagent_layerwise_meta = active_meta
 
         if self.layerwise_retrievers:
             self.current_layer += 1
@@ -1012,44 +1773,249 @@ class LMCacheConnectorV1Impl:
 
         kvcaches = list(self.kv_caches.values())
         is_first = True
+        layer_idx = _specagent_layer_index(layer_name)
+        fp_enabled = (
+            _specagent_fp_enabled(layer_idx)
+            and os.environ.get("SPECAGENT_KV_FINGERPRINT_PRESTORE")
+        )
+        fp_store = _specagent_kv_fp_store() if fp_enabled else None
 
         for request in connector_metadata.requests:
             save_spec = request.save_spec
+            specagent_save_debug = (
+                os.environ.get("SPECAGENT_SAVE_DEBUG")
+                and request.load_spec is not None
+                and request.load_spec.can_load
+            )
             if (
                 save_spec is None or not save_spec.can_save
             ) and self.kv_role != "kv_producer":
+                if specagent_save_debug:
+                    logger.warning(
+                        "[SpecAgent][SAVE-LAYER-SKIP] req=%s layer=%s "
+                        "reason=no_save_spec can_save=%s meta_tokens=%d",
+                        request.req_id,
+                        layer_name,
+                        save_spec.can_save if save_spec is not None else None,
+                        len(request.token_ids),
+                    )
                 continue
+
+            token_ids = request.token_ids
+            assert isinstance(token_ids, list)
+
+            slot_mapping = request.slot_mapping
+            assert isinstance(slot_mapping, torch.Tensor)
+            assert len(slot_mapping) == len(token_ids)
+
+            # TODO: have a pre-allocated buffer to hold the slot_mappings
+            slot_mapping = slot_mapping.to(self.device)
+
+            if self.kv_role == "kv_producer":
+                skip_leading_tokens = 0
+            else:
+                assert save_spec is not None
+                skip_leading_tokens = save_spec.skip_leading_tokens
+
+                if skip_leading_tokens >= len(token_ids):
+                    if specagent_save_debug:
+                        logger.warning(
+                            "[SpecAgent][SAVE-LAYER-SKIP] req=%s layer=%s "
+                            "reason=skip_ge_len skip=%d token_len=%d",
+                            request.req_id,
+                            layer_name,
+                            skip_leading_tokens,
+                            len(token_ids),
+                        )
+                    continue  # skip this request
+                # Align to lmcache chunk size
+                skip_leading_tokens = (
+                    skip_leading_tokens
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
+                )
+                if skip_leading_tokens >= len(token_ids):
+                    if specagent_save_debug:
+                        logger.warning(
+                            "[SpecAgent][SAVE-LAYER-SKIP] req=%s layer=%s "
+                            "reason=aligned_skip_ge_len skip=%d token_len=%d",
+                            request.req_id,
+                            layer_name,
+                            skip_leading_tokens,
+                            len(token_ids),
+                        )
+                    continue  # skip this request after chunk alignment
+
+            store_mask = torch.ones(len(token_ids), dtype=torch.bool)
+            store_mask[:skip_leading_tokens] = False
+            if skip_leading_tokens > 0:
+                aligned_token_len = (
+                    len(token_ids)
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
+                )
+                if aligned_token_len <= skip_leading_tokens:
+                    if specagent_save_debug:
+                        logger.warning(
+                            "[SpecAgent][SAVE-LAYER-SKIP] req=%s layer=%s "
+                            "reason=no_aligned_suffix skip=%d token_len=%d "
+                            "aligned_len=%d",
+                            request.req_id,
+                            layer_name,
+                            skip_leading_tokens,
+                            len(token_ids),
+                            aligned_token_len,
+                        )
+                    continue
+                token_ids = token_ids[:aligned_token_len]
+                slot_mapping = slot_mapping[:aligned_token_len]
+                store_mask = store_mask[:aligned_token_len]
+
+            if specagent_save_debug:
+                logger.warning(
+                    "[SpecAgent][SAVE-LAYER-START] req=%s layer=%s "
+                    "store_tokens=%d total_tokens=%d skip=%d",
+                    request.req_id,
+                    layer_name,
+                    len(token_ids) - skip_leading_tokens,
+                    len(token_ids),
+                    skip_leading_tokens,
+                )
+
+            if (
+                layer_idx == 0
+                and os.environ.get("SPECAGENT_LEGACY_PRESTORE_PROOF")
+            ):
+                saved_block_store = _specagent_cpu_saved_block_store()
+                saved_chunk_store = _specagent_cpu_saved_chunk_store()
+                block_start = skip_leading_tokens // self._block_size
+                aligned_saved_len = (
+                    len(token_ids)
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
+                )
+                chunk_start = skip_leading_tokens // self._lmcache_chunk_size
+                chunk_end = aligned_saved_len // self._lmcache_chunk_size
+                newly_recorded_chunks = 0
+                for chunk_i in range(chunk_start, chunk_end):
+                    tok_start = chunk_i * self._lmcache_chunk_size
+                    tok_end = tok_start + self._lmcache_chunk_size
+                    if tok_end > aligned_saved_len:
+                        break
+                    if not bool(store_mask[tok_start:tok_end].all().item()):
+                        continue
+                    token_hash = hash(tuple(int(t) for t in token_ids[:tok_end]))
+                    key = (tok_end, token_hash)
+                    if key not in saved_chunk_store:
+                        newly_recorded_chunks += 1
+                    saved_chunk_store.add(key)
+                block_end = aligned_saved_len // self._block_size
+                newly_recorded = 0
+                for logical_i in range(block_start, block_end):
+                    tok_start = logical_i * self._block_size
+                    tok_end = tok_start + self._block_size
+                    if tok_end > aligned_saved_len:
+                        break
+                    if not bool(store_mask[tok_start:tok_end].all().item()):
+                        continue
+                    token_hash = hash(tuple(int(t) for t in token_ids[:tok_end]))
+                    key = (logical_i, token_hash)
+                    if key not in saved_block_store:
+                        newly_recorded += 1
+                    saved_block_store.add(key)
+                if (
+                    (newly_recorded or newly_recorded_chunks)
+                    and os.environ.get("SPECAGENT_SAVE_DEBUG")
+                ):
+                    logger.warning(
+                        "[SpecAgent][CPU-SAVED-BLOCKS] req=%s "
+                        "new_blocks=%d total_blocks=%d new_chunks=%d "
+                        "total_chunks=%d token_range=[%d,%d)",
+                        request.req_id,
+                        newly_recorded,
+                        len(saved_block_store),
+                        newly_recorded_chunks,
+                        len(saved_chunk_store),
+                        skip_leading_tokens,
+                        len(token_ids),
+                    )
+
+            if fp_enabled and fp_store is not None:
+                block_start = skip_leading_tokens // self._block_size
+                block_end = cdiv(len(token_ids), self._block_size)
+                saved_blocks = 0
+                for logical_i in range(block_start, block_end):
+                    tok_start = logical_i * self._block_size
+                    tok_end = min(tok_start + self._block_size,
+                                  len(token_ids))
+                    if tok_start >= tok_end:
+                        continue
+                    token_hash = hash(tuple(
+                        int(t) for t in token_ids[:tok_end]
+                    ))
+                    slots = slot_mapping[tok_start:tok_end].long()
+                    phys = torch.div(
+                        slots, self._block_size, rounding_mode="floor"
+                    )
+                    offs = slots % self._block_size
+                    kv_tokens = kv_layer[:, phys, offs]
+                    fp_key = (layer_idx, logical_i, token_hash)
+                    fp_value = (
+                        tok_end - tok_start,
+                        *_specagent_kv_fingerprint(
+                            kv_tokens[0], kv_tokens[1],
+                        ),
+                    )
+                    old_versions = fp_store.get(fp_key)
+                    if old_versions is None:
+                        old_versions = []
+                    elif isinstance(old_versions, tuple):
+                        old_versions = [old_versions]
+                    best_sum_delta = 0.0
+                    best_norm_delta = 0.0
+                    if old_versions:
+                        deltas = [
+                            _specagent_kv_fp_delta(old_fp, fp_value)
+                            for old_fp in old_versions
+                        ]
+                        best_sum_delta, best_norm_delta = min(
+                            deltas, key=lambda item: (item[0], item[1])
+                        )
+                        if best_sum_delta > 1e-3 or best_norm_delta > 1e-2:
+                            logger.warning(
+                                "[SpecAgent][KV-FP-VERSION] req=%s "
+                                "layer=%d logical=%d token_range=[%d,%d) "
+                                "prev_versions=%d best_sum_delta=%.6g "
+                                "best_norm_delta=%.6g",
+                                request.req_id,
+                                layer_idx,
+                                logical_i,
+                                tok_start,
+                                tok_end,
+                                len(old_versions),
+                                best_sum_delta,
+                                best_norm_delta,
+                            )
+                    old_versions.append(fp_value)
+                    # Cap per-key history so debug metadata stays bounded.
+                    if len(old_versions) > 8:
+                        old_versions = old_versions[-8:]
+                    fp_store[fp_key] = old_versions
+                    saved_blocks += 1
+                if saved_blocks:
+                    logger.info(
+                        "[SpecAgent][KV-FP-SAVE] req=%s layer=%d "
+                        "blocks=%d token_range=[%d,%d) store_size=%d",
+                        request.req_id,
+                        layer_idx,
+                        saved_blocks,
+                        skip_leading_tokens,
+                        len(token_ids),
+                        len(fp_store),
+                    )
 
             layerwise_storer = self._layerwise_save_storers.get(request.req_id)
             if layerwise_storer is None:
-                token_ids = request.token_ids
-                assert isinstance(token_ids, list)
-
-                slot_mapping = request.slot_mapping
-                assert isinstance(slot_mapping, torch.Tensor)
-                assert len(slot_mapping) == len(token_ids)
-
-                # TODO: have a pre-allocated buffer to hold the slot_mappings
-                slot_mapping = slot_mapping.to(self.device)
-
-                if self.kv_role == "kv_producer":
-                    skip_leading_tokens = 0
-                else:
-                    assert save_spec is not None
-                    skip_leading_tokens = save_spec.skip_leading_tokens
-
-                    if skip_leading_tokens == len(token_ids):
-                        continue  # skip this request
-                    # Align to lmcache chunk size
-                    skip_leading_tokens = (
-                        skip_leading_tokens
-                        // self._lmcache_chunk_size
-                        * self._lmcache_chunk_size
-                    )
-
-                store_mask = torch.ones(len(token_ids), dtype=torch.bool)
-                store_mask[:skip_leading_tokens] = False
-
                 logger.debug(
                     "Storing KV cache for %d out of %d tokens "
                     "(skip_leading_tokens=%d) for request %s",
@@ -1069,6 +2035,8 @@ class LMCacheConnectorV1Impl:
                     offset=skip_leading_tokens,
                     sync=is_first,
                     req_id=request.req_id,
+                    specagent_block_size=self._block_size,
+                    specagent_save_current_layer_only=True,
                 )
                 self._layerwise_save_storers[request.req_id] = layerwise_storer
                 if is_first:
@@ -1137,7 +2105,7 @@ class LMCacheConnectorV1Impl:
                     skip_leading_tokens, request.disagg_spec.num_transferred_tokens
                 )
 
-            if skip_leading_tokens == len(token_ids):
+            if skip_leading_tokens >= len(token_ids):
                 continue  # skip this request
             # Align to lmcache chunk size
             skip_leading_tokens = (
@@ -1145,9 +2113,22 @@ class LMCacheConnectorV1Impl:
                 // self._lmcache_chunk_size
                 * self._lmcache_chunk_size
             )
+            if skip_leading_tokens >= len(token_ids):
+                continue  # skip this request after chunk alignment
 
             store_mask = torch.ones(len(token_ids), dtype=torch.bool)
             store_mask[:skip_leading_tokens] = False
+            if skip_leading_tokens > 0:
+                aligned_token_len = (
+                    len(token_ids)
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
+                )
+                if aligned_token_len <= skip_leading_tokens:
+                    continue
+                token_ids = token_ids[:aligned_token_len]
+                slot_mapping = slot_mapping[:aligned_token_len]
+                store_mask = store_mask[:aligned_token_len]
 
             logger.debug(
                 "Storing KV cache for %d out of %d tokens "
@@ -1439,6 +2420,395 @@ class LMCacheConnectorV1Impl:
         force_skip_save = self.kv_role == "kv_consumer" or self.force_skip_save
 
         meta = LMCacheConnectorMetadata()
+        specagent_fetch_reqs = (
+            getattr(scheduler_output, "specagent_fetch_reqs", None) or {}
+        )
+        specagent_token_counts = (
+            getattr(scheduler_output, "specagent_fetch_token_counts", None) or {}
+        )
+        specagent_cpu_prefix_blocks = (
+            getattr(scheduler_output, "specagent_fetch_cpu_prefix_blocks", None)
+            or {}
+        )
+        specagent_token_ranges = (
+            getattr(scheduler_output, "specagent_fetch_token_ranges", None) or {}
+        )
+        specagent_fetch_resident_logical_indices = (
+            getattr(
+                scheduler_output,
+                "specagent_fetch_resident_logical_indices",
+                None,
+            )
+            or {}
+        )
+        specagent_skip_save_reqs = (
+            getattr(scheduler_output, "specagent_skip_save_reqs", None) or {}
+        )
+        specagent_current_block_ids = (
+            getattr(scheduler_output, "specagent_current_block_ids", None) or {}
+        )
+        emitted_req_ids: set[str] = set()
+
+        def flatten_block_ids(
+            block_ids: Union[tuple[list[int], ...], list[int], None],
+        ) -> list[int] | None:
+            if block_ids is None:
+                return None
+            if isinstance(block_ids, tuple):
+                if len(block_ids) == 0:
+                    return []
+                return list(block_ids[0])
+            if isinstance(block_ids, list):
+                return [
+                    int(i)
+                    for elem in block_ids
+                    for i in (elem if isinstance(elem, list) else [elem])
+                ]
+            return None
+
+        def sync_authoritative_block_ids(
+            request_tracker: RequestTracker,
+            req_id: str,
+            reason: str,
+        ) -> None:
+            authoritative = flatten_block_ids(
+                specagent_current_block_ids.get(req_id)
+            )
+            if authoritative is None:
+                return
+            old = request_tracker.allocated_block_ids
+            if old == authoritative:
+                return
+            if os.environ.get("SPECAGENT_BLOCKMAP_DEBUG"):
+                old_preview = old[:8]
+                new_preview = authoritative[:8]
+                logger.warning(
+                    "[SpecAgent][BLOCKMAP-SYNC] req=%s reason=%s "
+                    "old_blocks=%d new_blocks=%d old_preview=%s "
+                    "new_preview=%s",
+                    req_id,
+                    reason,
+                    len(old),
+                    len(authoritative),
+                    old_preview,
+                    new_preview,
+                )
+            request_tracker.allocated_block_ids = authoritative
+
+        def specagent_step_skip_save(req_id: str) -> bool:
+            # Explicitly skipped requests are draft/polluted paths and must
+            # not write KV.  SpecAgent fetch requests are different: their
+            # fetched prefix may live in scratch while paged KV still has holes,
+            # but any newly computed observation/verified suffix is valid KV.
+            # apply_specagent_scratch_save_floor() raises skip_leading_tokens to
+            # the first safe suffix position so the prefix is not re-saved from
+            # stale paged slots while the new stable suffix can still be backed
+            # up to CPU.
+            if req_id in specagent_fetch_reqs:
+                return False
+            return req_id in specagent_skip_save_reqs
+
+        def set_step_skip_save(
+            request_tracker: RequestTracker, req_id: str
+        ) -> bool:
+            old_skip_save = request_tracker.skip_save
+            if specagent_step_skip_save(req_id):
+                request_tracker.skip_save = True
+                if os.environ.get("SPECAGENT_SAVE_DEBUG"):
+                    logger.warning(
+                        "[SpecAgent][SAVE-SKIP] req=%s reason=%s",
+                        req_id,
+                        specagent_skip_save_reqs.get(req_id),
+                    )
+            return old_skip_save
+
+        def restore_step_skip_save(
+            request_tracker: RequestTracker, old_skip_save: bool
+        ) -> None:
+            request_tracker.skip_save = old_skip_save
+
+        def apply_specagent_scratch_save_floor(
+            request_tracker: RequestTracker,
+            req_id: str,
+            safe_suffix_start: Optional[int] = None,
+        ) -> int:
+            old_saved_tokens = request_tracker.num_saved_tokens
+            if req_id not in specagent_fetch_reqs:
+                return old_saved_tokens
+
+            if safe_suffix_start is None:
+                # SpecAgent full-attention recovery may consume missing prefix
+                # blocks from the scratch buffer while the paged table still has
+                # holes for those logical positions. Saving any part of that
+                # prefix from paged KV can overwrite the valid CPU copy with
+                # hole/stale KV. The only safe save range for this scheduler
+                # step starts after the prefix that attention read.
+                n_scheduled = int(
+                    scheduler_output.num_scheduled_tokens.get(req_id, 0) or 0
+                )
+                safe_suffix_start = max(
+                    0, len(request_tracker.token_ids) - n_scheduled,
+                )
+
+            min_save_start = max(old_saved_tokens, safe_suffix_start)
+            save_floor = (
+                min_save_start // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
+            if save_floor < min_save_start:
+                boundary_chunk = (save_floor, save_floor + self._lmcache_chunk_size)
+                cpu_prefix_blocks = int(
+                    specagent_cpu_prefix_blocks.get(req_id, 0) or 0
+                )
+                resident_groups = (
+                    specagent_fetch_resident_logical_indices.get(req_id, ())
+                )
+                resident_logical: set[int] = set()
+                for group in resident_groups:
+                    if isinstance(group, (list, tuple, set)):
+                        resident_logical.update(int(i) for i in group)
+                    else:
+                        resident_logical.add(int(group))
+                overlaps_missing = False
+                for logical_i in range(cpu_prefix_blocks):
+                    if logical_i in resident_logical:
+                        continue
+                    block_start = logical_i * self._block_size
+                    block_end = block_start + self._block_size
+                    if (
+                        block_start < boundary_chunk[1]
+                        and boundary_chunk[0] < block_end
+                    ):
+                        overlaps_missing = True
+                        break
+                if overlaps_missing:
+                    save_floor = (
+                        cdiv(min_save_start, self._lmcache_chunk_size)
+                        * self._lmcache_chunk_size
+                    )
+            if save_floor > old_saved_tokens:
+                request_tracker.num_saved_tokens = save_floor
+                if os.environ.get("SPECAGENT_SAVE_DEBUG"):
+                    logger.warning(
+                        "[SpecAgent][SAVE-FLOOR] req=%s reason=%s "
+                        "old_saved=%d safe_suffix_start=%d save_floor=%d "
+                        "token_len=%d scheduled=%d",
+                        req_id,
+                        specagent_fetch_reqs.get(req_id),
+                        old_saved_tokens,
+                        safe_suffix_start,
+                        save_floor,
+                        len(request_tracker.token_ids),
+                        int(
+                            scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                            or 0
+                        ),
+                    )
+            return old_saved_tokens
+
+        def restore_specagent_scratch_save_floor_if_unsaved(
+            request_tracker: RequestTracker,
+            req_id: str,
+            old_saved_tokens: int,
+            req_meta: Optional[ReqMeta],
+        ) -> None:
+            if req_id not in specagent_fetch_reqs:
+                return
+            can_save = (
+                req_meta is not None
+                and req_meta.save_spec is not None
+                and req_meta.save_spec.can_save
+            )
+            if not can_save:
+                request_tracker.num_saved_tokens = old_saved_tokens
+
+        def sanitize_specagent_scratch_save_meta(
+            req_id: str,
+            req_meta: Optional[ReqMeta],
+        ) -> Optional[ReqMeta]:
+            if req_id not in specagent_fetch_reqs or req_meta is None:
+                return req_meta
+            save_spec = req_meta.save_spec
+            if save_spec is None or not save_spec.can_save:
+                return req_meta
+            skip_leading_tokens = (
+                save_spec.skip_leading_tokens
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
+            aligned_token_len = (
+                len(req_meta.token_ids)
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
+            if aligned_token_len <= skip_leading_tokens:
+                save_spec.can_save = False
+                if os.environ.get("SPECAGENT_SAVE_DEBUG"):
+                    logger.warning(
+                        "[SpecAgent][SAVE-SUFFIX-SKIP] req=%s reason=%s "
+                        "skip=%d token_len=%d aligned_len=%d",
+                        req_id,
+                        specagent_fetch_reqs.get(req_id),
+                        skip_leading_tokens,
+                        len(req_meta.token_ids),
+                        aligned_token_len,
+                    )
+                return req_meta
+            if aligned_token_len < len(req_meta.token_ids):
+                req_meta.token_ids = req_meta.token_ids[:aligned_token_len]
+                req_meta.slot_mapping = req_meta.slot_mapping[:aligned_token_len]
+                if os.environ.get("SPECAGENT_SAVE_DEBUG"):
+                    logger.warning(
+                        "[SpecAgent][SAVE-SUFFIX-TRIM] req=%s reason=%s "
+                        "skip=%d token_len=%d aligned_len=%d",
+                        req_id,
+                        specagent_fetch_reqs.get(req_id),
+                        skip_leading_tokens,
+                        len(req_meta.token_ids),
+                        aligned_token_len,
+                    )
+            save_spec.skip_leading_tokens = skip_leading_tokens
+            return req_meta
+
+        def debug_specagent_req_meta(
+            stage: str,
+            req_id: str,
+            request_tracker: RequestTracker,
+            req_meta: Optional[ReqMeta],
+            load_spec: Optional[LoadSpec],
+        ) -> None:
+            if (
+                req_id not in specagent_fetch_reqs
+                or not os.environ.get("SPECAGENT_SAVE_DEBUG")
+            ):
+                return
+            save_spec = req_meta.save_spec if req_meta is not None else None
+            logger.warning(
+                "[SpecAgent][SAVE-REQMETA] stage=%s req=%s reason=%s "
+                "tracker_tokens=%d tracker_saved=%d tracker_skip_save=%s "
+                "blocks=%d slot_capacity=%d meta=%s meta_tokens=%d "
+                "can_save=%s skip=%s load=%s lmcache_cached=%s vllm_cached=%s",
+                stage,
+                req_id,
+                specagent_fetch_reqs.get(req_id),
+                len(request_tracker.token_ids),
+                request_tracker.num_saved_tokens,
+                request_tracker.skip_save,
+                len(request_tracker.allocated_block_ids),
+                len(request_tracker.allocated_block_ids) * self._block_size,
+                req_meta is not None,
+                len(req_meta.token_ids) if req_meta is not None else 0,
+                save_spec.can_save if save_spec is not None else None,
+                save_spec.skip_leading_tokens if save_spec is not None else None,
+                load_spec is not None,
+                load_spec.lmcache_cached_tokens if load_spec is not None else None,
+                load_spec.vllm_cached_tokens if load_spec is not None else None,
+            )
+
+        def get_specagent_load_spec(req_id: str) -> Optional[LoadSpec]:
+            if req_id not in specagent_fetch_reqs:
+                return None
+            # The exact sparse missing ranges are computed later on the worker
+            # side in GPUModelRunner._make_specagent_destination_kwargs(), after
+            # the final batch/seq/block-table state is known.  At scheduler-side
+            # metadata construction time specagent_fetch_token_ranges is usually
+            # empty, and treating that as "no missing KV" drops LoadSpec.  Then
+            # the worker can discover real holes but LMCache has no request
+            # metadata and skips the fetch.  Emit a LoadSpec for every
+            # SpecAgent fetch request; the worker-side sparse token mask will
+            # still fetch zero tokens when there are no holes.
+            cpu_prefix_blocks = int(
+                specagent_cpu_prefix_blocks.get(req_id, 0) or 0
+            )
+            token_count = cpu_prefix_blocks * self._block_size
+            if token_count <= 0:
+                token_count = int(specagent_token_counts.get(req_id, 0) or 0)
+            if token_count <= 0:
+                request = self._unfinished_requests.get(req_id)
+                if request is not None:
+                    token_count = len(request.all_token_ids)
+            if token_count <= 0:
+                logger.warning(
+                    "[SpecAgent][LOADSPEC] skip req=%s reason=no_token_count "
+                    "fetch_reason=%s",
+                    req_id,
+                    specagent_fetch_reqs.get(req_id),
+                )
+                return None
+            logger.debug(
+                "[SpecAgent][LOADSPEC] force req=%s fetch_reason=%s "
+                "lmcache_cached_tokens=%d",
+                req_id,
+                specagent_fetch_reqs.get(req_id),
+                token_count,
+            )
+            return LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=token_count,
+                can_load=True,
+            )
+
+        def emit_missing_specagent_fetch_meta() -> None:
+            for req_id in specagent_fetch_reqs:
+                if req_id in emitted_req_ids:
+                    continue
+                load_spec = get_specagent_load_spec(req_id)
+                request_tracker = self._request_trackers.get(req_id)
+                if load_spec is None or request_tracker is None:
+                    if load_spec is not None:
+                        logger.warning(
+                            "[SpecAgent][LOADSPEC] missing tracker req=%s "
+                            "fetch_reason=%s",
+                            req_id,
+                            specagent_fetch_reqs.get(req_id),
+                        )
+                    continue
+                old_saved_tokens = apply_specagent_scratch_save_floor(
+                    request_tracker,
+                    req_id,
+                    len(request_tracker.token_ids),
+                )
+                sync_authoritative_block_ids(
+                    request_tracker, req_id, "extra_fetch_meta"
+                )
+                req_meta = ReqMeta.from_request_tracker(
+                    request_tracker,
+                    self._block_size,
+                    self._lmcache_chunk_size,
+                    load_spec=load_spec,
+                    discard_partial_chunks=self._discard_partial_chunks,
+                    save_decode_cache=self.config.save_decode_cache,
+                )
+                debug_specagent_req_meta(
+                    "extra_fetch_meta/from_tracker",
+                    req_id,
+                    request_tracker,
+                    req_meta,
+                    load_spec,
+                )
+                restore_specagent_scratch_save_floor_if_unsaved(
+                    request_tracker,
+                    req_id,
+                    old_saved_tokens,
+                    req_meta,
+                )
+                req_meta = sanitize_specagent_scratch_save_meta(req_id, req_meta)
+                debug_specagent_req_meta(
+                    "extra_fetch_meta/sanitized",
+                    req_id,
+                    request_tracker,
+                    req_meta,
+                    load_spec,
+                )
+                if req_meta is not None:
+                    meta.add_request(req_meta)
+                    emitted_req_ids.add(req_id)
+                    logger.debug(
+                        "[SpecAgent][LOADSPEC] emitted extra req_meta req=%s "
+                        "fetch_reason=%s",
+                        req_id,
+                        specagent_fetch_reqs.get(req_id),
+                    )
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
@@ -1454,6 +2824,18 @@ class LMCacheConnectorV1Impl:
             if request.req_id.startswith("mock_req"):
                 continue
             load_spec = self.load_specs.pop(request.req_id, None)
+            if request.req_id in specagent_fetch_reqs:
+                # SpecAgent scratch fetch is authoritative for this step.  A
+                # normal LMCache lookup may have produced a can_load=False
+                # LoadSpec when vLLM believes the prefix is already computed,
+                # but sparse residency can still have holes that must be
+                # fetched before attention.  Override that stale/no-op LoadSpec
+                # so the first scheduled forward does not run without data.
+                forced_load_spec = get_specagent_load_spec(request.req_id)
+                if forced_load_spec is not None:
+                    load_spec = forced_load_spec
+            elif load_spec is None:
+                load_spec = get_specagent_load_spec(request.req_id)
             num_tokens_to_compute = (
                 request.num_computed_tokens
                 + scheduler_output.num_scheduled_tokens[request.req_id]
@@ -1463,20 +2845,43 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_tokens = load_spec.lmcache_cached_tokens
             request_priority = self._requests_priority.pop(request.req_id, 0)
 
-            skip_save = force_skip_save or (
+            persistent_skip_save = force_skip_save or (
                 self.config.priority_limit is not None
                 and request_priority > self.config.priority_limit
             )
+            skip_save = persistent_skip_save or specagent_step_skip_save(
+                request.req_id
+            )
+
+            tracker_lmcache_cached_tokens = (
+                0 if request.req_id in specagent_fetch_reqs
+                else lmcache_cached_tokens
+            )
+            if request.req_id in specagent_fetch_reqs and lmcache_cached_tokens:
+                logger.warning(
+                    "[SpecAgent][SAVE-META] req=%s forced_load_tokens=%d "
+                    "tracker_saved_tokens_reset=0 reason=scratch_fetch_load_is_not_"
+                    "proof_that_cpu_has_full_prefix",
+                    request.req_id,
+                    lmcache_cached_tokens,
+                )
 
             request_tracker = RequestTracker.from_new_request(
                 self.config,
                 request,
                 num_tokens_to_compute,
-                lmcache_cached_tokens,
+                tracker_lmcache_cached_tokens,
                 skip_save,
+            )
+            sync_authoritative_block_ids(
+                request_tracker, request.req_id, "new_request"
             )
             self._request_trackers[request.req_id] = request_tracker
 
+            old_saved_tokens = apply_specagent_scratch_save_floor(
+                request_tracker,
+                request.req_id,
+            )
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
@@ -1485,8 +2890,35 @@ class LMCacheConnectorV1Impl:
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
             )
+            debug_specagent_req_meta(
+                "new_request/from_tracker",
+                request.req_id,
+                request_tracker,
+                req_meta,
+                load_spec,
+            )
+            restore_specagent_scratch_save_floor_if_unsaved(
+                request_tracker,
+                request.req_id,
+                old_saved_tokens,
+                req_meta,
+            )
+            req_meta = sanitize_specagent_scratch_save_meta(
+                request.req_id,
+                req_meta,
+            )
+            debug_specagent_req_meta(
+                "new_request/sanitized",
+                request.req_id,
+                request_tracker,
+                req_meta,
+                load_spec,
+            )
+            if specagent_step_skip_save(request.req_id):
+                request_tracker.skip_save = persistent_skip_save
             if req_meta is not None:
                 meta.add_request(req_meta)
+                emitted_req_ids.add(request.req_id)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
 
@@ -1496,6 +2928,12 @@ class LMCacheConnectorV1Impl:
         if isinstance(cached_reqs, list):
             for i, req in enumerate(cached_reqs):
                 load_spec = self.load_specs.pop(req.req_id, None)
+                if req.req_id in specagent_fetch_reqs:
+                    forced_load_spec = get_specagent_load_spec(req.req_id)
+                    if forced_load_spec is not None:
+                        load_spec = forced_load_spec
+                elif load_spec is None:
+                    load_spec = get_specagent_load_spec(req.req_id)
                 lmcache_cached_tokens = 0
                 vllm_cached_tokens = 0
                 if load_spec is not None:
@@ -1514,15 +2952,37 @@ class LMCacheConnectorV1Impl:
                     )
                     all_token_ids = list(vllm_request.all_token_ids)
 
+                tracker_lmcache_cached_tokens = (
+                    request_tracker.num_saved_tokens
+                    if req.req_id in specagent_fetch_reqs
+                    else lmcache_cached_tokens
+                )
+                if req.req_id in specagent_fetch_reqs and lmcache_cached_tokens:
+                    logger.warning(
+                        "[SpecAgent][SAVE-META] req=%s forced_load_tokens=%d "
+                        "tracker_saved_tokens_kept=%d",
+                        req.req_id,
+                        lmcache_cached_tokens,
+                        tracker_lmcache_cached_tokens,
+                    )
+
                 request_tracker.update(
                     req.new_token_ids,
                     req.new_block_ids,
                     req.resumed_from_preemption,
-                    lmcache_cached_tokens=lmcache_cached_tokens,
+                    lmcache_cached_tokens=tracker_lmcache_cached_tokens,
                     vllm_cached_tokens=vllm_cached_tokens,
                     all_token_ids=all_token_ids,
                 )
+                sync_authoritative_block_ids(
+                    request_tracker, req.req_id, "cached_request"
+                )
 
+                old_saved_tokens = apply_specagent_scratch_save_floor(
+                    request_tracker,
+                    req.req_id,
+                )
+                old_skip_save = set_step_skip_save(request_tracker, req.req_id)
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     self._block_size,
@@ -1531,8 +2991,35 @@ class LMCacheConnectorV1Impl:
                     discard_partial_chunks=self._discard_partial_chunks,
                     save_decode_cache=self.config.save_decode_cache,
                 )
+                debug_specagent_req_meta(
+                    "cached_list/from_tracker",
+                    req.req_id,
+                    request_tracker,
+                    req_meta,
+                    load_spec,
+                )
+                restore_step_skip_save(request_tracker, old_skip_save)
+                restore_specagent_scratch_save_floor_if_unsaved(
+                    request_tracker,
+                    req.req_id,
+                    old_saved_tokens,
+                    req_meta,
+                )
+                req_meta = sanitize_specagent_scratch_save_meta(
+                    req.req_id,
+                    req_meta,
+                )
+                debug_specagent_req_meta(
+                    "cached_list/sanitized",
+                    req.req_id,
+                    request_tracker,
+                    req_meta,
+                    load_spec,
+                )
                 if req_meta is not None:
                     meta.add_request(req_meta)
+                    emitted_req_ids.add(req.req_id)
+            emit_missing_specagent_fetch_meta()
             return meta
 
         for i, req_id in enumerate(cached_reqs.req_ids):
@@ -1557,6 +3044,12 @@ class LMCacheConnectorV1Impl:
             new_block_ids = cached_reqs.new_block_ids[i]
 
             load_spec = self.load_specs.pop(req_id, None)
+            if req_id in specagent_fetch_reqs:
+                forced_load_spec = get_specagent_load_spec(req_id)
+                if forced_load_spec is not None:
+                    load_spec = forced_load_spec
+            elif load_spec is None:
+                load_spec = get_specagent_load_spec(req_id)
             lmcache_cached_tokens = 0
             vllm_cached_tokens = 0
             if load_spec is not None:
@@ -1596,12 +3089,31 @@ class LMCacheConnectorV1Impl:
                 )
                 if full_hit_adj:
                     expected -= 1
-                assert request.num_computed_tokens == expected, (
-                    f"Preempted request {req_id} has "
-                    f"num_computed_tokens {request.num_computed_tokens} "
-                    f"but expected {expected} "
-                    f"(full_hit_adj={full_hit_adj})"
-                )
+                if request.num_computed_tokens != expected:
+                    logger.warning(
+                        "[SpecAgent][PREEMPT-LOAD-MISMATCH] req=%s "
+                        "num_computed_tokens=%d expected=%d "
+                        "lmcache_cached_tokens=%d vllm_cached_tokens=%d "
+                        "full_hit_adj=%s; capping load_spec to actual "
+                        "computed prefix to avoid saving beyond valid KV.",
+                        req_id,
+                        request.num_computed_tokens,
+                        expected,
+                        lmcache_cached_tokens,
+                        load_spec.vllm_cached_tokens,
+                        full_hit_adj,
+                    )
+                    lmcache_cached_tokens = min(
+                        lmcache_cached_tokens, request.num_computed_tokens,
+                    )
+                    vllm_cached_tokens = min(
+                        vllm_cached_tokens, request.num_computed_tokens,
+                    )
+                    load_spec = LoadSpec(
+                        vllm_cached_tokens=vllm_cached_tokens,
+                        lmcache_cached_tokens=lmcache_cached_tokens,
+                        can_load=load_spec.can_load,
+                    )
 
             # When retrieve fail, vllm will call _handle_invalid_blocks to
             # reset request.num_computed_tokens, this will lead to
@@ -1637,15 +3149,37 @@ class LMCacheConnectorV1Impl:
             # token_ids correctly for chunk key computation
             all_token_ids = list(request.all_token_ids) if preempted else None
 
+            tracker_lmcache_cached_tokens = (
+                request_tracker.num_saved_tokens
+                if req_id in specagent_fetch_reqs
+                else lmcache_cached_tokens
+            )
+            if req_id in specagent_fetch_reqs and lmcache_cached_tokens:
+                logger.warning(
+                    "[SpecAgent][SAVE-META] req=%s forced_load_tokens=%d "
+                    "tracker_saved_tokens_kept=%d",
+                    req_id,
+                    lmcache_cached_tokens,
+                    tracker_lmcache_cached_tokens,
+                )
+
             request_tracker.update(
                 new_token_ids,
                 new_block_ids,
                 preempted=preempted,
-                lmcache_cached_tokens=lmcache_cached_tokens,
+                lmcache_cached_tokens=tracker_lmcache_cached_tokens,
                 vllm_cached_tokens=vllm_cached_tokens,
                 all_token_ids=all_token_ids,
             )
+            sync_authoritative_block_ids(
+                request_tracker, req_id, "cached_request"
+            )
 
+            old_saved_tokens = apply_specagent_scratch_save_floor(
+                request_tracker,
+                req_id,
+            )
+            old_skip_save = set_step_skip_save(request_tracker, req_id)
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
@@ -1654,9 +3188,33 @@ class LMCacheConnectorV1Impl:
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
             )
+            debug_specagent_req_meta(
+                "cached_request/from_tracker",
+                req_id,
+                request_tracker,
+                req_meta,
+                load_spec,
+            )
+            restore_step_skip_save(request_tracker, old_skip_save)
+            restore_specagent_scratch_save_floor_if_unsaved(
+                request_tracker,
+                req_id,
+                old_saved_tokens,
+                req_meta,
+            )
+            req_meta = sanitize_specagent_scratch_save_meta(req_id, req_meta)
+            debug_specagent_req_meta(
+                "cached_request/sanitized",
+                req_id,
+                request_tracker,
+                req_meta,
+                load_spec,
+            )
             if req_meta is not None:
                 meta.add_request(req_meta)
+                emitted_req_ids.add(req_id)
 
+        emit_missing_specagent_fetch_meta()
         return meta
 
     @_lmcache_nvtx_annotate

@@ -20,8 +20,10 @@ if TYPE_CHECKING:
 
 # Standard
 import asyncio
+import builtins
 import gc
 import multiprocessing
+import os
 import time
 
 # Third Party
@@ -63,6 +65,191 @@ from lmcache.v1.token_database import (
 )
 
 logger = init_logger(__name__)
+
+_SPECAGENT_LIVE_PROBE_LOG_LIMIT = 20
+
+
+def _specagent_record_actual_cpu_store(
+    tokens: Union[torch.Tensor, list[int]],
+    start: int,
+    end: int,
+    block_size: int,
+) -> None:
+    if os.environ.get("SPECAGENT_DISABLE_CPU_STORE_PROOF"):
+        return
+
+    chunk_store = getattr(builtins, "_specagent_cpu_saved_chunks", None)
+    if chunk_store is None:
+        chunk_store = set()
+        setattr(builtins, "_specagent_cpu_saved_chunks", chunk_store)
+
+    if isinstance(tokens, torch.Tensor):
+        prefix_tokens = [int(t) for t in tokens[:end].detach().cpu().tolist()]
+    else:
+        prefix_tokens = [int(t) for t in tokens[:end]]
+    token_hash = hash(tuple(prefix_tokens))
+    chunk_store.add((end, token_hash))
+
+    if not os.environ.get("SPECAGENT_LEGACY_PRESTORE_PROOF"):
+        return
+
+    block_store = getattr(builtins, "_specagent_cpu_saved_blocks", None)
+    if block_store is None:
+        block_store = set()
+        setattr(builtins, "_specagent_cpu_saved_blocks", block_store)
+    for tok_end in range(
+        ((start + block_size - 1) // block_size) * block_size,
+        end + 1,
+        block_size,
+    ):
+        if tok_end <= start:
+            continue
+        block_prefix = prefix_tokens[:tok_end]
+        block_store.add((tok_end // block_size - 1, hash(tuple(block_prefix))))
+
+
+def _specagent_record_actual_kv_fingerprint(
+    tokens: Union[torch.Tensor, list[int]],
+    memory_obj: MemoryObj,
+    start: int,
+    end: int,
+    block_size: int,
+    req_id: str,
+    layer_id: int = 0,
+    cache_key: Optional[CacheEngineKey] = None,
+) -> None:
+    if not bool(__import__("os").environ.get("SPECAGENT_KV_FINGERPRINT")):
+        return
+    if memory_obj.tensor is None:
+        return
+    tensor = memory_obj.tensor
+    if tensor.dim() >= 3 and tensor.shape[0] == 1 and tensor.shape[1] == 2:
+        tensor = tensor[0]
+    elif tensor.dim() == 3 and tensor.shape[1] == 2:
+        tensor = tensor.permute(1, 0, 2).contiguous()
+    if tensor.dim() < 2 or tensor.shape[0] != 2:
+        logger.warning(
+            "[SpecAgent][KV-FP-SKIP] req=%s reason=unexpected_memory_shape "
+            "shape=%s",
+            req_id,
+            tuple(memory_obj.tensor.shape),
+        )
+        return
+    fp_store = getattr(builtins, "_specagent_kv_fingerprints", None)
+    if fp_store is None:
+        fp_store = {}
+        setattr(builtins, "_specagent_kv_fingerprints", fp_store)
+
+    for tok_start in range(
+        (start // block_size) * block_size,
+        end,
+        block_size,
+    ):
+        tok_end = min(tok_start + block_size, end)
+        if tok_start < start or tok_end <= tok_start:
+            continue
+        target_logicals_raw = __import__("os").environ.get(
+            "SPECAGENT_KV_FINGERPRINT_TARGET_LOGICALS", ""
+        ).strip()
+        if target_logicals_raw:
+            target_logicals: set[int] = set()
+            for part in target_logicals_raw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    target_logicals.add(int(part))
+                except ValueError:
+                    continue
+            if target_logicals and tok_start // block_size not in target_logicals:
+                continue
+        if isinstance(tokens, torch.Tensor):
+            prefix_tokens = [
+                int(t) for t in tokens[:tok_end].detach().cpu().tolist()
+            ]
+        else:
+            prefix_tokens = [int(t) for t in tokens[:tok_end]]
+        rel_start = tok_start - start
+        rel_end = tok_end - start
+        kv = tensor[:, rel_start:rel_end].float()
+        fp_value = (
+            tok_end - tok_start,
+            float(kv[0].sum().item()),
+            float(kv[1].sum().item()),
+            float((kv[0] * kv[0]).sum().item()),
+            float((kv[1] * kv[1]).sum().item()),
+        )
+        # Use LMCache's authoritative chunk key when available. Logical block
+        # indices alone collide across unrelated requests and are only useful
+        # as human-readable context in the log.
+        key_hash = (
+            cache_key.chunk_hash
+            if cache_key is not None
+            else hash(tuple(prefix_tokens))
+        )
+        fp_key = (
+            int(layer_id),
+            key_hash,
+            tok_start - start,
+            tok_end - tok_start,
+        )
+        legacy_prefix_key = (
+            int(layer_id),
+            tok_start // block_size,
+            hash(tuple(prefix_tokens)),
+        )
+        old_versions = fp_store.get(fp_key)
+        if old_versions is None:
+            old_versions = []
+        elif isinstance(old_versions, tuple):
+            old_versions = [old_versions]
+        if old_versions:
+            deltas = []
+            for old_fp in old_versions:
+                sum_delta = max(
+                    abs(float(old_fp[1]) - fp_value[1]),
+                    abs(float(old_fp[2]) - fp_value[2]),
+                )
+                norm_delta = max(
+                    abs(float(old_fp[3]) - fp_value[3]),
+                    abs(float(old_fp[4]) - fp_value[4]),
+                )
+                deltas.append((sum_delta, norm_delta))
+            best_sum_delta, best_norm_delta = min(
+                deltas, key=lambda item: (item[0], item[1])
+            )
+            if best_sum_delta > 1e-3 or best_norm_delta > 1e-2:
+                logger.warning(
+                    "[SpecAgent][KV-FP-VERSION] req=%s layer=%d logical=%d "
+                    "token_range=[%d,%d) chunk_start=%d key=%s prev_versions=%d "
+                    "best_sum_delta=%.6g best_norm_delta=%.6g source=actual_store",
+                    req_id,
+                    layer_id,
+                    tok_start // block_size,
+                    tok_start,
+                    tok_end,
+                    start,
+                    str(key_hash),
+                    len(old_versions),
+                    best_sum_delta,
+                    best_norm_delta,
+                )
+        old_versions.append(fp_value)
+        if len(old_versions) > 8:
+            old_versions = old_versions[-8:]
+        fp_store[fp_key] = old_versions
+        # Keep the older logical-block key as a debug alias.  The runtime
+        # correctness checker in vLLM indexes by logical block and prefix hash,
+        # while LMCache's authoritative store key is chunk based.
+        legacy_versions = fp_store.get(legacy_prefix_key)
+        if legacy_versions is None:
+            legacy_versions = []
+        elif isinstance(legacy_versions, tuple):
+            legacy_versions = [legacy_versions]
+        legacy_versions.append(fp_value)
+        if len(legacy_versions) > 8:
+            legacy_versions = legacy_versions[-8:]
+        fp_store[legacy_prefix_key] = legacy_versions
 
 # Type aliases for processed chunks
 # (cache_key, memory_obj, start_index, end_index)
@@ -261,6 +448,78 @@ class LMCacheEngine:
         """Extracts request ID from kwargs for logging."""
         return kwargs.get("req_id", "unspecified")
 
+    def specagent_live_saved_tokens(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        upto_tokens: Optional[int] = None,
+    ) -> int:
+        """Return the live contiguous CPU-backed prefix length.
+
+        LMCache layerwise retrieval stops at the first unavailable chunk.
+        Therefore SpecAgent full restore can only safely advertise the
+        contiguous prefix for which every layer of every chunk is currently
+        present in the storage backend.
+        """
+        global _SPECAGENT_LIVE_PROBE_LOG_LIMIT
+        debug_probe = bool(os.environ.get("SPECAGENT_LIVE_PROBE_DEBUG"))
+        if self.storage_manager is None:
+            if debug_probe and _SPECAGENT_LIVE_PROBE_LOG_LIMIT > 0:
+                _SPECAGENT_LIVE_PROBE_LOG_LIMIT -= 1
+                logger.info(
+                    "[SpecAgent][CPU-LIVE-PROBE-LMCACHE] storage_manager=None "
+                    "engine_id=%s worker_id=%s",
+                    id(self),
+                    getattr(self.metadata, "worker_id", None),
+                )
+            return 0
+        limit = len(tokens) if upto_tokens is None else min(
+            len(tokens), max(0, int(upto_tokens))
+        )
+        chunk_size = int(getattr(self.token_database, "chunk_size", 0) or 0)
+        if chunk_size <= 0:
+            return 0
+        aligned = (limit // chunk_size) * chunk_size
+        if aligned <= 0:
+            return 0
+
+        live_tokens = 0
+        probe_tokens = tokens[:aligned]
+        for start, end, key in self.token_database.process_tokens(
+            tokens=probe_tokens,
+            request_configs=None,
+        ):
+            assert isinstance(key, CacheEngineKey)
+            keys_multi_layer = key.split_layers(self.num_layers)
+            layer_locations = [
+                self.storage_manager.contains(layer_key, self.retrieve_locations)
+                for layer_key in keys_multi_layer
+            ]
+            if debug_probe and _SPECAGENT_LIVE_PROBE_LOG_LIMIT > 0:
+                _SPECAGENT_LIVE_PROBE_LOG_LIMIT -= 1
+                present_layers = sum(1 for loc in layer_locations if loc)
+                logger.info(
+                    "[SpecAgent][CPU-LIVE-PROBE-LMCACHE] engine_id=%s "
+                    "worker_id=%s chunk=[%d,%d) aligned=%d chunk_size=%d "
+                    "key_hash=%s present_layers=%d/%d first_location=%s "
+                    "retrieve_locations=%s store_location=%s",
+                    id(self),
+                    getattr(self.metadata, "worker_id", None),
+                    start,
+                    end,
+                    aligned,
+                    chunk_size,
+                    str(key.chunk_hash),
+                    present_layers,
+                    self.num_layers,
+                    str(layer_locations[0]) if layer_locations else None,
+                    self.retrieve_locations,
+                    self.store_location,
+                )
+            if not all(layer_locations):
+                break
+            live_tokens = int(end)
+        return live_tokens
+
     def mark_init_failed(self, reason: str = "") -> None:
         """
         Mark the engine as having failed initialization.
@@ -304,6 +563,24 @@ class LMCacheEngine:
                     event_manager=self.event_manager,
                     lmcache_worker=self.lmcache_worker,
                     async_lookup_server=async_lookup_server,
+                )
+                # SpecAgent's scheduler runs in this same EngineCore process.
+                # Expose the live CPU-cache probe only after this engine owns a
+                # real storage manager.  Registering from __init__ is too early
+                # and can be overwritten by scheduler-side LMCache objects that
+                # do not have storage.
+                builtins._specagent_lmcache_live_saved_tokens = (
+                    self.specagent_live_saved_tokens
+                )
+                logger.info(
+                    "[SpecAgent][CPU-LIVE-PROBE-LMCACHE] registered "
+                    "engine_id=%s worker_id=%s retrieve_locations=%s "
+                    "store_location=%s use_layerwise=%s",
+                    id(self),
+                    getattr(self.metadata, "worker_id", None),
+                    self.retrieve_locations,
+                    self.store_location,
+                    self.use_layerwise,
                 )
             self.post_inited = True
 
@@ -647,9 +924,13 @@ class LMCacheEngine:
             assert isinstance(key, CacheEngineKey)
 
             keys_multi_layer = key.split_layers(self.num_layers)
-            # Only check the first layer
-            if self.storage_manager.contains(
-                keys_multi_layer[0], self.retrieve_locations
+            # Layerwise retrieval is only valid once every layer for this
+            # chunk is present.  Checking layer 0 alone can advertise a chunk
+            # while later layers are still being stored, which makes SpecAgent
+            # scratch attention consume zero/stale KV for those layers.
+            if all(
+                self.storage_manager.contains(key_layer, self.retrieve_locations)
+                for key_layer in keys_multi_layer
             ):
                 continue
 
@@ -719,15 +1000,54 @@ class LMCacheEngine:
             mem_obj_generator = self.gpu_connector.batched_from_gpu(
                 memory_objs, starts, ends, **kwargs
             )
+            store_current_layer_only = bool(
+                kwargs.get("specagent_save_current_layer_only", False)
+            )
+            if not store_current_layer_only:
+                # The default layerwise D2H generator yields immediately after
+                # starting a layer transfer. The following next() waits for
+                # that layer to finish before scheduling the next one. Prime it
+                # once so each batched_put below sees completed CPU memory.
+                next(mem_obj_generator)
 
-            next(mem_obj_generator)
-
+            specagent_block_size = int(kwargs.get("specagent_block_size", 16))
             for layer_id in range(self.num_layers):
-                yield
                 next(mem_obj_generator)
                 self.storage_manager.batched_put(
                     keys[layer_id], memory_objs[layer_id], location=self.store_location
                 )
+                for start, end, key, memory_obj in zip(
+                    starts, ends, keys[layer_id], memory_objs[layer_id], strict=False
+                ):
+                    _specagent_record_actual_kv_fingerprint(
+                        tokens,
+                        memory_obj,
+                        start,
+                        end,
+                        specagent_block_size,
+                        req_id,
+                        layer_id,
+                        key,
+                    )
+                if layer_id == self.num_layers - 1:
+                    for start, end, memory_obj in zip(
+                        starts, ends, memory_objs[layer_id], strict=False
+                    ):
+                        _specagent_record_actual_cpu_store(
+                            tokens, start, end, specagent_block_size
+                        )
+
+                yield
+
+            if (
+                store_current_layer_only
+                and not os.environ.get("SPECAGENT_DISABLE_STORE_CLEANUP")
+            ):
+                # Finish the GPU connector generator so its temporary transfer
+                # buffer reaches ref_count_down(). In layerwise mode the
+                # per-layer loop above stops immediately after the last layer
+                # yield, leaving connector cleanup pending unless we drain it.
+                next(mem_obj_generator, None)
 
             tot_time = time.perf_counter() - t_start
             logger.info(
@@ -967,15 +1287,17 @@ class LMCacheEngine:
 
             keys_multi_layer = key.split_layers(self.num_layers)
 
-            # NOTE: Only check the first layer
-            if current_location := self.storage_manager.contains(
-                keys_multi_layer[0], self.retrieve_locations
-            ):
+            layer_locations = [
+                self.storage_manager.contains(layer_key, self.retrieve_locations)
+                for layer_key in keys_multi_layer
+            ]
+            if all(layer_locations):
+                current_location = layer_locations[0]
                 if location is None:
                     location = current_location
                 else:
                     # TODO(Jiayi): Support multi-location retrieval in the future
-                    assert location == current_location, (
+                    assert all(loc == location for loc in layer_locations), (
                         "All retrieved keys should be from the same location "
                         "when use layerwise retrieval."
                         "Please support multi-location retrieval in the future."
@@ -1004,10 +1326,35 @@ class LMCacheEngine:
             next(mem_obj_consumer)
 
             to_count_down = []
-            for layer_id in range(self.num_layers):
-                task = next(get_generator)
+            cpu_prefetch_ahead = max(
+                0,
+                int(os.environ.get("SPECAGENT_CPU_PREFETCH_AHEAD_LAYERS", "0")),
+            )
+            cpu_prefetch_profile = bool(
+                os.environ.get("SPECAGENT_CPU_PREFETCH_PROFILE")
+            )
+            prefetch_ms_total = 0.0
+            result_ms_total = 0.0
+            send_ms_total = 0.0
+            result_ms_max = 0.0
+            send_ms_max = 0.0
+            prefetched_tasks: dict[int, Any] = {}
+            next_task_layer = 0
 
-                assert task is not None
+            def prefetch_until(exclusive_layer: int) -> None:
+                nonlocal next_task_layer, prefetch_ms_total
+                while next_task_layer < min(self.num_layers, exclusive_layer):
+                    prefetch_t0 = time.perf_counter()
+                    prefetched_tasks[next_task_layer] = next(get_generator)
+                    prefetch_ms_total += (
+                        time.perf_counter() - prefetch_t0
+                    ) * 1000.0
+                    assert prefetched_tasks[next_task_layer] is not None
+                    next_task_layer += 1
+
+            for layer_id in range(self.num_layers):
+                prefetch_until(layer_id + cpu_prefetch_ahead + 1)
+                task = prefetched_tasks.pop(layer_id)
 
                 if layer_id == 0:
                     # NOTE(Yuwei): For sglang integration we need to provide retrieved
@@ -1016,9 +1363,35 @@ class LMCacheEngine:
                 else:
                     yield None
 
+                result_t0 = time.perf_counter()
                 mem_objs_layer = task.result()
+                result_ms = (time.perf_counter() - result_t0) * 1000.0
+                result_ms_total += result_ms
+                result_ms_max = max(result_ms_max, result_ms)
+                send_t0 = time.perf_counter()
                 mem_obj_consumer.send(mem_objs_layer)
+                send_ms = (time.perf_counter() - send_t0) * 1000.0
+                send_ms_total += send_ms
+                send_ms_max = max(send_ms_max, send_ms)
                 to_count_down.extend(mem_objs_layer)
+
+            if cpu_prefetch_profile:
+                logger.info(
+                    "[SpecAgent][CPU-PREFETCH] req=%s layers=%d ahead=%d "
+                    "chunks=%d tokens=%d prefetch_ms=%.3f "
+                    "task_result_ms_sum=%.3f task_result_ms_max=%.3f "
+                    "gpu_send_ms_sum=%.3f gpu_send_ms_max=%.3f",
+                    req_id,
+                    self.num_layers,
+                    cpu_prefetch_ahead,
+                    len(keys),
+                    int(torch.sum(ret_mask).item()),
+                    prefetch_ms_total,
+                    result_ms_total,
+                    result_ms_max,
+                    send_ms_total,
+                    send_ms_max,
+                )
 
             for mem_obj in to_count_down:
                 mem_obj.ref_count_down()
@@ -1027,6 +1400,20 @@ class LMCacheEngine:
             # `StopIteration`
             for layer_id in range(self.num_layers):
                 yield None
+
+            yield None
+            retrieved_tokens = torch.sum(ret_mask)
+            self.stats_monitor.on_retrieve_finished(monitor_req_id,
+                                                    retrieved_tokens)
+            if not self._is_passive():
+                logger.info(
+                    "[req_id=%s] Retrieved %d out of %d out of total %d tokens",
+                    req_id,
+                    retrieved_tokens,
+                    torch.sum(mask),
+                    len(tokens),
+                )
+            return
 
         yield None
 
