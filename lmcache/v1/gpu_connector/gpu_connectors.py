@@ -1282,6 +1282,19 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
         offset: int = int(kwargs.get("offset", 0) or 0)
+        write_token_mask: Optional[torch.Tensor] = kwargs.get(
+            "specagent_write_token_mask"
+        )
+        if write_token_mask is not None:
+            write_token_mask = write_token_mask.to(
+                device=slot_mapping.device, dtype=torch.bool
+            )
+            if len(write_token_mask) != len(slot_mapping):
+                raise ValueError(
+                    "specagent_write_token_mask must match slot_mapping "
+                    f"length, got mask={len(write_token_mask)} "
+                    f"slot_mapping={len(slot_mapping)}"
+                )
         defer_tmp_buffer_free = bool(
             kwargs.get("specagent_defer_store_tmp_buffer_free", True)
         )
@@ -1289,6 +1302,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         self._lazy_initialize_buffer(kvcaches)
 
         slot_mapping_chunks = []
+        write_mask_chunks = []
         for start, end in zip(starts, ends, strict=False):
             local_start = start - offset
             local_end = end - offset
@@ -1299,9 +1313,18 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     f"slot_mapping_len={len(slot_mapping)}"
                 )
             slot_mapping_chunks.append(slot_mapping[local_start:local_end])
+            if write_token_mask is not None:
+                write_mask_chunks.append(write_token_mask[
+                    local_start:local_end
+                ])
 
         # TODO(Jiayi): Optimize away this `cat`
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
+        write_mask_full = (
+            torch.cat(write_mask_chunks, dim=0)
+            if write_mask_chunks
+            else None
+        )
 
         num_tokens = len(slot_mapping_full)
 
@@ -1402,6 +1425,13 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                                 and start <= debug_target_token < end
                             ):
                                 target_local = debug_target_token - offset
+                                if (
+                                    write_token_mask is not None
+                                    and not bool(write_token_mask[
+                                        target_local
+                                    ].item())
+                                ):
+                                    continue
                                 target_slot = int(slot_mapping[target_local].item())
                                 debug_targets.append((
                                     debug_target_token,
@@ -1442,10 +1472,17 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         )
 
                 if self.use_gpu:
+                    transfer_tensor = tmp_gpu_buffer_obj.tensor
+                    transfer_slot_mapping = slot_mapping_full
+                    if write_mask_full is not None:
+                        transfer_tensor = transfer_tensor[write_mask_full]
+                        transfer_slot_mapping = slot_mapping_full[
+                            write_mask_full
+                        ]
                     lmc_ops.single_layer_kv_transfer(
-                        tmp_gpu_buffer_obj.tensor,
+                        transfer_tensor,
                         kvcaches[layer_id],
-                        slot_mapping_full,
+                        transfer_slot_mapping,
                         lmc_ops.TransferDirection.H2D,
                         self.gpu_kv_format,
                         token_major=True,

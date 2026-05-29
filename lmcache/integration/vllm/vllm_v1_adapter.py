@@ -980,9 +980,19 @@ class LMCacheConnectorV1Impl:
 
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
+            specagent_fetch_reason = str(sa_fetch_reqs.get(request.req_id, ""))
+            use_paged_restore_target = specagent_fetch_reason in {
+                "verify_paged_restore",
+                "observation_paged_restore",
+            }
             use_specagent_buf = (
                 sa_dest_kvcaches is not None
                 and request.req_id in sa_fetch_reqs
+                and request.req_id in sa_dest_slot_mapping
+                and not use_paged_restore_target
+            )
+            use_specagent_slot_mapping = (
+                request.req_id in sa_fetch_reqs
                 and request.req_id in sa_dest_slot_mapping
             )
             use_specagent_sparse_mask = (
@@ -994,8 +1004,13 @@ class LMCacheConnectorV1Impl:
                 slot_mapping = sa_dest_slot_mapping[request.req_id].to(self.device)
             else:
                 target_kvcaches = kvcaches
-                slot_mapping = request.slot_mapping.to(self.device)
-            if not use_specagent_buf:
+                if use_specagent_slot_mapping:
+                    slot_mapping = sa_dest_slot_mapping[request.req_id].to(
+                        self.device
+                    )
+                else:
+                    slot_mapping = request.slot_mapping.to(self.device)
+            if not use_specagent_buf and not use_specagent_slot_mapping:
                 assert len(tokens) == len(slot_mapping)
 
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
@@ -1073,7 +1088,7 @@ class LMCacheConnectorV1Impl:
                     "lmcache_cached_tokens=%d vllm_cached_tokens=%d "
                     "slot_len=%d target=%s",
                     request.req_id,
-                    sa_fetch_reqs.get(request.req_id),
+                    specagent_fetch_reason,
                     clipped_ranges,
                     effective_chunk_segments,
                     fetch_tokens,
@@ -1123,7 +1138,7 @@ class LMCacheConnectorV1Impl:
                             "chunks were ever saved in this process."
                             % (
                                 request.req_id,
-                                sa_fetch_reqs.get(request.req_id),
+                                specagent_fetch_reason,
                                 seg_start,
                                 seg_end,
                                 never_saved_chunks,
@@ -1131,6 +1146,18 @@ class LMCacheConnectorV1Impl:
                         )
                     seg_token_mask = torch.ones(seg_end, dtype=torch.bool)
                     seg_token_mask[:seg_start] = False
+                    specagent_write_token_mask = None
+                    if use_paged_restore_target:
+                        specagent_write_token_mask = torch.zeros(
+                            seg_end, dtype=torch.bool
+                        )
+                        for range_start, range_end in clipped_ranges:
+                            write_start = max(seg_start, range_start)
+                            write_end = min(seg_end, range_end)
+                            if write_start < write_end:
+                                specagent_write_token_mask[
+                                    write_start:write_end
+                                ] = True
                     if self.use_layerwise:
                         # SpecAgent scratch attention may read every fetched
                         # segment in the current layer.  The generic LMCache
@@ -1150,6 +1177,9 @@ class LMCacheConnectorV1Impl:
                             vllm_cached_tokens=seg_start,
                             sync=sync,
                             specagent_layer_events=layer_events,
+                            specagent_write_token_mask=(
+                                specagent_write_token_mask
+                            ),
                         )
                         first_ret = next(layerwise_retriever)
                         num_retrieved_tokens = (
@@ -1167,7 +1197,7 @@ class LMCacheConnectorV1Impl:
                                 "missing logical blocks are excluded or recomputed."
                                 % (
                                     request.req_id,
-                                    sa_fetch_reqs.get(request.req_id),
+                                    specagent_fetch_reason,
                                     seg_start,
                                     seg_end,
                                     num_retrieved_tokens,
