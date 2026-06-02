@@ -1004,7 +1004,7 @@ class LMCacheEngine:
                 kwargs.get("specagent_save_current_layer_only", False)
             )
             if not store_current_layer_only:
-                # The default layerwise D2H generator yields immediately after
+                # The layerwise D2H generator yields immediately after
                 # starting a layer transfer. The following next() waits for
                 # that layer to finish before scheduling the next one. Prime it
                 # once so each batched_put below sees completed CPU memory.
@@ -1012,7 +1012,15 @@ class LMCacheEngine:
 
             specagent_block_size = int(kwargs.get("specagent_block_size", 16))
             for layer_id in range(self.num_layers):
-                next(mem_obj_generator)
+                if store_current_layer_only:
+                    # SpecAgent calls this generator after each model layer.
+                    # Start and finish only the current layer here; do not
+                    # advance into the next layer before its KV has been
+                    # computed.
+                    next(mem_obj_generator)
+                    next(mem_obj_generator)
+                else:
+                    next(mem_obj_generator)
                 self.storage_manager.batched_put(
                     keys[layer_id], memory_objs[layer_id], location=self.store_location
                 )

@@ -1705,6 +1705,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         defer_tmp_buffer_free = bool(
             kwargs.get("specagent_defer_store_tmp_buffer_free", True)
         )
+        current_layer_only = bool(
+            kwargs.get("specagent_save_current_layer_only", False)
+        )
 
         self._lazy_initialize_buffer(self.kvcaches)
 
@@ -1794,13 +1797,19 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
             yield
-            if sync and not (
+            if (sync or current_layer_only) and not (
                 defer_tmp_buffer_free
                 and self.use_gpu
                 and layer_id == self.num_layers - 1
             ):
                 self.store_stream.synchronize()
             logger.debug(f"Finished offloading layer {layer_id}")
+            if current_layer_only:
+                # Give callers a synchronization point for this layer without
+                # advancing into the next layer. SpecAgent invokes layerwise
+                # save from each model-layer hook, so reading layer N+1 here
+                # would race before that layer has produced KV.
+                yield
 
         # free the buffer memory
         if tmp_gpu_buffer_obj is not None:

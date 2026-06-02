@@ -61,6 +61,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _specagent_env_true(env_name: str) -> bool:
+    value = os.environ.get(env_name)
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _specagent_layer_index(layer_name: str) -> Optional[int]:
     for part in layer_name.split("."):
         if part.isdigit():
@@ -1813,7 +1820,7 @@ class LMCacheConnectorV1Impl:
         for request in connector_metadata.requests:
             save_spec = request.save_spec
             specagent_save_debug = (
-                os.environ.get("SPECAGENT_SAVE_DEBUG")
+                _specagent_env_true("SPECAGENT_SAVE_DEBUG")
                 and request.load_spec is not None
                 and request.load_spec.can_load
             )
@@ -1955,7 +1962,7 @@ class LMCacheConnectorV1Impl:
                     saved_block_store.add(key)
                 if (
                     (newly_recorded or newly_recorded_chunks)
-                    and os.environ.get("SPECAGENT_SAVE_DEBUG")
+                    and _specagent_env_true("SPECAGENT_SAVE_DEBUG")
                 ):
                     logger.warning(
                         "[SpecAgent][CPU-SAVED-BLOCKS] req=%s "
@@ -2062,7 +2069,11 @@ class LMCacheConnectorV1Impl:
                     mask=store_mask,
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping,
-                    offset=skip_leading_tokens,
+                    # token_ids and slot_mapping remain full-sequence aligned.
+                    # store_mask selects the suffix chunks to save; the GPU
+                    # connector must still index slot_mapping by absolute
+                    # token position.
+                    offset=0,
                     sync=is_first,
                     req_id=request.req_id,
                     specagent_block_size=self._block_size,
@@ -2188,7 +2199,7 @@ class LMCacheConnectorV1Impl:
                 mask=store_mask,
                 kvcaches=kvcaches,
                 slot_mapping=slot_mapping,
-                offset=skip_leading_tokens,
+                offset=0,
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
                 req_id=request.req_id,
@@ -2527,7 +2538,13 @@ class LMCacheConnectorV1Impl:
 
         def specagent_step_skip_save(req_id: str) -> bool:
             # Explicitly skipped requests are draft/polluted paths and must
-            # not write KV.  SpecAgent fetch requests are different: their
+            # not write KV.  This decision must dominate fetch metadata:
+            # a DRAFT request can carry fetch state for sparse attention, but
+            # its newly computed K/V is based on draft tokens and is not a
+            # valid CPU-backup source.
+            if req_id in specagent_skip_save_reqs:
+                return True
+            # SpecAgent fetch requests are different: their
             # fetched prefix may live in scratch while paged KV still has holes,
             # but any newly computed observation/verified suffix is valid KV.
             # apply_specagent_scratch_save_floor() raises skip_leading_tokens to
@@ -2536,7 +2553,7 @@ class LMCacheConnectorV1Impl:
             # up to CPU.
             if req_id in specagent_fetch_reqs:
                 return False
-            return req_id in specagent_skip_save_reqs
+            return False
 
         def set_step_skip_save(
             request_tracker: RequestTracker, req_id: str
@@ -2544,7 +2561,7 @@ class LMCacheConnectorV1Impl:
             old_skip_save = request_tracker.skip_save
             if specagent_step_skip_save(req_id):
                 request_tracker.skip_save = True
-                if os.environ.get("SPECAGENT_SAVE_DEBUG"):
+                if _specagent_env_true("SPECAGENT_SAVE_DEBUG"):
                     logger.warning(
                         "[SpecAgent][SAVE-SKIP] req=%s reason=%s",
                         req_id,
@@ -2618,7 +2635,7 @@ class LMCacheConnectorV1Impl:
                     )
             if save_floor > old_saved_tokens:
                 request_tracker.num_saved_tokens = save_floor
-                if os.environ.get("SPECAGENT_SAVE_DEBUG"):
+                if _specagent_env_true("SPECAGENT_SAVE_DEBUG"):
                     logger.warning(
                         "[SpecAgent][SAVE-FLOOR] req=%s reason=%s "
                         "old_saved=%d safe_suffix_start=%d save_floor=%d "
@@ -2673,7 +2690,7 @@ class LMCacheConnectorV1Impl:
             )
             if aligned_token_len <= skip_leading_tokens:
                 save_spec.can_save = False
-                if os.environ.get("SPECAGENT_SAVE_DEBUG"):
+                if _specagent_env_true("SPECAGENT_SAVE_DEBUG"):
                     logger.warning(
                         "[SpecAgent][SAVE-SUFFIX-SKIP] req=%s reason=%s "
                         "skip=%d token_len=%d aligned_len=%d",
@@ -2687,7 +2704,7 @@ class LMCacheConnectorV1Impl:
             if aligned_token_len < len(req_meta.token_ids):
                 req_meta.token_ids = req_meta.token_ids[:aligned_token_len]
                 req_meta.slot_mapping = req_meta.slot_mapping[:aligned_token_len]
-                if os.environ.get("SPECAGENT_SAVE_DEBUG"):
+                if _specagent_env_true("SPECAGENT_SAVE_DEBUG"):
                     logger.warning(
                         "[SpecAgent][SAVE-SUFFIX-TRIM] req=%s reason=%s "
                         "skip=%d token_len=%d aligned_len=%d",
@@ -2709,7 +2726,7 @@ class LMCacheConnectorV1Impl:
         ) -> None:
             if (
                 req_id not in specagent_fetch_reqs
-                or not os.environ.get("SPECAGENT_SAVE_DEBUG")
+                or not _specagent_env_true("SPECAGENT_SAVE_DEBUG")
             ):
                 return
             save_spec = req_meta.save_spec if req_meta is not None else None
