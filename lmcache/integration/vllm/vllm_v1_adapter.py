@@ -937,7 +937,12 @@ class LMCacheConnectorV1Impl:
         sa_lead = max(1, int(sa_extra.get("layer_prefetch_granularity", 2)))
         self._specagent_prefetch_lead = sa_lead
         self._specagent_layerwise_check_period = max(1, 2 * sa_lead)
-        if sa_fetch_reqs:
+        sa_verbose = (
+            _specagent_env_true("SPECAGENT_VERBOSE")
+            or _specagent_env_true("SPECAGENT_FETCH_DEBUG")
+            or _specagent_env_true("SPECAGENT_BW_PROFILE")
+        )
+        if sa_fetch_reqs and sa_verbose:
             logger.info(
                 "[SpecAgent][FETCH-ADAPTER] fetch_reqs=%s metadata_reqs=%s "
                 "has_dest=%s has_slot=%s",
@@ -1089,21 +1094,22 @@ class LMCacheConnectorV1Impl:
                 fetch_tokens = sum(
                     end - start for start, end in effective_chunk_segments
                 )
-                logger.info(
-                    "[SpecAgent][FETCH-MASK] req=%s fetch_reason=%s "
-                    "ranges=%s chunk_segments=%s fetch_tokens=%d "
-                    "lmcache_cached_tokens=%d vllm_cached_tokens=%d "
-                    "slot_len=%d target=%s",
-                    request.req_id,
-                    specagent_fetch_reason,
-                    clipped_ranges,
-                    effective_chunk_segments,
-                    fetch_tokens,
-                    lmcache_cached_tokens,
-                    request.load_spec.vllm_cached_tokens,
-                    len(slot_mapping),
-                    "scratch" if use_specagent_buf else "paged",
-                )
+                if sa_verbose:
+                    logger.info(
+                        "[SpecAgent][FETCH-MASK] req=%s fetch_reason=%s "
+                        "ranges=%s chunk_segments=%s fetch_tokens=%d "
+                        "lmcache_cached_tokens=%d vllm_cached_tokens=%d "
+                        "slot_len=%d target=%s",
+                        request.req_id,
+                        specagent_fetch_reason,
+                        clipped_ranges,
+                        effective_chunk_segments,
+                        fetch_tokens,
+                        lmcache_cached_tokens,
+                        request.load_spec.vllm_cached_tokens,
+                        len(slot_mapping),
+                        "scratch" if use_specagent_buf else "paged",
+                    )
                 if not effective_chunk_segments:
                     if os.environ.get("SPECAGENT_FETCH_DEBUG"):
                         logger.warning(
@@ -1435,7 +1441,8 @@ class LMCacheConnectorV1Impl:
         if requested_layer == self.num_layers - 1:
             target_layer = self.num_layers
         start_layer = self.current_layer
-        t0 = time.perf_counter()
+        overlap_debug = _specagent_env_true("SPECAGENT_OVERLAP_DEBUG")
+        t0 = time.perf_counter() if overlap_debug else 0.0
         while self.layerwise_retrievers and self.current_layer <= target_layer:
             self._wait_for_next_layer_load()
 
@@ -1476,7 +1483,7 @@ class LMCacheConnectorV1Impl:
             )
             raise
 
-        if os.environ.get("SPECAGENT_OVERLAP_DEBUG"):
+        if overlap_debug:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             if requested_layer < 4 or requested_layer == self.num_layers - 1:
                 logger.info(
@@ -1537,7 +1544,8 @@ class LMCacheConnectorV1Impl:
             return
 
         start_layer = self.current_layer
-        t0 = time.perf_counter()
+        overlap_debug = _specagent_env_true("SPECAGENT_OVERLAP_DEBUG")
+        t0 = time.perf_counter() if overlap_debug else 0.0
         while (self.layerwise_retrievers
                and self.current_layer <= first_target_layer):
             self._wait_for_next_layer_load()
@@ -1563,7 +1571,7 @@ class LMCacheConnectorV1Impl:
                        and self.current_layer <= second_target_layer):
                     self._wait_for_next_layer_load()
 
-        if os.environ.get("SPECAGENT_OVERLAP_DEBUG") and requested_layer < 4:
+        if overlap_debug and requested_layer < 4:
             logger.info(
                 "[SpecAgent][OVERLAP-PREFETCH] requested_layer=%d "
                 "target_layer=%d prefetch_ahead=%d advanced=%d "
@@ -1619,7 +1627,12 @@ class LMCacheConnectorV1Impl:
                             expected_tokens,
                         )
                     )
-                should_log_ready = (
+                log_fetch_ready = (
+                    _specagent_env_true("SPECAGENT_VERBOSE")
+                    or _specagent_env_true("SPECAGENT_FETCH_DEBUG")
+                    or _specagent_env_true("SPECAGENT_BW_PROFILE")
+                )
+                should_log_ready = log_fetch_ready and (
                     self.current_layer == 0
                     or self.current_layer == self.num_layers - 1
                 )
@@ -1714,15 +1727,21 @@ class LMCacheConnectorV1Impl:
                                 expected_tokens,
                             )
                         )
-                    logger.info(
-                        "[SpecAgent][FETCH-READY] req=%s layer=%d "
-                        "segment=%s expected_tokens=%d ret_tokens=%d final=True",
-                        meta.get("req_id"),
-                        self.current_layer,
-                        meta.get("segment"),
-                        expected_tokens,
-                        final_tokens,
-                    )
+                    if (
+                        _specagent_env_true("SPECAGENT_VERBOSE")
+                        or _specagent_env_true("SPECAGENT_FETCH_DEBUG")
+                        or _specagent_env_true("SPECAGENT_BW_PROFILE")
+                    ):
+                        logger.info(
+                            "[SpecAgent][FETCH-READY] req=%s layer=%d "
+                            "segment=%s expected_tokens=%d ret_tokens=%d "
+                            "final=True",
+                            meta.get("req_id"),
+                            self.current_layer,
+                            meta.get("segment"),
+                            expected_tokens,
+                            final_tokens,
+                        )
                     if meta.get("copy_to_paged"):
                         src_blocks = meta.get("src_blocks")
                         dst_blocks = meta.get("dst_blocks")
@@ -1759,7 +1778,8 @@ class LMCacheConnectorV1Impl:
                     final_ret.sum().item()
                     if final_ret is not None and hasattr(final_ret, "sum") else 0
                 )
-                logger.info(f"Retrieved {num_retrieved_tokens} tokens")
+                if _specagent_env_true("SPECAGENT_BW_PROFILE"):
+                    logger.info("Retrieved %d tokens", num_retrieved_tokens)
                 continue
             active_retrievers.append(layerwise_retriever)
             active_meta.append(meta)
