@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple, Union
 import abc
 import builtins
 import os
+import time
 
 # Third Party
 import torch
@@ -1357,6 +1358,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         )
         debug_count = 0
         bw_profile = bool(os.environ.get("SPECAGENT_BW_PROFILE"))
+        sync_bw_profile = bool(os.environ.get("SPECAGENT_SYNC_BW_PROFILE"))
+        sync_bw_profile_limit = int(os.environ.get(
+            "SPECAGENT_SYNC_BW_PROFILE_MAX", "0"))
+        sync_bw_profile_count = 0
         bw_profile_records = []
         specagent_layer_events = kwargs.get("specagent_layer_events")
         event_synchronized_load = isinstance(specagent_layer_events, list)
@@ -1372,6 +1377,24 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             prof_start = prof_end = None
             prof_h2d_bytes = 0
             prof_gpu_copy_bytes = 0
+            sync_profile_enabled = False
+            sync_profile_t0 = 0.0
+            sync_profile_h2d_bytes = 0
+            if sync_bw_profile:
+                sync_profile_h2d_bytes = sum(
+                    int(memory_obj.get_size())
+                    for memory_obj in memory_objs_layer
+                )
+                sync_profile_enabled = (
+                    sync_profile_h2d_bytes > 0
+                    and (
+                        sync_bw_profile_limit <= 0
+                        or sync_bw_profile_count < sync_bw_profile_limit
+                    )
+                )
+                if sync_profile_enabled:
+                    torch.cuda.synchronize(self.device)
+                    sync_profile_t0 = time.time()
             if bw_profile:
                 prof_start = torch.cuda.Event(enable_timing=True)
                 prof_end = torch.cuda.Event(enable_timing=True)
@@ -1404,7 +1427,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             f"Expected memory format {MemoryFormat.KV_T2D}, "
                             f"got {memory_obj.metadata.fmt}"
                         )
-                    if bw_profile:
+                    if bw_profile or sync_profile_enabled:
                         prof_h2d_bytes += int(memory_obj.get_size())
                     if self.use_gpu:
                         tmp_gpu_buffer_obj.tensor[
@@ -1488,6 +1511,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         token_major=True,
                     )
                     if bw_profile:
+                        prof_gpu_copy_bytes = int(
+                            tmp_gpu_buffer_obj.tensor.numel()
+                            * tmp_gpu_buffer_obj.tensor.element_size()
+                        )
+                    elif sync_profile_enabled:
                         prof_gpu_copy_bytes = int(
                             tmp_gpu_buffer_obj.tensor.numel()
                             * tmp_gpu_buffer_obj.tensor.element_size()
@@ -1596,6 +1624,30 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     event.record(self.load_stream)
                     if layer_id < len(specagent_layer_events):
                         specagent_layer_events[layer_id] = event
+            if sync_profile_enabled:
+                torch.cuda.synchronize(self.device)
+                elapsed_s = max(time.time() - sync_profile_t0, 1e-12)
+                h2d_gbps = prof_h2d_bytes / elapsed_s / 1e9
+                total_bytes = prof_h2d_bytes + prof_gpu_copy_bytes
+                total_gbps = total_bytes / elapsed_s / 1e9
+                print(
+                    "[SpecAgent][LMC-H2D-SYNC-BW] "
+                    f"layer={layer_id} "
+                    f"h2d_bytes={prof_h2d_bytes} "
+                    f"gpu_copy_bytes={prof_gpu_copy_bytes} "
+                    f"total_bytes={total_bytes} "
+                    f"elapsed_ms={elapsed_s * 1000.0:.3f} "
+                    f"effective_h2d_GBps={h2d_gbps:.3f} "
+                    f"effective_total_GBps={total_gbps:.3f} "
+                    f"num_tokens={int(num_tokens)} "
+                    f"chunks={len(starts)} "
+                    f"starts_first={int(starts[0]) if starts else None} "
+                    f"ends_last={int(ends[-1]) if ends else None} "
+                    f"use_gpu={self.use_gpu} "
+                    f"event_mode={event_synchronized_load}",
+                    flush=True,
+                )
+                sync_bw_profile_count += 1
             if bw_profile and prof_start is not None and prof_end is not None:
                 bw_profile_records.append(
                     (layer_id, prof_h2d_bytes, prof_gpu_copy_bytes,
@@ -1603,8 +1655,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 )
         yield
 
-        # synchronize the last layer
-        if sync:
+        # synchronize the last layer.  SpecAgent passes per-layer events and
+        # waits on those from the attention stream; a stream-wide wait here
+        # serializes unrelated load-stream work and defeats layerwise overlap.
+        if sync and not event_synchronized_load:
             current_stream.wait_stream(self.load_stream)
         if bw_profile and bw_profile_records:
             total_h2d = 0

@@ -662,6 +662,8 @@ class LMCacheConnectorV1Impl:
         ] = []
         self._specagent_layerwise_meta: list[dict[str, object]] = []
         self._specagent_layerwise_check_period = 0
+        self._specagent_layer_group_size = 1
+        self._specagent_waited_layer_groups: set[int] = set()
         self._layerwise_save_storers: dict[
             str, Generator[Optional[torch.Tensor], None, None]
         ] = {}
@@ -936,6 +938,8 @@ class LMCacheConnectorV1Impl:
         self._specagent_layerwise_meta = []
         sa_lead = max(1, int(sa_extra.get("layer_prefetch_granularity", 2)))
         self._specagent_prefetch_lead = sa_lead
+        self._specagent_layer_group_size = sa_lead
+        self._specagent_waited_layer_groups.clear()
         self._specagent_layerwise_check_period = max(1, 2 * sa_lead)
         sa_verbose = (
             _specagent_env_true("SPECAGENT_VERBOSE")
@@ -1424,21 +1428,37 @@ class LMCacheConnectorV1Impl:
             requested_layer = self.current_layer
         requested_layer = max(0, min(int(requested_layer), self.num_layers - 1))
 
+        has_specagent_events = any(
+            isinstance(meta, dict)
+            and isinstance(meta.get("layer_events"), list)
+            for meta in self._specagent_layerwise_meta
+        )
+        group_size = 1
+        group_id = requested_layer
+        group_end_layer = requested_layer
+        if has_specagent_events:
+            group_size = max(
+                1,
+                min(
+                    int(getattr(self, "_specagent_layer_group_size", 1) or 1),
+                    self.num_layers,
+                ),
+            )
+            group_id = requested_layer // group_size
+            group_start_layer = group_id * group_size
+            group_end_layer = min(
+                group_start_layer + group_size - 1,
+                self.num_layers - 1,
+            )
+            if group_id in self._specagent_waited_layer_groups:
+                return
+
         # retrieve_layer() is already advanced through layer 0 in
-        # start_load_kv().  Each later advance sends the next layer to the GPU
-        # connector, and the connector waits for the previous layer's load
-        # stream before launching that copy.  Therefore one advance per
-        # requested layer is enough to make that layer visible.
-        #
-        # Advancing one layer too far is not just wasted work for SpecAgent:
-        # the scratch ring is indexed by layer % granularity.  With
-        # granularity=2, advancing through layer L+2 before layer L attention
-        # consumes scratch overwrites the exact slot layer L is about to read.
-        # The final layer is the only special case; it needs the generator's
-        # final synchronization advance because there is no layer L+1 copy to
-        # wait on it.
-        target_layer = requested_layer
-        if requested_layer == self.num_layers - 1:
+        # start_load_kv().  For SpecAgent, the scratch ring is reused every
+        # group_size layers, so it is safe to advance to the end of the current
+        # group but not beyond it.
+        target_layer = group_end_layer
+        if group_end_layer == self.num_layers - 1:
             target_layer = self.num_layers
         start_layer = self.current_layer
         overlap_debug = _specagent_env_true("SPECAGENT_OVERLAP_DEBUG")
@@ -1457,9 +1477,10 @@ class LMCacheConnectorV1Impl:
                 missing_event_dependency = True
                 continue
             events = meta.get("layer_events")
+            wait_layer = group_end_layer if has_specagent_events else requested_layer
             event = (
-                events[requested_layer]
-                if isinstance(events, list) and requested_layer < len(events)
+                events[wait_layer]
+                if isinstance(events, list) and wait_layer < len(events)
                 else None
             )
             if event is None:
@@ -1488,10 +1509,13 @@ class LMCacheConnectorV1Impl:
             if requested_layer < 4 or requested_layer == self.num_layers - 1:
                 logger.info(
                     "[SpecAgent][OVERLAP-WAIT] requested_layer=%d "
-                    "target_layer=%d advanced=%d start_layer=%d end_layer=%d "
-                    "wait_ms=%.3f active_retrievers=%d",
+                    "target_layer=%d group_size=%d group_end=%d "
+                    "advanced=%d start_layer=%d end_layer=%d wait_ms=%.3f "
+                    "active_retrievers=%d",
                     requested_layer,
                     target_layer,
+                    group_size,
+                    group_end_layer,
                     max(0, self.current_layer - start_layer),
                     start_layer,
                     self.current_layer,
@@ -1504,6 +1528,9 @@ class LMCacheConnectorV1Impl:
                     "fallback_stream_wait=True",
                     requested_layer,
                 )
+
+        if has_specagent_events:
+            self._specagent_waited_layer_groups.add(group_id)
 
         return
 
@@ -1592,18 +1619,34 @@ class LMCacheConnectorV1Impl:
             logger.debug("Waiting for layer %d to be loaded", self.current_layer)
 
         # Wait for the layer to be loaded
+        breakdown = _specagent_env_true("SPECAGENT_FETCH_BREAKDOWN")
         active_retrievers = []
         active_meta = []
         for idx, layerwise_retriever in enumerate(self.layerwise_retrievers):
+            next_t0 = time.perf_counter() if breakdown else 0.0
             try:
                 ret_token_mask = next(layerwise_retriever)
             except StopIteration:
                 continue
+            next_ms = (
+                (time.perf_counter() - next_t0) * 1000.0
+                if breakdown else 0.0
+            )
 
             meta = (
                 self._specagent_layerwise_meta[idx]
                 if idx < len(self._specagent_layerwise_meta) else None
             )
+            req_id = meta.get("req_id") if isinstance(meta, dict) else None
+            segment = meta.get("segment") if isinstance(meta, dict) else None
+            if breakdown:
+                print(
+                    "[SpecAgent][FETCH-BREAKDOWN][wait_next] "
+                    f"req={req_id} layer={self.current_layer} "
+                    f"retriever_idx={idx} segment={segment} "
+                    f"next_retriever_ms={next_ms:.3f}",
+                    flush=True,
+                )
             if meta is not None:
                 fetched_tokens = None
                 if ret_token_mask is not None:
@@ -1674,12 +1717,29 @@ class LMCacheConnectorV1Impl:
                         and dst_kvcaches
                     ):
                         layer_idx = self.current_layer
+                        copy_t0 = time.perf_counter() if breakdown else 0.0
                         current_platform.insert_blocks_to_device(
                             src_kvcaches[layer_idx],
                             dst_kvcaches[layer_idx],
                             src_blocks,
                             dst_blocks,
                         )
+                        copy_ms = (
+                            (time.perf_counter() - copy_t0) * 1000.0
+                            if breakdown else 0.0
+                        )
+                        if breakdown:
+                            blocks = (
+                                int(src_blocks.numel())
+                                if hasattr(src_blocks, "numel") else 0
+                            )
+                            print(
+                                "[SpecAgent][FETCH-BREAKDOWN][paged_copy] "
+                                f"req={req_id} layer={layer_idx} "
+                                f"segment={segment} blocks={blocks} "
+                                f"copy_ms={copy_ms:.3f} final=False",
+                                flush=True,
+                            )
                         if isinstance(events, list):
                             copied_event = torch.cuda.Event()
                             copied_event.record(current_stream)
@@ -1754,12 +1814,31 @@ class LMCacheConnectorV1Impl:
                             and dst_kvcaches
                         ):
                             layer_idx = self.current_layer
+                            copy_t0 = time.perf_counter() if breakdown else 0.0
                             current_platform.insert_blocks_to_device(
                                 src_kvcaches[layer_idx],
                                 dst_kvcaches[layer_idx],
                                 src_blocks,
                                 dst_blocks,
                             )
+                            copy_ms = (
+                                (time.perf_counter() - copy_t0) * 1000.0
+                                if breakdown else 0.0
+                            )
+                            if breakdown:
+                                blocks = (
+                                    int(src_blocks.numel())
+                                    if hasattr(src_blocks, "numel") else 0
+                                )
+                                print(
+                                    "[SpecAgent][FETCH-BREAKDOWN][paged_copy] "
+                                    f"req={meta.get('req_id')} "
+                                    f"layer={layer_idx} "
+                                    f"segment={meta.get('segment')} "
+                                    f"blocks={blocks} copy_ms={copy_ms:.3f} "
+                                    "final=True",
+                                    flush=True,
+                                )
                             events = meta.get("layer_events")
                             if isinstance(events, list):
                                 copied_event = torch.cuda.Event()
@@ -1774,6 +1853,22 @@ class LMCacheConnectorV1Impl:
                                     int(src_blocks.numel())
                                     if hasattr(src_blocks, "numel") else 0,
                                 )
+                    events = meta.get("layer_events")
+                    event = (
+                        events[self.current_layer]
+                        if isinstance(events, list)
+                        and self.current_layer < len(events)
+                        else None
+                    )
+                    if event is not None:
+                        torch.cuda.current_stream(self.device).wait_event(event)
+                    else:
+                        gpu_connector = getattr(
+                            self.lmcache_engine, "gpu_connector", None)
+                        load_stream = getattr(gpu_connector, "load_stream", None)
+                        if load_stream is not None:
+                            torch.cuda.current_stream(
+                                self.device).wait_stream(load_stream)
                 num_retrieved_tokens = (
                     final_ret.sum().item()
                     if final_ret is not None and hasattr(final_ret, "sum") else 0

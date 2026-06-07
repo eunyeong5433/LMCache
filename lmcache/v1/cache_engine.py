@@ -1381,6 +1381,21 @@ class LMCacheEngine:
                 send_ms = (time.perf_counter() - send_t0) * 1000.0
                 send_ms_total += send_ms
                 send_ms_max = max(send_ms_max, send_ms)
+                if os.environ.get("SPECAGENT_FETCH_BREAKDOWN"):
+                    bytes_layer = sum(
+                        int(memory_obj.get_size())
+                        for memory_obj in mem_objs_layer
+                    )
+                    print(
+                        "[SpecAgent][FETCH-BREAKDOWN][retrieve_layer] "
+                        f"req={req_id} layer={layer_id} "
+                        f"chunks={len(mem_objs_layer)} "
+                        f"bytes={bytes_layer} "
+                        f"task_result_ms={result_ms:.3f} "
+                        f"gpu_send_ms={send_ms:.3f} "
+                        f"cpu_prefetch_ahead={cpu_prefetch_ahead}",
+                        flush=True,
+                    )
                 to_count_down.extend(mem_objs_layer)
 
             if cpu_prefetch_profile:
