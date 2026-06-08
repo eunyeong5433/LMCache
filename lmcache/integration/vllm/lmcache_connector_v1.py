@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.utils import record_function_or_nullcontext
 import torch
 
 # First Party
@@ -72,7 +73,8 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             the same.
 
         """
-        self._lmcache_engine.start_load_kv(forward_context, **kwargs)
+        with record_function_or_nullcontext("lmcache connector: start_load_kv"):
+            self._lmcache_engine.start_load_kv(forward_context, **kwargs)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """
@@ -85,7 +87,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         Args:
             layer_name: the name of that layer
         """
-        self._lmcache_engine.wait_for_layer_load(layer_name)
+        with record_function_or_nullcontext(
+            f"lmcache connector: wait_for_layer_load {layer_name}"
+        ):
+            self._lmcache_engine.wait_for_layer_load(layer_name)
 
     def save_kv_layer(
         self,
@@ -106,9 +111,12 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             attn_metadata (AttentionMetadata): the attention metadata.
             **kwargs: additional arguments for the save operation.
         """
-        self._lmcache_engine.save_kv_layer(
-            layer_name, kv_layer, attn_metadata, **kwargs
-        )
+        with record_function_or_nullcontext(
+            f"lmcache connector: save_kv_layer {layer_name}"
+        ):
+            self._lmcache_engine.save_kv_layer(
+                layer_name, kv_layer, attn_metadata, **kwargs
+            )
 
     def wait_for_save(self):
         """
@@ -118,7 +126,8 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
 
         This prevents overwrites of paged KV buffer before saving done.
         """
-        self._lmcache_engine.wait_for_save()
+        with record_function_or_nullcontext("lmcache connector: wait_for_save"):
+            self._lmcache_engine.wait_for_save()
 
     def get_finished(
         self, finished_req_ids: set[str]

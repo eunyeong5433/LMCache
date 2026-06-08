@@ -23,6 +23,7 @@ from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.version import __version__ as VLLM_VERSION
 import torch
 
@@ -1125,19 +1126,27 @@ class LMCacheConnectorV1Impl:
                             lmcache_cached_tokens,
                         )
                     continue
+                saved_chunk_store = _specagent_cpu_saved_chunk_store()
+                prefix_hash_by_chunk_end: dict[int, int] = {}
+                hash_tokens_tuple = tuple(int(t) for t in tokens)
+
+                def chunk_prefix_hash(chunk_end: int) -> int:
+                    cached = prefix_hash_by_chunk_end.get(chunk_end)
+                    if cached is None:
+                        cached = hash(hash_tokens_tuple[:chunk_end])
+                        prefix_hash_by_chunk_end[chunk_end] = cached
+                    return cached
+
                 for seg_i, (seg_start, seg_end) in enumerate(
                     effective_chunk_segments
                 ):
-                    saved_chunk_store = _specagent_cpu_saved_chunk_store()
                     never_saved_chunks = []
                     for chunk_end in range(
                         seg_start + self._lmcache_chunk_size,
                         seg_end + 1,
                         self._lmcache_chunk_size,
                     ):
-                        token_hash = hash(tuple(
-                            int(t) for t in tokens[:chunk_end]
-                        ))
+                        token_hash = chunk_prefix_hash(chunk_end)
                         if (chunk_end, token_hash) not in saved_chunk_store:
                             never_saved_chunks.append(
                                 (
@@ -1186,19 +1195,27 @@ class LMCacheConnectorV1Impl:
                         # relaxed with per-segment events/double buffering.
                         sync = True
                         layer_events: list[Any] = [None] * self.num_layers
-                        layerwise_retriever = self.lmcache_engine.retrieve_layer(
-                            tokens[:seg_end],
-                            seg_token_mask,
-                            kvcaches=target_kvcaches,
-                            slot_mapping=slot_mapping[:seg_end],
-                            vllm_cached_tokens=seg_start,
-                            sync=sync,
-                            specagent_layer_events=layer_events,
-                            specagent_write_token_mask=(
-                                specagent_write_token_mask
-                            ),
-                        )
-                        first_ret = next(layerwise_retriever)
+                        with record_function_or_nullcontext(
+                            "lmcache adapter: specagent retrieve_layer "
+                            f"req={request.req_id} seg={seg_start}-{seg_end}"
+                        ):
+                            layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                                tokens[:seg_end],
+                                seg_token_mask,
+                                kvcaches=target_kvcaches,
+                                slot_mapping=slot_mapping[:seg_end],
+                                vllm_cached_tokens=seg_start,
+                                sync=sync,
+                                specagent_layer_events=layer_events,
+                                specagent_write_token_mask=(
+                                    specagent_write_token_mask
+                                ),
+                            )
+                        with record_function_or_nullcontext(
+                            "lmcache adapter: specagent retrieve first_next "
+                            f"req={request.req_id} seg={seg_start}-{seg_end}"
+                        ):
+                            first_ret = next(layerwise_retriever)
                         num_retrieved_tokens = (
                             int(first_ret.item())
                             if hasattr(first_ret, "item")
@@ -1221,7 +1238,11 @@ class LMCacheConnectorV1Impl:
                                     num_expected_tokens,
                                 )
                             )
-                        next(layerwise_retriever)
+                        with record_function_or_nullcontext(
+                            "lmcache adapter: specagent retrieve second_next "
+                            f"req={request.req_id} seg={seg_start}-{seg_end}"
+                        ):
+                            next(layerwise_retriever)
                         self.layerwise_retrievers.append(layerwise_retriever)
                         self._specagent_layerwise_meta.append({
                             "req_id": request.req_id,
@@ -1287,17 +1308,26 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     )
                 else:
-                    layerwise_retriever = self.lmcache_engine.retrieve_layer(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
-                        kvcaches=target_kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                        sync=sync,
-                    )
+                    with record_function_or_nullcontext(
+                        f"lmcache adapter: retrieve_layer req={request.req_id}"
+                    ):
+                        layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                            tokens[:lmcache_cached_tokens],
+                            token_mask[:lmcache_cached_tokens],
+                            kvcaches=target_kvcaches,
+                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                            vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                            sync=sync,
+                        )
                     # NOTE: retrieve for two layers at the first layer
-                    next(layerwise_retriever)
-                    next(layerwise_retriever)
+                    with record_function_or_nullcontext(
+                        f"lmcache adapter: retrieve prime0 req={request.req_id}"
+                    ):
+                        next(layerwise_retriever)
+                    with record_function_or_nullcontext(
+                        f"lmcache adapter: retrieve prime1 req={request.req_id}"
+                    ):
+                        next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
                     self._specagent_layerwise_meta.append(None)
             else:
@@ -1619,34 +1649,21 @@ class LMCacheConnectorV1Impl:
             logger.debug("Waiting for layer %d to be loaded", self.current_layer)
 
         # Wait for the layer to be loaded
-        breakdown = _specagent_env_true("SPECAGENT_FETCH_BREAKDOWN")
         active_retrievers = []
         active_meta = []
         for idx, layerwise_retriever in enumerate(self.layerwise_retrievers):
-            next_t0 = time.perf_counter() if breakdown else 0.0
             try:
-                ret_token_mask = next(layerwise_retriever)
+                with record_function_or_nullcontext(
+                    f"lmcache adapter: next layer={self.current_layer}"
+                ):
+                    ret_token_mask = next(layerwise_retriever)
             except StopIteration:
                 continue
-            next_ms = (
-                (time.perf_counter() - next_t0) * 1000.0
-                if breakdown else 0.0
-            )
 
             meta = (
                 self._specagent_layerwise_meta[idx]
                 if idx < len(self._specagent_layerwise_meta) else None
             )
-            req_id = meta.get("req_id") if isinstance(meta, dict) else None
-            segment = meta.get("segment") if isinstance(meta, dict) else None
-            if breakdown:
-                print(
-                    "[SpecAgent][FETCH-BREAKDOWN][wait_next] "
-                    f"req={req_id} layer={self.current_layer} "
-                    f"retriever_idx={idx} segment={segment} "
-                    f"next_retriever_ms={next_ms:.3f}",
-                    flush=True,
-                )
             if meta is not None:
                 fetched_tokens = None
                 if ret_token_mask is not None:
@@ -1717,29 +1734,12 @@ class LMCacheConnectorV1Impl:
                         and dst_kvcaches
                     ):
                         layer_idx = self.current_layer
-                        copy_t0 = time.perf_counter() if breakdown else 0.0
                         current_platform.insert_blocks_to_device(
                             src_kvcaches[layer_idx],
                             dst_kvcaches[layer_idx],
                             src_blocks,
                             dst_blocks,
                         )
-                        copy_ms = (
-                            (time.perf_counter() - copy_t0) * 1000.0
-                            if breakdown else 0.0
-                        )
-                        if breakdown:
-                            blocks = (
-                                int(src_blocks.numel())
-                                if hasattr(src_blocks, "numel") else 0
-                            )
-                            print(
-                                "[SpecAgent][FETCH-BREAKDOWN][paged_copy] "
-                                f"req={req_id} layer={layer_idx} "
-                                f"segment={segment} blocks={blocks} "
-                                f"copy_ms={copy_ms:.3f} final=False",
-                                flush=True,
-                            )
                         if isinstance(events, list):
                             copied_event = torch.cuda.Event()
                             copied_event.record(current_stream)
@@ -1814,31 +1814,12 @@ class LMCacheConnectorV1Impl:
                             and dst_kvcaches
                         ):
                             layer_idx = self.current_layer
-                            copy_t0 = time.perf_counter() if breakdown else 0.0
                             current_platform.insert_blocks_to_device(
                                 src_kvcaches[layer_idx],
                                 dst_kvcaches[layer_idx],
                                 src_blocks,
                                 dst_blocks,
                             )
-                            copy_ms = (
-                                (time.perf_counter() - copy_t0) * 1000.0
-                                if breakdown else 0.0
-                            )
-                            if breakdown:
-                                blocks = (
-                                    int(src_blocks.numel())
-                                    if hasattr(src_blocks, "numel") else 0
-                                )
-                                print(
-                                    "[SpecAgent][FETCH-BREAKDOWN][paged_copy] "
-                                    f"req={meta.get('req_id')} "
-                                    f"layer={layer_idx} "
-                                    f"segment={meta.get('segment')} "
-                                    f"blocks={blocks} copy_ms={copy_ms:.3f} "
-                                    "final=True",
-                                    flush=True,
-                                )
                             events = meta.get("layer_events")
                             if isinstance(events, list):
                                 copied_event = torch.cuda.Event()
