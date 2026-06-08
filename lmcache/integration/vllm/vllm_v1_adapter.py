@@ -1172,6 +1172,12 @@ class LMCacheConnectorV1Impl:
                         )
                     seg_token_mask = torch.ones(seg_end, dtype=torch.bool)
                     seg_token_mask[:seg_start] = False
+                    num_expected_tokens = seg_end - seg_start
+                    expected_mib = (
+                        num_expected_tokens
+                        * self._specagent_kv_bytes_per_layer_token()
+                        / (1024 * 1024)
+                    )
                     specagent_write_token_mask = None
                     if use_paged_restore_target:
                         specagent_write_token_mask = torch.zeros(
@@ -1197,7 +1203,9 @@ class LMCacheConnectorV1Impl:
                         layer_events: list[Any] = [None] * self.num_layers
                         with record_function_or_nullcontext(
                             "lmcache adapter: specagent retrieve_layer "
-                            f"req={request.req_id} seg={seg_start}-{seg_end}"
+                            f"req={request.req_id} seg={seg_start}-{seg_end} "
+                            f"expected_tokens={num_expected_tokens} "
+                            f"expected_layer_mib={expected_mib:.1f}"
                         ):
                             layerwise_retriever = self.lmcache_engine.retrieve_layer(
                                 tokens[:seg_end],
@@ -1213,7 +1221,9 @@ class LMCacheConnectorV1Impl:
                             )
                         with record_function_or_nullcontext(
                             "lmcache adapter: specagent retrieve first_next "
-                            f"req={request.req_id} seg={seg_start}-{seg_end}"
+                            f"req={request.req_id} seg={seg_start}-{seg_end} "
+                            f"expected_tokens={num_expected_tokens} "
+                            f"expected_layer_mib={expected_mib:.1f}"
                         ):
                             first_ret = next(layerwise_retriever)
                         num_retrieved_tokens = (
@@ -1221,7 +1231,6 @@ class LMCacheConnectorV1Impl:
                             if hasattr(first_ret, "item")
                             else 0
                         )
-                        num_expected_tokens = int(seg_token_mask.sum().item())
                         if num_retrieved_tokens < num_expected_tokens:
                             raise RuntimeError(
                                 "[SpecAgent][FETCH-INCOMPLETE] req=%s "
@@ -1240,7 +1249,9 @@ class LMCacheConnectorV1Impl:
                             )
                         with record_function_or_nullcontext(
                             "lmcache adapter: specagent retrieve second_next "
-                            f"req={request.req_id} seg={seg_start}-{seg_end}"
+                            f"req={request.req_id} seg={seg_start}-{seg_end} "
+                            f"expected_tokens={num_expected_tokens} "
+                            f"expected_layer_mib={expected_mib:.1f}"
                         ):
                             next(layerwise_retriever)
                         self.layerwise_retrievers.append(layerwise_retriever)
@@ -1493,8 +1504,22 @@ class LMCacheConnectorV1Impl:
         start_layer = self.current_layer
         overlap_debug = _specagent_env_true("SPECAGENT_OVERLAP_DEBUG")
         t0 = time.perf_counter() if overlap_debug else 0.0
-        while self.layerwise_retrievers and self.current_layer <= target_layer:
-            self._wait_for_next_layer_load()
+        expected_layer_mib = self._specagent_expected_layer_mib()
+        advance_layers = max(0, target_layer - start_layer + 1)
+        expected_wait_mib = expected_layer_mib * advance_layers
+        with record_function_or_nullcontext(
+            "lmcache connector: wait_for_layer_load "
+            f"layer={requested_layer} group={group_id} "
+            f"group_size={group_size} target={target_layer} "
+            f"advance_layers={advance_layers} "
+            f"expected_layer_mib={expected_layer_mib:.1f} "
+            f"expected_wait_mib={expected_wait_mib:.1f}"
+        ):
+            while (
+                self.layerwise_retrievers
+                and self.current_layer <= target_layer
+            ):
+                self._wait_for_next_layer_load()
 
         # Wait only for the layer being consumed.  A stream-wide wait would also
         # wait for the one-group-ahead prefetch launched above, defeating the
@@ -1516,14 +1541,24 @@ class LMCacheConnectorV1Impl:
             if event is None:
                 missing_event_dependency = True
                 continue
-            current_stream.wait_event(event)
+            with record_function_or_nullcontext(
+                "lmcache connector: wait_for_layer_load event "
+                f"layer={requested_layer} wait_layer={wait_layer} "
+                f"group={group_id} expected_layer_mib={expected_layer_mib:.1f}"
+            ):
+                current_stream.wait_event(event)
             waited_event = True
 
         try:
             gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
             load_stream = getattr(gpu_connector, "load_stream", None)
             if missing_event_dependency and load_stream is not None:
-                current_stream.wait_stream(load_stream)
+                with record_function_or_nullcontext(
+                    "lmcache connector: wait_for_layer_load stream_fallback "
+                    f"layer={requested_layer} group={group_id} "
+                    f"expected_wait_mib={expected_wait_mib:.1f}"
+                ):
+                    current_stream.wait_stream(load_stream)
         except Exception:
             logger.exception(
                 "[SpecAgent][FETCH-SYNC] failed to synchronize load stream "
@@ -1563,6 +1598,30 @@ class LMCacheConnectorV1Impl:
             self._specagent_waited_layer_groups.add(group_id)
 
         return
+
+    def _specagent_kv_bytes_per_layer_token(self) -> int:
+        if not self.kv_caches:
+            return 0
+        kv_layer = next(iter(self.kv_caches.values()))
+        if kv_layer.ndim < 5:
+            return 0
+        return (
+            2
+            * int(kv_layer.shape[-2])
+            * int(kv_layer.shape[-1])
+            * int(kv_layer.element_size())
+        )
+
+    def _specagent_expected_layer_mib(self) -> float:
+        bytes_per_layer_token = self._specagent_kv_bytes_per_layer_token()
+        if bytes_per_layer_token <= 0:
+            return 0.0
+        expected_tokens = sum(
+            int(meta.get("expected_tokens", 0) or 0)
+            for meta in self._specagent_layerwise_meta
+            if isinstance(meta, dict)
+        )
+        return expected_tokens * bytes_per_layer_token / (1024 * 1024)
 
     def prefetch_next_layer_load(
         self,
@@ -1652,18 +1711,30 @@ class LMCacheConnectorV1Impl:
         active_retrievers = []
         active_meta = []
         for idx, layerwise_retriever in enumerate(self.layerwise_retrievers):
-            try:
-                with record_function_or_nullcontext(
-                    f"lmcache adapter: next layer={self.current_layer}"
-                ):
-                    ret_token_mask = next(layerwise_retriever)
-            except StopIteration:
-                continue
-
             meta = (
                 self._specagent_layerwise_meta[idx]
                 if idx < len(self._specagent_layerwise_meta) else None
             )
+            next_label = f"lmcache adapter: next layer={self.current_layer}"
+            if isinstance(meta, dict):
+                expected_tokens = int(meta.get("expected_tokens") or 0)
+                expected_mib = (
+                    expected_tokens
+                    * self._specagent_kv_bytes_per_layer_token()
+                    / (1024 * 1024)
+                )
+                next_label += (
+                    f" req={meta.get('req_id')}"
+                    f" segment={meta.get('segment')}"
+                    f" expected_tokens={expected_tokens}"
+                    f" expected_mib={expected_mib:.1f}"
+                )
+            try:
+                with record_function_or_nullcontext(next_label):
+                    ret_token_mask = next(layerwise_retriever)
+            except StopIteration:
+                continue
+
             if meta is not None:
                 fetched_tokens = None
                 if ret_token_mask is not None:
