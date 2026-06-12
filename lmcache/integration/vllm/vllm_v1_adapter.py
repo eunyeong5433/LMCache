@@ -3285,9 +3285,26 @@ class LMCacheConnectorV1Impl:
                     f"This might be due to an unsupported vLLM version."
                 )
             if preempted:
-                assert load_spec is not None, (
-                    f"Request {req_id} is preempted but was not given a load spec"
-                )
+                if load_spec is None:
+                    # A resumed request may have only vLLM-local prefix cache
+                    # available.  Do not invent an LMCache hit here: the
+                    # scheduler did not reserve external-load slots for one,
+                    # and marking tokens as LMCache-backed would violate the
+                    # SpecAgent CPU-backed proof invariant.
+                    vllm_cached_tokens = max(0, int(request.num_computed_tokens))
+                    lmcache_cached_tokens = 0
+                    load_spec = LoadSpec(
+                        vllm_cached_tokens=vllm_cached_tokens,
+                        lmcache_cached_tokens=lmcache_cached_tokens,
+                        can_load=False,
+                    )
+                    logger.warning(
+                        "[SpecAgent][PREEMPT-NO-LOADSPEC] req=%s "
+                        "num_computed_tokens=%d; using vLLM-local no-load "
+                        "fallback",
+                        req_id,
+                        request.num_computed_tokens,
+                    )
                 # num_computed_tokens should be reset to 0 during preemption
                 # and then set to the number of already cached tokens (maxxing
                 # prefix caching and lmcache)
