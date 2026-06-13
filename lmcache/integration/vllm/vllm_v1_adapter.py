@@ -69,6 +69,10 @@ def _specagent_env_true(env_name: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _specagent_timing_enabled() -> bool:
+    return _specagent_env_true("SPECAGENT_LMCACHE_TIMING")
+
+
 def _specagent_layer_index(layer_name: str) -> Optional[int]:
     for part in layer_name.split("."):
         if part.isdigit():
@@ -429,6 +433,8 @@ class ReqMeta:
             the request metadata if we need to perform load/save
             operations, None otherwise.
         """
+        timing = _specagent_timing_enabled()
+        t0 = time.perf_counter() if timing else 0.0
         input_token_ids = tracker.token_ids
         input_token_len = len(input_token_ids)
 
@@ -458,6 +464,17 @@ class ReqMeta:
         )
 
         if skip_save and load_spec is None:
+            if timing:
+                logger.info(
+                    "[SpecAgent][LMCACHE-TIMING] from_tracker req=%s "
+                    "result=none reason=skip_save input_tokens=%d "
+                    "saved_tokens=%d is_decode=%s elapsed_ms=%.3f",
+                    tracker.req_id,
+                    input_token_len,
+                    tracker.num_saved_tokens,
+                    tracker.is_decode_phase,
+                    (time.perf_counter() - t0) * 1000.0,
+                )
             return None
 
         # Calculate number of tokens to save based on discard_partial_chunks
@@ -564,7 +581,7 @@ class ReqMeta:
             )
 
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
-        return ReqMeta(
+        req_meta = ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
@@ -574,6 +591,24 @@ class ReqMeta:
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
         )
+        if timing:
+            logger.info(
+                "[SpecAgent][LMCACHE-TIMING] from_tracker req=%s "
+                "result=meta input_tokens=%d save_tokens=%d skip_leading=%d "
+                "can_save=%s load_vllm=%s load_lmcache=%s can_load=%s "
+                "is_decode=%s elapsed_ms=%.3f",
+                tracker.req_id,
+                input_token_len,
+                len(token_ids),
+                save_spec.skip_leading_tokens if save_spec is not None else None,
+                save_spec.can_save if save_spec is not None else None,
+                load_spec.vllm_cached_tokens if load_spec is not None else None,
+                load_spec.lmcache_cached_tokens if load_spec is not None else None,
+                load_spec.can_load if load_spec is not None else None,
+                tracker.is_decode_phase,
+                (time.perf_counter() - t0) * 1000.0,
+            )
+        return req_meta
 
 
 @dataclass
@@ -916,6 +951,8 @@ class LMCacheConnectorV1Impl:
 
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
+        timing = _specagent_timing_enabled()
+        t0 = time.perf_counter() if timing else 0.0
 
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
@@ -931,6 +968,13 @@ class LMCacheConnectorV1Impl:
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
             logger.debug("In connector.start_load_kv, but the attn_metadata is None")
+            if timing:
+                logger.info(
+                    "[SpecAgent][LMCACHE-TIMING] start_load_kv "
+                    "result=no_attn_metadata metadata_reqs=%d elapsed_ms=%.3f",
+                    len(metadata.requests),
+                    (time.perf_counter() - t0) * 1000.0,
+                )
             return
 
         assert self.lmcache_engine is not None
@@ -1379,6 +1423,29 @@ class LMCacheConnectorV1Impl:
                         slot_mapping[:lmcache_cached_tokens],
                     )
                     self._invalid_block_ids.update(missing_blocks)
+
+        if timing:
+            loadable = sum(
+                1
+                for req in metadata.requests
+                if req.load_spec is not None and req.load_spec.can_load
+            )
+            saveable = sum(
+                1
+                for req in metadata.requests
+                if req.save_spec is not None and req.save_spec.can_save
+            )
+            logger.info(
+                "[SpecAgent][LMCACHE-TIMING] start_load_kv "
+                "result=done metadata_reqs=%d loadable=%d saveable=%d "
+                "specagent_fetch_reqs=%d layerwise=%s elapsed_ms=%.3f",
+                len(metadata.requests),
+                loadable,
+                saveable,
+                len(sa_fetch_reqs),
+                self.use_layerwise,
+                (time.perf_counter() - t0) * 1000.0,
+            )
 
     def record_failed_blocks(
         self,
@@ -1958,6 +2025,10 @@ class LMCacheConnectorV1Impl:
             **kwargs: additional arguments for the save operation.
         """
         assert self.lmcache_engine is not None
+        timing = _specagent_timing_enabled()
+        t0 = time.perf_counter() if timing else 0.0
+        saved_reqs = 0
+        saved_tokens = 0
 
         if not self.use_layerwise:
             return
@@ -2086,6 +2157,8 @@ class LMCacheConnectorV1Impl:
                     skip_leading_tokens,
                 )
 
+            saved_reqs += 1
+            saved_tokens += max(0, len(token_ids) - skip_leading_tokens)
             if (
                 layer_idx == 0
                 and os.environ.get("SPECAGENT_LEGACY_PRESTORE_PROOF")
@@ -2252,9 +2325,32 @@ class LMCacheConnectorV1Impl:
 
             next(layerwise_storer)
 
+        if timing:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            should_log = (
+                saved_reqs > 0
+                and (
+                    layer_idx in {0, self.num_layers - 1}
+                    or elapsed_ms >= 1.0
+                )
+            )
+            if should_log:
+                logger.info(
+                    "[SpecAgent][LMCACHE-TIMING] save_kv_layer layer=%s "
+                    "layer_idx=%s saved_reqs=%d saved_tokens=%d "
+                    "elapsed_ms=%.3f",
+                    layer_name,
+                    layer_idx,
+                    saved_reqs,
+                    saved_tokens,
+                    elapsed_ms,
+                )
+
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
+        timing = _specagent_timing_enabled()
+        t0 = time.perf_counter() if timing else 0.0
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
@@ -2269,17 +2365,35 @@ class LMCacheConnectorV1Impl:
             for request in connector_metadata.requests:
                 self.lmcache_engine.lookup_unpin(request.req_id)
 
+            if timing:
+                logger.info(
+                    "[SpecAgent][LMCACHE-TIMING] wait_for_save "
+                    "role=consumer metadata_reqs=%d elapsed_ms=%.3f",
+                    len(connector_metadata.requests),
+                    (time.perf_counter() - t0) * 1000.0,
+                )
             return
 
         if self.use_layerwise:
+            finalized = 0
             for request in connector_metadata.requests:
                 layerwise_storer = self._layerwise_save_storers.pop(
                     request.req_id, None
                 )
                 if layerwise_storer is not None:
                     next(layerwise_storer)
+                    finalized += 1
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
+            if timing:
+                logger.info(
+                    "[SpecAgent][LMCACHE-TIMING] wait_for_save "
+                    "mode=layerwise metadata_reqs=%d finalized=%d "
+                    "elapsed_ms=%.3f",
+                    len(connector_metadata.requests),
+                    finalized,
+                    (time.perf_counter() - t0) * 1000.0,
+                )
             return
 
         assert len(self.kv_caches) > 0
@@ -2380,6 +2494,14 @@ class LMCacheConnectorV1Impl:
                 if request.disagg_spec:
                     request.disagg_spec.num_transferred_tokens = len(token_ids)
 
+        if timing:
+            logger.info(
+                "[SpecAgent][LMCACHE-TIMING] wait_for_save "
+                "mode=bulk metadata_reqs=%d elapsed_ms=%.3f",
+                len(connector_metadata.requests),
+                (time.perf_counter() - t0) * 1000.0,
+            )
+
     @_lmcache_nvtx_annotate
     def get_finished(
         self, finished_req_ids: set[str]
@@ -2419,6 +2541,10 @@ class LMCacheConnectorV1Impl:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
+        timing = _specagent_timing_enabled()
+        t0 = time.perf_counter() if timing else 0.0
+        lookup_cached = False
+
         # Ignore DP attention mock requests
         if request.request_id.startswith("mock_req"):
             return 0
@@ -2444,6 +2570,7 @@ class LMCacheConnectorV1Impl:
         ) != -1:
             # -1 means no result cached
             # None or int means ongoing (async) or cached result
+            lookup_cached = True
             logger.debug(
                 f"Found {num_external_hit_tokens} hit tokens for request"
                 f" {req_id} in the lookup cache."
@@ -2482,6 +2609,17 @@ class LMCacheConnectorV1Impl:
                 request.num_tokens,
                 num_computed_tokens,
             )
+            if timing:
+                logger.info(
+                    "[SpecAgent][LMCACHE-TIMING] lookup req=%s "
+                    "result=pending cached_result=%s total_tokens=%d "
+                    "vllm_local_tokens=%d elapsed_ms=%.3f",
+                    req_id,
+                    lookup_cached,
+                    request.num_tokens,
+                    num_computed_tokens,
+                    (time.perf_counter() - t0) * 1000.0,
+                )
             return None
 
         # When prompt length is divisible by the block size and all
@@ -2530,12 +2668,42 @@ class LMCacheConnectorV1Impl:
         )
 
         if below_min_retrieve or need_to_allocate <= 0:
+            if timing:
+                logger.info(
+                    "[SpecAgent][LMCACHE-TIMING] lookup req=%s "
+                    "result=no_load cached_result=%s total_tokens=%d "
+                    "vllm_local_tokens=%d lmcache_hit_tokens=%d "
+                    "need_to_load=%d below_min=%s elapsed_ms=%.3f",
+                    req_id,
+                    lookup_cached,
+                    request.num_tokens,
+                    num_computed_tokens,
+                    num_external_hit_tokens,
+                    max(need_to_allocate, 0),
+                    below_min_retrieve,
+                    (time.perf_counter() - t0) * 1000.0,
+                )
             return 0
 
         # TODO: Align to vLLM block size. Should test whether it can be removed
         # need_to_allocate = need_to_allocate // self._block_size * \
         #        self._block_size
 
+        if timing:
+            logger.info(
+                "[SpecAgent][LMCACHE-TIMING] lookup req=%s "
+                "result=load cached_result=%s total_tokens=%d "
+                "vllm_local_tokens=%d lmcache_hit_tokens=%d "
+                "need_to_load=%d below_min=%s elapsed_ms=%.3f",
+                req_id,
+                lookup_cached,
+                request.num_tokens,
+                num_computed_tokens,
+                num_external_hit_tokens,
+                max(need_to_allocate, 0),
+                below_min_retrieve,
+                (time.perf_counter() - t0) * 1000.0,
+            )
         return need_to_allocate
 
     @_lmcache_nvtx_annotate
@@ -2546,6 +2714,8 @@ class LMCacheConnectorV1Impl:
         For SharedStorageConnector, update _request_needs_load
         if the CacheManager this allocated blocks for us.
         """
+
+        timing = _specagent_timing_enabled()
 
         # Clear local status in lookup client when a new request is
         # successfully scheduled.
@@ -2578,11 +2748,35 @@ class LMCacheConnectorV1Impl:
 
         if request.request_id not in self.load_specs:
             # No KV tokens from external KV cache, return
+            if timing:
+                logger.info(
+                    "[SpecAgent][LMCACHE-TIMING] after_alloc req=%s "
+                    "result=no_load_spec num_external_tokens=%d "
+                    "num_computed_tokens=%d total_tokens=%d",
+                    request.request_id,
+                    num_external_tokens,
+                    request.num_computed_tokens,
+                    request.num_tokens,
+                )
             return
 
         if num_external_tokens == 0:
             # No need to load anything
             self.load_specs[request.request_id].can_load = False
+            if timing:
+                spec = self.load_specs[request.request_id]
+                logger.info(
+                    "[SpecAgent][LMCACHE-TIMING] after_alloc req=%s "
+                    "result=no_external_load num_external_tokens=0 "
+                    "load_vllm=%d load_lmcache=%d can_load=%s "
+                    "num_computed_tokens=%d total_tokens=%d",
+                    request.request_id,
+                    spec.vllm_cached_tokens,
+                    spec.lmcache_cached_tokens,
+                    spec.can_load,
+                    request.num_computed_tokens,
+                    request.num_tokens,
+                )
             return
 
         recalc_last = (
@@ -2610,6 +2804,21 @@ class LMCacheConnectorV1Impl:
         )
 
         self.load_specs[request.request_id].can_load = True
+        if timing:
+            spec = self.load_specs[request.request_id]
+            logger.info(
+                "[SpecAgent][LMCACHE-TIMING] after_alloc req=%s "
+                "result=external_load num_external_tokens=%d "
+                "load_vllm=%d load_lmcache=%d can_load=%s "
+                "num_computed_tokens=%d total_tokens=%d",
+                request.request_id,
+                num_external_tokens,
+                spec.vllm_cached_tokens,
+                spec.lmcache_cached_tokens,
+                spec.can_load,
+                request.num_computed_tokens,
+                request.num_tokens,
+            )
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(
@@ -3300,10 +3509,14 @@ class LMCacheConnectorV1Impl:
                     )
                     logger.warning(
                         "[SpecAgent][PREEMPT-NO-LOADSPEC] req=%s "
-                        "num_computed_tokens=%d; using vLLM-local no-load "
-                        "fallback",
+                        "num_computed_tokens=%d num_external_computed_tokens=%s "
+                        "num_new_tokens=%d tracker_len=%d; using vLLM-local "
+                        "no-load fallback",
                         req_id,
                         request.num_computed_tokens,
+                        getattr(request, "num_external_computed_tokens", None),
+                        num_new_tokens,
+                        len(request_tracker.token_ids),
                     )
                 # num_computed_tokens should be reset to 0 during preemption
                 # and then set to the number of already cached tokens (maxxing
