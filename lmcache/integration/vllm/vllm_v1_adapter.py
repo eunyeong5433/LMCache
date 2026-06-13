@@ -409,6 +409,8 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    # SpecAgent turn-end save emitted after the request actually stopped.
+    is_finished_save: bool = False
 
     @staticmethod
     def from_request_tracker(
@@ -714,9 +716,11 @@ class LMCacheConnectorV1Impl:
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
             self._unfinished_requests: dict[str, "Request"] = {}
+            self._specagent_finished_save_metas: dict[str, ReqMeta] = {}
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
+            self._specagent_finished_save_completed: set[str] = set()
 
             if self.enable_blending:
                 assert self.lmcache_engine is not None
@@ -2129,7 +2133,7 @@ class LMCacheConnectorV1Impl:
 
             store_mask = torch.ones(len(token_ids), dtype=torch.bool)
             store_mask[:skip_leading_tokens] = False
-            if skip_leading_tokens > 0:
+            if skip_leading_tokens > 0 and not request.is_finished_save:
                 aligned_token_len = (
                     len(token_ids)
                     // self._lmcache_chunk_size
@@ -2329,7 +2333,12 @@ class LMCacheConnectorV1Impl:
                 if is_first:
                     is_first = False
 
-            next(layerwise_storer)
+            try:
+                next(layerwise_storer)
+            except StopIteration:
+                self._layerwise_save_storers.pop(request.req_id, None)
+                if request.is_finished_save:
+                    self._specagent_finished_save_completed.add(request.req_id)
 
         if timing:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -2387,8 +2396,13 @@ class LMCacheConnectorV1Impl:
                     request.req_id, None
                 )
                 if layerwise_storer is not None:
-                    next(layerwise_storer)
+                    try:
+                        next(layerwise_storer)
+                    except StopIteration:
+                        pass
                     finalized += 1
+                if request.is_finished_save:
+                    self._specagent_finished_save_completed.add(request.req_id)
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
             if timing:
@@ -2446,7 +2460,7 @@ class LMCacheConnectorV1Impl:
 
             store_mask = torch.ones(len(token_ids), dtype=torch.bool)
             store_mask[:skip_leading_tokens] = False
-            if skip_leading_tokens > 0:
+            if skip_leading_tokens > 0 and not request.is_finished_save:
                 aligned_token_len = (
                     len(token_ids)
                     // self._lmcache_chunk_size
@@ -2509,10 +2523,71 @@ class LMCacheConnectorV1Impl:
             )
 
     @_lmcache_nvtx_annotate
+    def _specagent_save_finished_meta_without_forward(
+        self, request: ReqMeta
+    ) -> bool:
+        """Store a finished SpecAgent turn when no model forward is running."""
+        if not request.is_finished_save:
+            return False
+        save_spec = request.save_spec
+        if save_spec is None or not save_spec.can_save:
+            return True
+        if self.kv_role == "kv_consumer":
+            return True
+        assert self.lmcache_engine is not None
+        assert len(self.kv_caches) > 0
+
+        token_ids = request.token_ids
+        slot_mapping = request.slot_mapping
+        assert isinstance(token_ids, list)
+        assert isinstance(slot_mapping, torch.Tensor)
+        assert len(slot_mapping) == len(token_ids)
+        if not token_ids:
+            return True
+
+        slot_mapping = slot_mapping.to(self.device)
+        skip_leading_tokens = (
+            save_spec.skip_leading_tokens
+            // self._lmcache_chunk_size
+            * self._lmcache_chunk_size
+        )
+        if skip_leading_tokens >= len(token_ids):
+            return True
+
+        store_mask = torch.ones(len(token_ids), dtype=torch.bool)
+        store_mask[:skip_leading_tokens] = False
+        storer = self.lmcache_engine.store_layer(
+            token_ids,
+            mask=store_mask,
+            kvcaches=list(self.kv_caches.values()),
+            slot_mapping=slot_mapping,
+            offset=0,
+            sync=True,
+            req_id=request.req_id,
+            specagent_block_size=self._block_size,
+            specagent_save_current_layer_only=False,
+        )
+        for _ in storer:
+            pass
+        return True
+
+    @_lmcache_nvtx_annotate
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        return None, None
+        connector_metadata = self._parent._get_connector_metadata()
+        if isinstance(connector_metadata, LMCacheConnectorMetadata):
+            for request in connector_metadata.requests:
+                if (
+                    request.is_finished_save
+                    and request.req_id
+                    not in self._specagent_finished_save_completed
+                ):
+                    if self._specagent_save_finished_meta_without_forward(request):
+                        self._specagent_finished_save_completed.add(request.req_id)
+        finished_sending = set(self._specagent_finished_save_completed)
+        self._specagent_finished_save_completed.clear()
+        return finished_sending or None, None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         invalid_blocks = self._invalid_block_ids.copy()
@@ -2942,6 +3017,25 @@ class LMCacheConnectorV1Impl:
 
         def specagent_step_force_save(req_id: str) -> bool:
             return req_id in specagent_turn_end_save_reqs
+
+        for req_id, req_meta in list(
+            getattr(self, "_specagent_finished_save_metas", {}).items()
+        ):
+            meta.add_request(req_meta)
+            emitted_req_ids.add(req_id)
+            self._specagent_finished_save_metas.pop(req_id, None)
+            if _specagent_env_true("SPECAGENT_SAVE_DEBUG"):
+                logger.warning(
+                    "[SpecAgent][FINISH-SAVE-META] emit req=%s tokens=%d "
+                    "skip=%s",
+                    req_id,
+                    len(req_meta.token_ids),
+                    (
+                        req_meta.save_spec.skip_leading_tokens
+                        if req_meta.save_spec is not None
+                        else None
+                    ),
+                )
 
         def set_step_skip_save(
             request_tracker: RequestTracker, req_id: str
@@ -3721,6 +3815,67 @@ class LMCacheConnectorV1Impl:
                 return_params["num_lmcache_cached_tokens"] = (
                     request_tracker.num_lmcache_cached_tokens
                 )
+
+        spec_cfg = getattr(self._vllm_config, "specagent_config", None)
+        if isinstance(spec_cfg, dict):
+            turn_end_only = bool(spec_cfg.get("save_kv_on_turn_end_only", False))
+        else:
+            turn_end_only = bool(
+                getattr(spec_cfg, "save_kv_on_turn_end_only", False)
+                if spec_cfg is not None
+                else False
+            )
+        if (
+            turn_end_only
+            and getattr(request, "job_id", None) is not None
+            and request.status != RequestStatus.FINISHED_ABORTED
+        ):
+            tracker = self._request_trackers.get(request.request_id)
+            skip_leading_tokens = (
+                int(tracker.num_saved_tokens)
+                if tracker is not None else 0
+            )
+            token_limit = min(
+                int(getattr(request, "num_computed_tokens", 0) or 0),
+                len(request.all_token_ids),
+                len(block_ids) * self._block_size,
+            )
+            if token_limit > skip_leading_tokens:
+                block_ids_tensor = torch.tensor(block_ids, dtype=torch.long)
+                block_offsets = torch.arange(
+                    0, self._block_size, dtype=torch.long
+                )
+                slot_mapping = (
+                    block_offsets.reshape((1, self._block_size))
+                    + block_ids_tensor.reshape((len(block_ids), 1))
+                    * self._block_size
+                ).flatten()[:token_limit]
+                req_meta = ReqMeta(
+                    req_id=request.request_id,
+                    token_ids=list(request.all_token_ids[:token_limit]),
+                    slot_mapping=slot_mapping,
+                    is_last_prefill=True,
+                    save_spec=SaveSpec(skip_leading_tokens, True),
+                    load_spec=None,
+                    disagg_spec=None,
+                    request_configs=(
+                        tracker.request_configs
+                        if tracker is not None else None
+                    ),
+                    is_finished_save=True,
+                )
+                self._specagent_finished_save_metas[request.request_id] = req_meta
+                if _specagent_env_true("SPECAGENT_SAVE_DEBUG"):
+                    logger.warning(
+                        "[SpecAgent][FINISH-SAVE] req=%s tokens=%d "
+                        "skip=%d blocks=%d status=%s",
+                        request.request_id,
+                        token_limit,
+                        skip_leading_tokens,
+                        len(block_ids),
+                        request.status,
+                    )
+                return True, return_params
 
         return False, return_params
 
