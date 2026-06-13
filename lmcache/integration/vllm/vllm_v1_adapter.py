@@ -418,6 +418,7 @@ class ReqMeta:
         load_spec: Optional[LoadSpec] = None,
         discard_partial_chunks: bool = True,
         save_decode_cache: bool = False,
+        force_save: bool = False,
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -428,6 +429,8 @@ class ReqMeta:
             load_spec (Optional[LoadSpec]): the load spec for KV cache loading.
             discard_partial_chunks (bool): whether to discard partial chunks.
             save_decode_cache (bool): whether to save the cache in decode phase.
+            force_save (bool): whether to bypass chunk-boundary/decode save
+                skips for a final turn-level flush.
 
         Returns:
             the request metadata if we need to perform load/save
@@ -456,11 +459,13 @@ class ReqMeta:
         # Check if request_configs has lmcache.skip_save set to True
         request_skip = (tracker.request_configs or {}).get("lmcache.skip_save", False)
 
-        skip_save = tracker.disagg_spec is None and (
-            tracker.skip_save
-            or (tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary)
+        explicit_skip = tracker.skip_save or request_skip
+        boundary_or_decode_skip = (
+            (tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary)
             or (tracker.is_decode_phase and not save_decode_cache)
-            or request_skip
+        )
+        skip_save = tracker.disagg_spec is None and (
+            explicit_skip or ((not force_save) and boundary_or_decode_skip)
         )
 
         if skip_save and load_spec is None:
@@ -596,7 +601,7 @@ class ReqMeta:
                 "[SpecAgent][LMCACHE-TIMING] from_tracker req=%s "
                 "result=meta input_tokens=%d save_tokens=%d skip_leading=%d "
                 "can_save=%s load_vllm=%s load_lmcache=%s can_load=%s "
-                "is_decode=%s elapsed_ms=%.3f",
+                "is_decode=%s force_save=%s elapsed_ms=%.3f",
                 tracker.req_id,
                 input_token_len,
                 len(token_ids),
@@ -606,6 +611,7 @@ class ReqMeta:
                 load_spec.lmcache_cached_tokens if load_spec is not None else None,
                 load_spec.can_load if load_spec is not None else None,
                 tracker.is_decode_phase,
+                force_save,
                 (time.perf_counter() - t0) * 1000.0,
             )
         return req_meta
@@ -2861,6 +2867,9 @@ class LMCacheConnectorV1Impl:
         specagent_skip_save_reqs = (
             getattr(scheduler_output, "specagent_skip_save_reqs", None) or {}
         )
+        specagent_turn_end_save_reqs = set(
+            getattr(scheduler_output, "specagent_turn_end_save_reqs", None) or ()
+        )
         specagent_current_block_ids = (
             getattr(scheduler_output, "specagent_current_block_ids", None) or {}
         )
@@ -2930,6 +2939,9 @@ class LMCacheConnectorV1Impl:
             if req_id in specagent_fetch_reqs:
                 return False
             return False
+
+        def specagent_step_force_save(req_id: str) -> bool:
+            return req_id in specagent_turn_end_save_reqs
 
         def set_step_skip_save(
             request_tracker: RequestTracker, req_id: str
@@ -3201,6 +3213,7 @@ class LMCacheConnectorV1Impl:
                     load_spec=load_spec,
                     discard_partial_chunks=self._discard_partial_chunks,
                     save_decode_cache=self.config.save_decode_cache,
+                    force_save=specagent_step_force_save(req_id),
                 )
                 debug_specagent_req_meta(
                     "extra_fetch_meta/from_tracker",
@@ -3312,6 +3325,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
+                force_save=specagent_step_force_save(request.req_id),
             )
             debug_specagent_req_meta(
                 "new_request/from_tracker",
@@ -3413,6 +3427,7 @@ class LMCacheConnectorV1Impl:
                     load_spec=load_spec,
                     discard_partial_chunks=self._discard_partial_chunks,
                     save_decode_cache=self.config.save_decode_cache,
+                    force_save=specagent_step_force_save(req.req_id),
                 )
                 debug_specagent_req_meta(
                     "cached_list/from_tracker",
@@ -3631,6 +3646,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
+                force_save=specagent_step_force_save(req_id),
             )
             debug_specagent_req_meta(
                 "cached_request/from_tracker",
