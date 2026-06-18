@@ -1346,6 +1346,20 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             )
             assert tmp_gpu_buffer_obj.tensor is not None
 
+        # foreach-alt: precompute layer-invariant dst views into the tmp buffer
+        # once (chunk lengths from slot_mapping_chunks). Removes per-chunk Python
+        # (zip/bounds/assert/slice/offset) from the per-layer hot loop.
+        _fa_dsts: Optional[list] = None
+        if self.use_gpu:
+            _fa_dsts = []
+            _fa_off = 0
+            for _smc in slot_mapping_chunks:
+                _clen = len(_smc)
+                _fa_dsts.append(
+                    tmp_gpu_buffer_obj.tensor[_fa_off : _fa_off + _clen]
+                )
+                _fa_off += _clen
+
         current_stream = torch.cuda.current_stream()
         debug_transfer = bool(os.environ.get("SPECAGENT_LMCACHE_TRANSFER_DEBUG"))
         debug_limit = int(os.environ.get("SPECAGENT_LMCACHE_TRANSFER_DEBUG_MAX", "8"))
@@ -1361,8 +1375,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         specagent_layer_events = kwargs.get("specagent_layer_events")
         event_synchronized_load = isinstance(specagent_layer_events, list)
 
+        _hb = bool(os.environ.get("SPECAGENT_HOST_BREAKDOWN"))
+        import time as _hbt
+        _hb_copy = _hb_xfer = 0.0
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
+            _hb_t0 = _hbt.perf_counter() if _hb else 0.0
             if sync and not event_synchronized_load:
                 current_stream.wait_stream(self.load_stream)
             if layer_id > 0:
@@ -1381,87 +1399,36 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 buffer_offset = 0
                 debug_first: Optional[tuple[int, int, int, int]] = None
                 debug_targets: list[tuple[int, int, int, int, int]] = []
-                for start, end, memory_obj in zip(
-                    starts, ends, memory_objs_layer, strict=False
-                ):
-                    local_start = start - offset
-                    local_end = end - offset
-                    if local_start < 0 or local_end > len(slot_mapping):
-                        raise ValueError(
-                            "Invalid layerwise load range after offset adjustment: "
-                            f"start={start} end={end} offset={offset} "
-                            f"slot_mapping_len={len(slot_mapping)}"
+                if self.use_gpu:
+                    # fast path: dst views precomputed (_fa_dsts); fill tmp buffer
+                    # with one batched multi-tensor copy. No per-chunk Python in
+                    # the hot loop (validation already done pre-loop; fmt checked
+                    # once on layer 0).
+                    if layer_id == 0 and memory_objs_layer:
+                        _exp_fmt = (
+                            MemoryFormat.KV_MLA_FMT if self.use_mla
+                            else MemoryFormat.KV_T2D
                         )
-                    chunk_len = local_end - local_start
-                    # Validate memory format
-                    if self.use_mla:
-                        assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT, (
-                            f"Expected memory format {MemoryFormat.KV_MLA_FMT}, "
-                            f"got {memory_obj.metadata.fmt}"
+                        assert memory_objs_layer[0].metadata.fmt == _exp_fmt, (
+                            f"Expected memory format {_exp_fmt}, got "
+                            f"{memory_objs_layer[0].metadata.fmt}"
                         )
-                    else:
-                        assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D, (
-                            f"Expected memory format {MemoryFormat.KV_T2D}, "
-                            f"got {memory_obj.metadata.fmt}"
+                    _fa_srcs = [mo.tensor for mo in memory_objs_layer]
+                    _fa_n = min(len(_fa_dsts), len(_fa_srcs))
+                    if _fa_n:
+                        torch._foreach_copy_(
+                            _fa_dsts[:_fa_n], _fa_srcs[:_fa_n],
+                            non_blocking=True,
                         )
                     if bw_profile:
-                        prof_h2d_bytes += int(memory_obj.get_size())
-                    if self.use_gpu:
-                        tmp_gpu_buffer_obj.tensor[
-                            buffer_offset : buffer_offset + chunk_len
-                        ].copy_(memory_obj.tensor, non_blocking=True)
-                        if debug_transfer and debug_count < debug_limit:
-                            first_slot = int(slot_mapping[local_start].item())
-                            last_slot = int(slot_mapping[local_end - 1].item())
-                            if debug_first is None:
-                                debug_first = (
-                                    buffer_offset,
-                                    first_slot,
-                                    first_slot // max(1, self.block_size),
-                                    first_slot % max(1, self.block_size),
-                                )
-                            if (
-                                debug_target_token is not None
-                                and start <= debug_target_token < end
-                            ):
-                                target_local = debug_target_token - offset
-                                if (
-                                    write_token_mask is not None
-                                    and not bool(write_token_mask[
-                                        target_local
-                                    ].item())
-                                ):
-                                    continue
-                                target_slot = int(slot_mapping[target_local].item())
-                                debug_targets.append((
-                                    debug_target_token,
-                                    buffer_offset + debug_target_token - start,
-                                    target_slot,
-                                    target_slot // max(1, self.block_size),
-                                    target_slot % max(1, self.block_size),
-                                ))
-                            logger.warning(
-                                "[SpecAgent][LMC-H2D-PLAN] layer=%d "
-                                "start=%d end=%d offset=%d local=[%d,%d) "
-                                "chunk_len=%d buffer_offset=%d "
-                                "slot_first=%d slot_last=%d block_first=%d "
-                                "block_last=%d fmt=%s",
-                                layer_id,
-                                start,
-                                end,
-                                offset,
-                                local_start,
-                                local_end,
-                                chunk_len,
-                                buffer_offset,
-                                first_slot,
-                                last_slot,
-                                first_slot // max(1, self.block_size),
-                                last_slot // max(1, self.block_size),
-                                memory_obj.metadata.fmt,
-                            )
-                        buffer_offset += chunk_len
-                    else:
+                        for _mo in memory_objs_layer:
+                            prof_h2d_bytes += int(_mo.get_size())
+                else:
+                    for start, end, memory_obj in zip(
+                        starts, ends, memory_objs_layer, strict=False
+                    ):
+                        local_start = start - offset
+                        local_end = end - offset
                         lmc_ops.single_layer_kv_transfer(
                             memory_obj.tensor,
                             kvcaches[layer_id],
@@ -1471,6 +1438,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             token_major=True,
                         )
 
+                if _hb:
+                    _hb_c1 = _hbt.perf_counter(); _hb_copy += _hb_c1 - _hb_t0
                 if self.use_gpu:
                     transfer_tensor = tmp_gpu_buffer_obj.tensor
                     transfer_slot_mapping = slot_mapping_full
@@ -1487,6 +1456,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         self.gpu_kv_format,
                         token_major=True,
                     )
+                    if _hb:
+                        _hb_xfer += _hbt.perf_counter() - _hb_c1
                     if bw_profile:
                         prof_gpu_copy_bytes = int(
                             tmp_gpu_buffer_obj.tensor.numel()
@@ -1601,6 +1572,14 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     (layer_id, prof_h2d_bytes, prof_gpu_copy_bytes,
                      prof_start, prof_end)
                 )
+        if _hb:
+            logger.error(
+                "[SpecAgent][HOST-BREAKDOWN] layers=%d chunks_per_layer=%d "
+                "copy_ms=%.2f xfer_ms=%.2f total_ms=%.2f",
+                self.num_layers, len(starts),
+                _hb_copy * 1000, _hb_xfer * 1000,
+                (_hb_copy + _hb_xfer) * 1000,
+            )
         yield
 
         # synchronize the last layer.  SpecAgent passes per-layer events and
