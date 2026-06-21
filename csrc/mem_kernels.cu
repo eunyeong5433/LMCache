@@ -1052,10 +1052,12 @@ void single_layer_kv_transfer_sgl(
  * @param host_buffer_alignments the alignment (i.e., cudaHostRegister
  * granularity) requirement of the host buffer. Must be power of two.
  */
-void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
-                          TransferDirection direction,
-                          size_t host_buffer_offset,
-                          size_t host_buffer_alignments) {
+static void lmcache_memcpy_async_impl(uintptr_t dest, uintptr_t src,
+                                      size_t nbytes,
+                                      TransferDirection direction,
+                                      size_t host_buffer_offset,
+                                      size_t host_buffer_alignments,
+                                      cudaStream_t stream) {
   // Check that host_buffer_alignments is power of two
   TORCH_CHECK((host_buffer_alignments & (host_buffer_alignments - 1)) == 0,
               "host_buffer_alignments must be power of two");
@@ -1065,7 +1067,6 @@ void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
   cudaMemcpyKind kind = (direction == TransferDirection::H2D)
                             ? cudaMemcpyHostToDevice
                             : cudaMemcpyDeviceToHost;
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   while (offset < nbytes) {
     size_t current_src = src + offset;
@@ -1081,5 +1082,38 @@ void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
                                     max_nbytes, kind, stream));
 
     offset += max_nbytes;
+  }
+}
+
+void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
+                          TransferDirection direction,
+                          size_t host_buffer_offset,
+                          size_t host_buffer_alignments) {
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  lmcache_memcpy_async_impl(dest, src, nbytes, direction, host_buffer_offset,
+                            host_buffer_alignments, stream);
+}
+
+void lmcache_memcpy_async_batch(
+    const std::vector<uintptr_t>& dests, const std::vector<uintptr_t>& srcs,
+    const std::vector<size_t>& nbytes, TransferDirection direction,
+    const std::vector<size_t>& host_buffer_offsets,
+    const std::vector<size_t>& host_buffer_alignments) {
+  const size_t count = dests.size();
+  TORCH_CHECK(srcs.size() == count, "srcs size must match dests size");
+  TORCH_CHECK(nbytes.size() == count, "nbytes size must match dests size");
+  TORCH_CHECK(host_buffer_offsets.size() == count,
+              "host_buffer_offsets size must match dests size");
+  TORCH_CHECK(host_buffer_alignments.size() == count,
+              "host_buffer_alignments size must match dests size");
+
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  for (size_t i = 0; i < count; ++i) {
+    if (nbytes[i] == 0) {
+      continue;
+    }
+    lmcache_memcpy_async_impl(dests[i], srcs[i], nbytes[i], direction,
+                              host_buffer_offsets[i],
+                              host_buffer_alignments[i], stream);
   }
 }

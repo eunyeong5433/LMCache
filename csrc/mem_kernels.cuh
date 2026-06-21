@@ -6,6 +6,8 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Exception.h>
+#include <cstdint>
+#include <vector>
 
 enum class TransferDirection : int {
   H2D = 0,
@@ -119,6 +121,13 @@ void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
                           TransferDirection direction,
                           size_t host_buffer_offset,
                           size_t host_buffer_alignments);
+
+void lmcache_memcpy_async_batch(const std::vector<uintptr_t>& dests,
+                                const std::vector<uintptr_t>& srcs,
+                                const std::vector<size_t>& nbytes,
+                                TransferDirection direction,
+                                const std::vector<size_t>& host_buffer_offsets,
+                                const std::vector<size_t>& host_buffer_alignments);
 
 // deprecated / unused except in unit tests
 void load_and_reshape_flash(torch::Tensor& key_value, torch::Tensor& key_cache,

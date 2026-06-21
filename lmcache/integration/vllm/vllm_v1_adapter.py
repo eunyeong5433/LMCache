@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections.abc import Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import builtins
 import os
+import threading
 import time
 
 # Third Party
@@ -708,6 +710,28 @@ class LMCacheConnectorV1Impl:
         self._specagent_layerwise_check_period = 0
         self._specagent_layer_group_size = 1
         self._specagent_waited_layer_groups: set[int] = set()
+        self._specagent_prefetch_lock = threading.Lock()
+        self._specagent_prefetch_cond = threading.Condition(
+            self._specagent_prefetch_lock
+        )
+        self._specagent_prefetch_future: Future | None = None
+        self._specagent_prefetch_target = -1
+        self._specagent_prefetch_executor: ThreadPoolExecutor | None = (
+            None if role == KVConnectorRole.SCHEDULER
+            else ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="specagent-kv-prefetch",
+            )
+        )
+        self._specagent_async_save_this_step = False
+        self._specagent_save_executor: ThreadPoolExecutor | None = (
+            None if role == KVConnectorRole.SCHEDULER
+            else ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="specagent-kv-save",
+            )
+        )
+        self._specagent_save_futures: list[Future] = []
         self._layerwise_save_storers: dict[
             str, Generator[Optional[torch.Tensor], None, None]
         ] = {}
@@ -951,6 +975,8 @@ class LMCacheConnectorV1Impl:
             the same.
         """
         self.current_layer = 0
+        self._specagent_join_prefetch_future()
+        self._specagent_join_save_futures()
 
         if len(self.kv_caches) == 0:
             logger.warning(
@@ -974,6 +1000,11 @@ class LMCacheConnectorV1Impl:
         sa_cascade_maps = sa_extra.get("specagent_cascade_maps") or {}
         sa_fetch_buf_blocks = sa_extra.get("specagent_fetch_buf_blocks")
         sa_fetch_paged_blocks = sa_extra.get("specagent_fetch_paged_blocks")
+        self._specagent_async_save_this_step = bool(sa_fetch_reqs)
+        sa_cpu_prefetch_ahead_layers = max(
+            0,
+            int(sa_extra.get("specagent_cpu_prefetch_ahead_layers", 0) or 0),
+        )
 
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
@@ -1268,51 +1299,32 @@ class LMCacheConnectorV1Impl:
                                 slot_mapping=slot_mapping[:seg_end],
                                 vllm_cached_tokens=seg_start,
                                 sync=sync,
+                                req_id=request.req_id,
                                 specagent_layer_events=layer_events,
                                 specagent_write_token_mask=(
                                     specagent_write_token_mask
                                 ),
+                                specagent_expected_tokens=num_expected_tokens,
+                                specagent_cpu_prefetch_ahead_layers=(
+                                    sa_cpu_prefetch_ahead_layers
+                                ),
                             )
-                        with record_function_or_nullcontext(
-                            "lmcache adapter: specagent retrieve first_next "
-                            f"req={request.req_id} seg={seg_start}-{seg_end} "
-                            f"expected_tokens={num_expected_tokens} "
-                            f"expected_layer_mib={expected_mib:.1f}"
-                        ):
-                            first_ret = next(layerwise_retriever)
-                        num_retrieved_tokens = (
-                            int(first_ret.item())
-                            if hasattr(first_ret, "item")
-                            else 0
-                        )
-                        if num_retrieved_tokens < num_expected_tokens:
-                            raise RuntimeError(
-                                "[SpecAgent][FETCH-INCOMPLETE] req=%s "
-                                "fetch_reason=%s segment=[%d,%d) "
-                                "retrieved=%d expected=%d. Scratch attention "
-                                "for this step is not fully valid unless the "
-                                "missing logical blocks are excluded or recomputed."
-                                % (
-                                    request.req_id,
-                                    specagent_fetch_reason,
-                                    seg_start,
-                                    seg_end,
-                                    num_retrieved_tokens,
-                                    num_expected_tokens,
-                                )
-                            )
-                        with record_function_or_nullcontext(
-                            "lmcache adapter: specagent retrieve second_next "
-                            f"req={request.req_id} seg={seg_start}-{seg_end} "
-                            f"expected_tokens={num_expected_tokens} "
-                            f"expected_layer_mib={expected_mib:.1f}"
-                        ):
-                            next(layerwise_retriever)
+                        # The first generator step performs the expensive
+                        # token/chunk lookup and submits CPU get work.  Let
+                        # the async producer execute it so start_load_kv does
+                        # not block before the model reaches layer 0.  The
+                        # fetched-token validation still runs in
+                        # _specagent_advance_retrievers_until before attention
+                        # can consume the layer.
                         self.layerwise_retrievers.append(layerwise_retriever)
                         self._specagent_layerwise_meta.append({
                             "req_id": request.req_id,
                             "segment": (seg_start, seg_end),
+                            "is_specagent": True,
+                            "fetch_reason": specagent_fetch_reason,
+                            "is_paged_restore": use_paged_restore_target,
                             "expected_tokens": num_expected_tokens,
+                            "expected_fetch_tokens": num_expected_tokens,
                             "layer_events": layer_events,
                             "copy_to_paged": (
                                 bool(
@@ -1433,6 +1445,19 @@ class LMCacheConnectorV1Impl:
                         slot_mapping[:lmcache_cached_tokens],
                     )
                     self._invalid_block_ids.update(missing_blocks)
+
+        if self._specagent_all_fetches_paged_restore():
+            self._specagent_request_async_prefetch(self.num_layers - 1)
+        elif self._specagent_has_layerwise_fetch():
+            group_size = max(
+                1,
+                int(getattr(self, "_specagent_layer_group_size", 1) or 1),
+            )
+            initial_group_end = min(
+                2 * group_size - 1,
+                self.num_layers - 1,
+            )
+            self._specagent_request_async_prefetch(initial_group_end)
 
         if timing:
             loadable = sum(
@@ -1571,12 +1596,9 @@ class LMCacheConnectorV1Impl:
             if group_id in self._specagent_waited_layer_groups:
                 return
 
-        # retrieve_layer() is already advanced through layer 0 in
-        # start_load_kv().  For SpecAgent, the scratch ring is reused every
-        # group_size layers, so it is safe to advance to the end of the current
-        # group but not beyond it.
         target_layer = group_end_layer
-        if group_end_layer == self.num_layers - 1:
+        specagent_fetch = self._specagent_has_layerwise_fetch()
+        if not specagent_fetch and group_end_layer == self.num_layers - 1:
             target_layer = self.num_layers
         start_layer = self.current_layer
         overlap_debug = _specagent_env_true("SPECAGENT_OVERLAP_DEBUG")
@@ -1592,11 +1614,15 @@ class LMCacheConnectorV1Impl:
             f"expected_layer_mib={expected_layer_mib:.1f} "
             f"expected_wait_mib={expected_wait_mib:.1f}"
         ):
-            while (
-                self.layerwise_retrievers
-                and self.current_layer <= target_layer
-            ):
-                self._wait_for_next_layer_load()
+            if specagent_fetch:
+                self.prefetch_next_layer_load(layer_name)
+                self._specagent_wait_for_async_prefetch(group_end_layer)
+            else:
+                while (
+                    self.layerwise_retrievers
+                    and self.current_layer <= target_layer
+                ):
+                    self._wait_for_next_layer_load()
 
         # Wait only for the layer being consumed.  A stream-wide wait would also
         # wait for the one-group-ahead prefetch launched above, defeating the
@@ -1700,82 +1726,426 @@ class LMCacheConnectorV1Impl:
         )
         return expected_tokens * bytes_per_layer_token / (1024 * 1024)
 
+    def _specagent_has_layerwise_fetch(self) -> bool:
+        return any(
+            isinstance(meta, dict) and meta.get("is_specagent")
+            for meta in self._specagent_layerwise_meta
+        )
+
+    def _specagent_all_fetches_paged_restore(self) -> bool:
+        specagent_metas = [
+            meta for meta in self._specagent_layerwise_meta
+            if isinstance(meta, dict) and meta.get("is_specagent")
+        ]
+        return bool(specagent_metas) and all(
+            meta.get("is_paged_restore") for meta in specagent_metas
+        )
+
+    def _specagent_events_ready(self, target_layer: int) -> bool:
+        if target_layer < 0:
+            return True
+        for meta in self._specagent_layerwise_meta:
+            events = meta.get("layer_events") if isinstance(meta, dict) else None
+            if (
+                isinstance(events, list)
+                and target_layer < len(events)
+                and events[target_layer] is None
+            ):
+                return False
+        return True
+
+    def _specagent_advance_retrievers_until(self, target_layer: int) -> None:
+        if target_layer < 0:
+            return
+        target_layer = min(int(target_layer), self.num_layers - 1)
+        load_stream = getattr(
+            getattr(self.lmcache_engine, "gpu_connector", None),
+            "load_stream",
+            None,
+        )
+        if load_stream is not None:
+            try:
+                torch.cuda.set_device(load_stream.device)
+            except Exception:
+                pass
+
+        def validate_result(meta: object, ret_token_mask: object | None) -> None:
+            if (
+                not isinstance(meta, dict)
+                or not meta.get("is_specagent")
+                or ret_token_mask is None
+            ):
+                return
+            if hasattr(ret_token_mask, "sum"):
+                fetched = int(ret_token_mask.sum().item())
+            elif hasattr(ret_token_mask, "item"):
+                fetched = int(ret_token_mask.item())
+            else:
+                fetched = int(ret_token_mask)
+            expected = int(
+                meta.get("expected_fetch_tokens")
+                or meta.get("expected_tokens")
+                or 0
+            )
+            if fetched < expected:
+                raise RuntimeError(
+                    "[SpecAgent][FETCH-ERROR] retrieved fewer tokens "
+                    f"than expected for req={meta.get('req_id')}: "
+                    f"fetched={fetched} expected={expected}"
+                )
+
+        # Advance layer-major across retrievers.  With multiple SpecAgent
+        # segments, draining retriever 0 through layer 63 before touching
+        # retriever 1 can make layer 0 attention wait behind unrelated later
+        # layers.  Interleaving by layer keeps the event needed by the consumer
+        # near the front of the producer queue while preserving each retriever's
+        # internal layer order.
+        for layer_id in range(target_layer + 1):
+            for idx, layerwise_retriever in enumerate(self.layerwise_retrievers):
+                meta = (
+                    self._specagent_layerwise_meta[idx]
+                    if idx < len(self._specagent_layerwise_meta)
+                    else {}
+                )
+                events = (
+                    meta.get("layer_events") if isinstance(meta, dict) else None
+                )
+                guard = 0
+                while (
+                    isinstance(events, list)
+                    and layer_id < len(events)
+                    and events[layer_id] is None
+                    and guard < self.num_layers + 4
+                ):
+                    try:
+                        with record_function_or_nullcontext(
+                            "lmcache adapter: advance to layer="
+                            f"{layer_id} target={target_layer} retriever={idx}"
+                        ):
+                            ret_token_mask = next(layerwise_retriever)
+                    except StopIteration:
+                        break
+                    guard += 1
+                    with self._specagent_prefetch_cond:
+                        self._specagent_prefetch_cond.notify_all()
+                    validate_result(meta, ret_token_mask)
+        with self._specagent_prefetch_cond:
+            self._specagent_prefetch_cond.notify_all()
+
+    def _specagent_clear_done_prefetch_future(self) -> None:
+        with self._specagent_prefetch_lock:
+            future = self._specagent_prefetch_future
+            if future is None or not future.done():
+                return
+            self._specagent_prefetch_future = None
+            self._specagent_prefetch_target = -1
+        future.result()
+
+    def _specagent_join_prefetch_future(self) -> None:
+        with self._specagent_prefetch_lock:
+            future = self._specagent_prefetch_future
+        if future is None:
+            return
+        future.result()
+        with self._specagent_prefetch_lock:
+            if self._specagent_prefetch_future is future:
+                self._specagent_prefetch_future = None
+                self._specagent_prefetch_target = -1
+
+    def _specagent_run_save_step(
+        self,
+        req_id: str,
+        layer_name: str,
+        layerwise_storer: Generator[Optional[torch.Tensor], None, None],
+    ) -> tuple[str, bool]:
+        try:
+            torch.cuda.set_device(self.device)
+        except Exception:
+            pass
+        stopped = False
+        with record_function_or_nullcontext(
+            "lmcache save worker: next "
+            f"req={req_id} layer={layer_name}"
+        ):
+            try:
+                next(layerwise_storer)
+            except StopIteration:
+                stopped = True
+        return req_id, stopped
+
+    def _specagent_submit_save_step(
+        self,
+        req_id: str,
+        layer_name: str,
+        layerwise_storer: Generator[Optional[torch.Tensor], None, None],
+    ) -> None:
+        executor = self._specagent_save_executor
+        if executor is None:
+            next(layerwise_storer)
+            return
+        with record_function_or_nullcontext(
+            "lmcache connector: submit_save_kv_layer "
+            f"req={req_id} layer={layer_name}"
+        ):
+            future = executor.submit(
+                self._specagent_run_save_step,
+                req_id,
+                layer_name,
+                layerwise_storer,
+            )
+        self._specagent_save_futures.append(future)
+
+    def _specagent_join_save_futures(self) -> None:
+        futures = self._specagent_save_futures
+        if not futures:
+            return
+        self._specagent_save_futures = []
+        with record_function_or_nullcontext(
+            f"lmcache connector: join_save_futures count={len(futures)}"
+        ):
+            for future in futures:
+                req_id, stopped = future.result()
+                if stopped:
+                    self._layerwise_save_storers.pop(req_id, None)
+
+    def _specagent_advance_after_future(
+        self, previous: Future, target_layer: int
+    ) -> None:
+        with record_function_or_nullcontext(
+            "lmcache prefetch worker: wait_prev "
+            f"target={target_layer}"
+        ):
+            previous.result()
+        with record_function_or_nullcontext(
+            "lmcache prefetch worker: advance "
+            f"target={target_layer}"
+        ):
+            self._specagent_advance_retrievers_until(target_layer)
+
+    def _specagent_wait_event_then_advance(
+        self,
+        previous: Future | None,
+        target_layer: int,
+        stream_wait_event: object | None,
+    ) -> None:
+        if previous is not None:
+            with record_function_or_nullcontext(
+                "lmcache prefetch worker: wait_prev "
+                f"target={target_layer}"
+            ):
+                previous.result()
+        if stream_wait_event is not None:
+            load_stream = getattr(
+                getattr(self.lmcache_engine, "gpu_connector", None),
+                "load_stream",
+                None,
+            )
+            if load_stream is not None:
+                try:
+                    torch.cuda.set_device(load_stream.device)
+                except Exception:
+                    pass
+                with record_function_or_nullcontext(
+                    "lmcache prefetch worker: stream_wait_event "
+                    f"target={target_layer}"
+                ):
+                    load_stream.wait_event(stream_wait_event)
+        with record_function_or_nullcontext(
+            "lmcache prefetch worker: advance "
+            f"target={target_layer}"
+        ):
+            self._specagent_advance_retrievers_until(target_layer)
+
+    def _specagent_request_async_prefetch(
+        self,
+        target_layer: int,
+        stream_wait_event: object | None = None,
+    ) -> Future | None:
+        if target_layer < 0:
+            return None
+        executor = self._specagent_prefetch_executor
+        if executor is None:
+            if stream_wait_event is not None:
+                load_stream = getattr(
+                    getattr(self.lmcache_engine, "gpu_connector", None),
+                    "load_stream",
+                    None,
+                )
+                if load_stream is not None:
+                    try:
+                        torch.cuda.set_device(load_stream.device)
+                    except Exception:
+                        pass
+                    with record_function_or_nullcontext(
+                        "lmcache prefetch request: inline_stream_wait_event "
+                        f"target={target_layer}"
+                    ):
+                        load_stream.wait_event(stream_wait_event)
+            with record_function_or_nullcontext(
+                "lmcache prefetch request: inline_advance "
+                f"target={target_layer}"
+            ):
+                self._specagent_advance_retrievers_until(target_layer)
+            return None
+        with record_function_or_nullcontext(
+            "lmcache prefetch request: lock "
+            f"target={target_layer} event={stream_wait_event is not None}"
+        ):
+            self._specagent_prefetch_lock.acquire()
+        try:
+            future = self._specagent_prefetch_future
+            if future is not None:
+                if future.done():
+                    self._specagent_prefetch_future = None
+                    self._specagent_prefetch_target = -1
+                    with record_function_or_nullcontext(
+                        "lmcache prefetch request: done_result "
+                        f"target={target_layer}"
+                    ):
+                        future.result()
+                elif self._specagent_prefetch_target >= target_layer:
+                    with record_function_or_nullcontext(
+                        "lmcache prefetch request: return_existing "
+                        f"target={target_layer} current="
+                        f"{self._specagent_prefetch_target}"
+                    ):
+                        pass
+                    return future
+                else:
+                    self._specagent_prefetch_target = target_layer
+                    if stream_wait_event is not None:
+                        with record_function_or_nullcontext(
+                            "lmcache prefetch request: submit_after_event "
+                            f"target={target_layer}"
+                        ):
+                            self._specagent_prefetch_future = executor.submit(
+                                self._specagent_wait_event_then_advance,
+                                future,
+                                target_layer,
+                                stream_wait_event,
+                            )
+                    else:
+                        with record_function_or_nullcontext(
+                            "lmcache prefetch request: submit_after "
+                            f"target={target_layer}"
+                        ):
+                            self._specagent_prefetch_future = executor.submit(
+                                self._specagent_advance_after_future,
+                                future,
+                                target_layer,
+                            )
+                    return self._specagent_prefetch_future
+            self._specagent_prefetch_target = target_layer
+            if stream_wait_event is not None:
+                with record_function_or_nullcontext(
+                    "lmcache prefetch request: submit_new_event "
+                    f"target={target_layer}"
+                ):
+                    self._specagent_prefetch_future = executor.submit(
+                        self._specagent_wait_event_then_advance,
+                        None,
+                        target_layer,
+                        stream_wait_event,
+                    )
+            else:
+                with record_function_or_nullcontext(
+                    "lmcache prefetch request: submit_new "
+                    f"target={target_layer}"
+                ):
+                    self._specagent_prefetch_future = executor.submit(
+                        self._specagent_advance_retrievers_until,
+                        target_layer,
+                    )
+            return self._specagent_prefetch_future
+        finally:
+            self._specagent_prefetch_lock.release()
+
+    def _specagent_wait_for_async_prefetch(self, target_layer: int) -> None:
+        if self._specagent_events_ready(target_layer):
+            self._specagent_clear_done_prefetch_future()
+            return
+        future = self._specagent_request_async_prefetch(target_layer)
+        if future is None:
+            return
+        while not self._specagent_events_ready(target_layer):
+            if future.done():
+                future.result()
+                break
+            with self._specagent_prefetch_cond:
+                if self._specagent_events_ready(target_layer):
+                    break
+                self._specagent_prefetch_cond.wait(timeout=0.001)
+        if future.done():
+            with self._specagent_prefetch_lock:
+                if self._specagent_prefetch_future is future:
+                    self._specagent_prefetch_future = None
+                    self._specagent_prefetch_target = -1
+        if not self._specagent_events_ready(target_layer):
+            self._specagent_advance_retrievers_until(target_layer)
+
     def prefetch_next_layer_load(
         self,
         layer_name: str,
         attention_done_event: object | None = None,
     ) -> None:
-        """Enqueue the next layer's SpecAgent scratch load after attention.
-
-        By default this advances only layer+1.  With a modulo scratch ring,
-        layer+2 reuses the current layer's scratch slot when granularity=2, so
-        it is only safe if the caller provides an event recorded after the
-        current attention kernel.  In that case the load stream waits on the
-        event before enqueuing layer+2, allowing the copy to overlap with FFN
-        without overwriting KV still being consumed by attention.
-        """
-        if not os.environ.get("SPECAGENT_POST_ATTN_PREFETCH"):
+        """Advance the SpecAgent layerwise producer ahead of the consumer."""
+        if (
+            not self.layerwise_retrievers
+            or not self._specagent_has_layerwise_fetch()
+        ):
             return
         requested_layer = _specagent_layer_index(layer_name)
         if requested_layer is None:
             requested_layer = self.current_layer
         requested_layer = max(0, min(int(requested_layer), self.num_layers - 1))
-        min_tokens = int(os.environ.get(
-            "SPECAGENT_POST_ATTN_PREFETCH_MIN_TOKENS", "0"))
-        if min_tokens > 0:
-            total_expected_tokens = sum(
-                int(meta.get("expected_tokens", 0))
-                for meta in self._specagent_layerwise_meta
-                if isinstance(meta, dict)
-            )
-            if total_expected_tokens < min_tokens:
-                return
-        prefetch_ahead = max(1, int(os.environ.get(
-            "SPECAGENT_POST_ATTN_PREFETCH_AHEAD", "1")))
-        first_target_layer = min(requested_layer + 1, self.num_layers - 1)
-        if first_target_layer <= requested_layer:
+        if self._specagent_all_fetches_paged_restore():
+            self._specagent_request_async_prefetch(self.num_layers - 1)
             return
 
-        start_layer = self.current_layer
+        group_size = max(
+            1,
+            min(
+                int(getattr(self, "_specagent_layer_group_size", 1) or 1),
+                self.num_layers,
+            ),
+        )
+        group_id = requested_layer // group_size
+        group_end_layer = min(
+            (group_id + 1) * group_size - 1,
+            self.num_layers - 1,
+        )
+        next_group_end_layer = min(
+            (group_id + 2) * group_size - 1,
+            self.num_layers - 1,
+        )
+        target_layer = next_group_end_layer
+        stream_wait_event = None
+        if attention_done_event is not None and requested_layer >= group_end_layer:
+            reuse_group_end_layer = min(
+                (group_id + 3) * group_size - 1,
+                self.num_layers - 1,
+            )
+            if reuse_group_end_layer > target_layer:
+                target_layer = reuse_group_end_layer
+                stream_wait_event = attention_done_event
+
         overlap_debug = _specagent_env_true("SPECAGENT_OVERLAP_DEBUG")
         t0 = time.perf_counter() if overlap_debug else 0.0
-        while (self.layerwise_retrievers
-               and self.current_layer <= first_target_layer):
-            self._wait_for_next_layer_load()
-
-        second_target_layer = first_target_layer
-        if prefetch_ahead >= 2 and attention_done_event is not None:
-            second_target_layer = min(requested_layer + 2, self.num_layers - 1)
-            if second_target_layer > first_target_layer:
-                try:
-                    gpu_connector = getattr(
-                        self.lmcache_engine, "gpu_connector", None)
-                    load_stream = getattr(gpu_connector, "load_stream", None)
-                    if load_stream is not None:
-                        load_stream.wait_event(attention_done_event)
-                except Exception:
-                    logger.exception(
-                        "[SpecAgent][OVERLAP-PREFETCH] failed to add "
-                        "attention_done dependency for layer=%s",
-                        layer_name,
-                    )
-                    raise
-                while (self.layerwise_retrievers
-                       and self.current_layer <= second_target_layer):
-                    self._wait_for_next_layer_load()
+        self._specagent_request_async_prefetch(
+            target_layer,
+            stream_wait_event=stream_wait_event,
+        )
 
         if overlap_debug and requested_layer < 4:
             logger.info(
                 "[SpecAgent][OVERLAP-PREFETCH] requested_layer=%d "
-                "target_layer=%d prefetch_ahead=%d advanced=%d "
-                "start_layer=%d end_layer=%d enqueue_ms=%.3f "
-                "active_retrievers=%d",
+                "target_layer=%d group_size=%d group_end=%d "
+                "event_wait=%s enqueue_ms=%.3f active_retrievers=%d",
                 requested_layer,
-                second_target_layer,
-                prefetch_ahead,
-                max(0, self.current_layer - start_layer),
-                start_layer,
-                self.current_layer,
+                target_layer,
+                group_size,
+                group_end_layer,
+                stream_wait_event is not None,
                 (time.perf_counter() - t0) * 1000.0,
                 len(self.layerwise_retrievers),
             )
@@ -2333,12 +2703,19 @@ class LMCacheConnectorV1Impl:
                 if is_first:
                     is_first = False
 
-            try:
-                next(layerwise_storer)
-            except StopIteration:
-                self._layerwise_save_storers.pop(request.req_id, None)
-                if request.is_finished_save:
-                    self._specagent_finished_save_completed.add(request.req_id)
+            if self._specagent_async_save_this_step:
+                self._specagent_submit_save_step(
+                    request.req_id,
+                    layer_name,
+                    layerwise_storer,
+                )
+            else:
+                try:
+                    next(layerwise_storer)
+                except StopIteration:
+                    self._layerwise_save_storers.pop(request.req_id, None)
+                    if request.is_finished_save:
+                        self._specagent_finished_save_completed.add(request.req_id)
 
         if timing:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -2390,6 +2767,7 @@ class LMCacheConnectorV1Impl:
             return
 
         if self.use_layerwise:
+            self._specagent_join_save_futures()
             finalized = 0
             for request in connector_metadata.requests:
                 layerwise_storer = self._layerwise_save_storers.pop(
@@ -2414,6 +2792,7 @@ class LMCacheConnectorV1Impl:
                     finalized,
                     (time.perf_counter() - t0) * 1000.0,
                 )
+            self._specagent_async_save_this_step = False
             return
 
         assert len(self.kv_caches) > 0
@@ -2598,6 +2977,10 @@ class LMCacheConnectorV1Impl:
     def shutdown(self):
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
+        executor = self._specagent_prefetch_executor
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._specagent_prefetch_executor = None
         self._manager.stop_services()
 
     ###################
@@ -3783,6 +4166,7 @@ class LMCacheConnectorV1Impl:
         if getattr(self, "use_layerwise", False) and hasattr(
             self, "_layerwise_save_storers"
         ):
+            self._specagent_join_save_futures()
             self._layerwise_save_storers.pop(request.request_id, None)
 
         # Cleanup if request was aborted

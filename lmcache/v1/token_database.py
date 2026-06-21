@@ -241,7 +241,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
 
     def _hash_tokens(
         self,
-        tokens: Union[torch.Tensor, List[int]],
+        tokens: Union[torch.Tensor, List[int], Tuple[int, ...]],
         prefix_hash: Optional[int] = None,
         extra_keys: Optional[list[Any]] = None,
     ) -> int:
@@ -249,6 +249,8 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             tokens_tuple = tuple(tokens.cpu().tolist())
         elif isinstance(tokens, list):
             tokens_tuple = tuple(tokens)
+        elif isinstance(tokens, tuple):
+            tokens_tuple = tokens
         else:
             raise ValueError(f"Unsupported tokens type: {type(tokens)}")
 
@@ -305,7 +307,7 @@ class ChunkedTokenDatabase(TokenDatabase):
     def _chunk_tokens(
         self,
         tokens: Union[torch.Tensor, List[int]],
-    ) -> Iterable[Union[torch.Tensor, List[int]]]:
+    ) -> Iterable[Union[torch.Tensor, List[int], Tuple[int, ...]]]:
         """
         Chunk the tokens into chunks of size self.chunk_size.
 
@@ -324,11 +326,14 @@ class ChunkedTokenDatabase(TokenDatabase):
             else (len(tokens) - len(tokens) % self.chunk_size)
         )
         for i in range(0, end, self.chunk_size):
-            yield tokens[i : i + self.chunk_size]
+            token_chunk = tokens[i : i + self.chunk_size]
+            if isinstance(token_chunk, list):
+                token_chunk = tuple(token_chunk)
+            yield token_chunk
 
     def _prefix_hash(
         self,
-        token_chunks: Iterable[Union[torch.Tensor, List[int]]],
+        token_chunks: Iterable[Union[torch.Tensor, List[int], Tuple[int, ...]]],
     ) -> Iterable[int]:
         prefix_hash = self._get_init_hash()
         for token_chunk in token_chunks:
@@ -383,6 +388,8 @@ class ChunkedTokenDatabase(TokenDatabase):
             )
 
         if tokens is not None:
+            if isinstance(tokens, torch.Tensor):
+                tokens = tokens.detach().cpu().tolist()
             total_len = len(tokens)
             token_chunks = self._chunk_tokens(tokens)
             prefix_hashes = self._prefix_hash(token_chunks)

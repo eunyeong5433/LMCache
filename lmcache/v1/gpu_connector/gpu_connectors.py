@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple, Union
 import abc
 import builtins
 import os
+from contextlib import nullcontext
 
 # Third Party
 import torch
@@ -34,6 +35,70 @@ if torch.cuda.is_available():
     import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+
+def _next_power_of_2(value: int) -> int:
+    return 1 << max(0, (value - 1).bit_length())
+
+
+def _can_raw_h2d_copy(dst: torch.Tensor, src: torch.Tensor) -> bool:
+    return (
+        dst.device.type == "cuda"
+        and src.device.type == "cpu"
+        and dst.is_contiguous()
+        and src.is_contiguous()
+        and dst.numel() == src.numel()
+        and dst.element_size() == src.element_size()
+    )
+
+
+def _raw_h2d_copy_async(dst: torch.Tensor, src: torch.Tensor) -> None:
+    nbytes = int(src.numel() * src.element_size())
+    if nbytes == 0:
+        return
+    # LMCache CPU buffers are cudaHostAlloc/cudaHostRegister-backed but are
+    # exposed to PyTorch via torch.frombuffer(), so Tensor.is_pinned() is false.
+    # Use LMCache's raw-pointer memcpyAsync path to avoid PyTorch staging.
+    lmc_ops.lmcache_memcpy_async(
+        dst.data_ptr(),
+        src.data_ptr(),
+        nbytes,
+        lmc_ops.TransferDirection.H2D,
+        0,
+        _next_power_of_2(nbytes),
+    )
+
+
+def _raw_h2d_copy_batch_async(
+    dsts: list[torch.Tensor],
+    srcs: list[torch.Tensor],
+) -> None:
+    if not dsts:
+        return
+    batch_copy = getattr(lmc_ops, "lmcache_memcpy_async_batch", None)
+    if batch_copy is None:
+        for dst, src in zip(dsts, srcs, strict=False):
+            _raw_h2d_copy_async(dst, src)
+        return
+
+    nbytes = [int(src.numel() * src.element_size()) for src in srcs]
+    batch_copy(
+        [int(dst.data_ptr()) for dst in dsts],
+        [int(src.data_ptr()) for src in srcs],
+        nbytes,
+        lmc_ops.TransferDirection.H2D,
+        [0] * len(nbytes),
+        [_next_power_of_2(num_bytes) for num_bytes in nbytes],
+    )
+
+
+try:
+    # vLLM emits these ranges into Nsight when profiling is enabled.  Keep
+    # LMCache importable in standalone contexts where vLLM is absent.
+    from vllm.v1.utils import record_function_or_nullcontext as _lmc_record
+except Exception:  # pragma: no cover - optional vLLM dependency.
+    def _lmc_record(_name: str):
+        return nullcontext()
 
 
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
@@ -1285,16 +1350,17 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         write_token_mask: Optional[torch.Tensor] = kwargs.get(
             "specagent_write_token_mask"
         )
+        write_token_mask_cpu: Optional[torch.Tensor] = None
         if write_token_mask is not None:
-            write_token_mask = write_token_mask.to(
-                device=slot_mapping.device, dtype=torch.bool
-            )
             if len(write_token_mask) != len(slot_mapping):
                 raise ValueError(
                     "specagent_write_token_mask must match slot_mapping "
                     f"length, got mask={len(write_token_mask)} "
                     f"slot_mapping={len(slot_mapping)}"
                 )
+            write_token_mask_cpu = write_token_mask.to(
+                device="cpu", dtype=torch.bool
+            )
         defer_tmp_buffer_free = bool(
             kwargs.get("specagent_defer_store_tmp_buffer_free", True)
         )
@@ -1313,18 +1379,63 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     f"slot_mapping_len={len(slot_mapping)}"
                 )
             slot_mapping_chunks.append(slot_mapping[local_start:local_end])
-            if write_token_mask is not None:
-                write_mask_chunks.append(write_token_mask[
+            if write_token_mask_cpu is not None:
+                write_mask_chunks.append(write_token_mask_cpu[
                     local_start:local_end
                 ])
 
-        # TODO(Jiayi): Optimize away this `cat`
-        slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
-        write_mask_full = (
-            torch.cat(write_mask_chunks, dim=0)
-            if write_mask_chunks
-            else None
-        )
+        copy_plan: Optional[list[tuple[int, int, int, int, int]]] = None
+        if write_mask_chunks:
+            copy_plan = []
+            compact_slot_mapping_chunks = []
+            dst_offset = 0
+            for chunk_idx, (slot_mapping_chunk, mask_chunk) in enumerate(
+                zip(slot_mapping_chunks, write_mask_chunks, strict=False)
+            ):
+                true_positions = torch.nonzero(mask_chunk, as_tuple=False).flatten()
+                if true_positions.numel() == 0:
+                    continue
+                positions = [int(pos) for pos in true_positions.tolist()]
+                run_start = positions[0]
+                prev = positions[0]
+                for pos in positions[1:]:
+                    if pos != prev + 1:
+                        run_end = prev + 1
+                        run_len = run_end - run_start
+                        copy_plan.append((
+                            chunk_idx,
+                            run_start,
+                            run_end,
+                            dst_offset,
+                            dst_offset + run_len,
+                        ))
+                        compact_slot_mapping_chunks.append(
+                            slot_mapping_chunk[run_start:run_end]
+                        )
+                        dst_offset += run_len
+                        run_start = pos
+                    prev = pos
+                run_end = prev + 1
+                run_len = run_end - run_start
+                copy_plan.append((
+                    chunk_idx,
+                    run_start,
+                    run_end,
+                    dst_offset,
+                    dst_offset + run_len,
+                ))
+                compact_slot_mapping_chunks.append(
+                    slot_mapping_chunk[run_start:run_end]
+                )
+                dst_offset += run_len
+            slot_mapping_full = (
+                torch.cat(compact_slot_mapping_chunks, dim=0)
+                if compact_slot_mapping_chunks
+                else slot_mapping.new_empty((0,))
+            )
+        else:
+            # TODO(Jiayi): Optimize away this `cat`
+            slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
 
         num_tokens = len(slot_mapping_full)
 
@@ -1352,13 +1463,17 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         _fa_dsts: Optional[list] = None
         if self.use_gpu:
             _fa_dsts = []
-            _fa_off = 0
-            for _smc in slot_mapping_chunks:
-                _clen = len(_smc)
-                _fa_dsts.append(
-                    tmp_gpu_buffer_obj.tensor[_fa_off : _fa_off + _clen]
-                )
-                _fa_off += _clen
+            if copy_plan is not None:
+                for _, _, _, dst_start, dst_end in copy_plan:
+                    _fa_dsts.append(tmp_gpu_buffer_obj.tensor[dst_start:dst_end])
+            else:
+                _fa_off = 0
+                for _smc in slot_mapping_chunks:
+                    _clen = len(_smc)
+                    _fa_dsts.append(
+                        tmp_gpu_buffer_obj.tensor[_fa_off : _fa_off + _clen]
+                    )
+                    _fa_off += _clen
 
         current_stream = torch.cuda.current_stream()
         debug_transfer = bool(os.environ.get("SPECAGENT_LMCACHE_TRANSFER_DEBUG"))
@@ -1413,16 +1528,56 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             f"Expected memory format {_exp_fmt}, got "
                             f"{memory_objs_layer[0].metadata.fmt}"
                         )
-                    _fa_srcs = [mo.tensor for mo in memory_objs_layer]
+                    with _lmc_record(
+                        "lmcache gpu_send: build_srcs "
+                        f"layer={layer_id} chunks={len(memory_objs_layer)} "
+                        f"copy_plan={copy_plan is not None}"
+                    ):
+                        if copy_plan is not None:
+                            _fa_srcs = []
+                            for (
+                                chunk_idx,
+                                src_start,
+                                src_end,
+                                _dst_start,
+                                _dst_end,
+                            ) in copy_plan:
+                                src = memory_objs_layer[chunk_idx].tensor
+                                if src_start == 0 and src_end == src.shape[0]:
+                                    _fa_srcs.append(src)
+                                else:
+                                    _fa_srcs.append(src[src_start:src_end])
+                        else:
+                            _fa_srcs = [mo.tensor for mo in memory_objs_layer]
                     _fa_n = min(len(_fa_dsts), len(_fa_srcs))
                     if _fa_n:
-                        torch._foreach_copy_(
-                            _fa_dsts[:_fa_n], _fa_srcs[:_fa_n],
-                            non_blocking=True,
-                        )
+                        with _lmc_record(
+                            "lmcache gpu_send: h2d_copy "
+                            f"layer={layer_id} copies={_fa_n}"
+                        ):
+                            _copy_dsts = _fa_dsts[:_fa_n]
+                            _copy_srcs = _fa_srcs[:_fa_n]
+                            if all(
+                                _can_raw_h2d_copy(_dst, _src)
+                                for _dst, _src in zip(
+                                    _copy_dsts, _copy_srcs, strict=False
+                                )
+                            ):
+                                _raw_h2d_copy_batch_async(
+                                    _copy_dsts,
+                                    _copy_srcs,
+                                )
+                            else:
+                                torch._foreach_copy_(
+                                    _copy_dsts,
+                                    _copy_srcs,
+                                    non_blocking=True,
+                                )
                     if bw_profile:
-                        for _mo in memory_objs_layer:
-                            prof_h2d_bytes += int(_mo.get_size())
+                        for _src in _fa_srcs:
+                            prof_h2d_bytes += int(
+                                _src.numel() * _src.element_size()
+                            )
                 else:
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
@@ -1443,19 +1598,18 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 if self.use_gpu:
                     transfer_tensor = tmp_gpu_buffer_obj.tensor
                     transfer_slot_mapping = slot_mapping_full
-                    if write_mask_full is not None:
-                        transfer_tensor = transfer_tensor[write_mask_full]
-                        transfer_slot_mapping = slot_mapping_full[
-                            write_mask_full
-                        ]
-                    lmc_ops.single_layer_kv_transfer(
-                        transfer_tensor,
-                        kvcaches[layer_id],
-                        transfer_slot_mapping,
-                        lmc_ops.TransferDirection.H2D,
-                        self.gpu_kv_format,
-                        token_major=True,
-                    )
+                    with _lmc_record(
+                        "lmcache gpu_send: xfer_to_kvcache "
+                        f"layer={layer_id} tokens={num_tokens}"
+                    ):
+                        lmc_ops.single_layer_kv_transfer(
+                            transfer_tensor,
+                            kvcaches[layer_id],
+                            transfer_slot_mapping,
+                            lmc_ops.TransferDirection.H2D,
+                            self.gpu_kv_format,
+                            token_major=True,
+                        )
                     if _hb:
                         _hb_xfer += _hbt.perf_counter() - _hb_c1
                     if bw_profile:

@@ -2,6 +2,7 @@
 # Standard
 from collections import defaultdict
 from collections.abc import Iterable
+from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -67,6 +68,14 @@ from lmcache.v1.token_database import (
 logger = init_logger(__name__)
 
 _SPECAGENT_LIVE_PROBE_LOG_LIMIT = 20
+
+try:
+    # vLLM exposes NVTX ranges only when profiling asks for them.  Keep a
+    # no-op fallback so standalone LMCache imports do not depend on vLLM.
+    from vllm.v1.utils import record_function_or_nullcontext as _lmc_record
+except Exception:  # pragma: no cover - vLLM may be absent in LMCache tests.
+    def _lmc_record(_name: str):
+        return nullcontext()
 
 
 def _specagent_record_actual_cpu_store(
@@ -1012,38 +1021,64 @@ class LMCacheEngine:
 
             specagent_block_size = int(kwargs.get("specagent_block_size", 16))
             for layer_id in range(self.num_layers):
-                if store_current_layer_only:
-                    # SpecAgent calls this generator after each model layer.
-                    # Start and finish only the current layer here; do not
-                    # advance into the next layer before its KV has been
-                    # computed.
-                    next(mem_obj_generator)
-                    next(mem_obj_generator)
-                else:
-                    next(mem_obj_generator)
-                self.storage_manager.batched_put(
-                    keys[layer_id], memory_objs[layer_id], location=self.store_location
-                )
-                for start, end, key, memory_obj in zip(
-                    starts, ends, keys[layer_id], memory_objs[layer_id], strict=False
+                with _lmc_record(
+                    "lmcache store_layer: d2h_wait "
+                    f"req={req_id} layer={layer_id} "
+                    f"chunks={len(keys[layer_id])}"
                 ):
-                    _specagent_record_actual_kv_fingerprint(
-                        tokens,
-                        memory_obj,
-                        start,
-                        end,
-                        specagent_block_size,
-                        req_id,
-                        layer_id,
-                        key,
+                    if store_current_layer_only:
+                        # SpecAgent calls this generator after each model layer.
+                        # Start and finish only the current layer here; do not
+                        # advance into the next layer before its KV has been
+                        # computed.
+                        next(mem_obj_generator)
+                        next(mem_obj_generator)
+                    else:
+                        next(mem_obj_generator)
+                with _lmc_record(
+                    "lmcache store_layer: batched_put "
+                    f"req={req_id} layer={layer_id} "
+                    f"chunks={len(keys[layer_id])}"
+                ):
+                    self.storage_manager.batched_put(
+                        keys[layer_id],
+                        memory_objs[layer_id],
+                        location=self.store_location,
                     )
-                if layer_id == self.num_layers - 1:
-                    for start, end, memory_obj in zip(
-                        starts, ends, memory_objs[layer_id], strict=False
+                with _lmc_record(
+                    "lmcache store_layer: fingerprint "
+                    f"req={req_id} layer={layer_id} "
+                    f"chunks={len(keys[layer_id])}"
+                ):
+                    for start, end, key, memory_obj in zip(
+                        starts,
+                        ends,
+                        keys[layer_id],
+                        memory_objs[layer_id],
+                        strict=False,
                     ):
-                        _specagent_record_actual_cpu_store(
-                            tokens, start, end, specagent_block_size
+                        _specagent_record_actual_kv_fingerprint(
+                            tokens,
+                            memory_obj,
+                            start,
+                            end,
+                            specagent_block_size,
+                            req_id,
+                            layer_id,
+                            key,
                         )
+                if layer_id == self.num_layers - 1:
+                    with _lmc_record(
+                        "lmcache store_layer: cpu_store_proof "
+                        f"req={req_id} layer={layer_id} "
+                        f"chunks={len(keys[layer_id])}"
+                    ):
+                        for start, end, memory_obj in zip(
+                            starts, ends, memory_objs[layer_id], strict=False
+                        ):
+                            _specagent_record_actual_cpu_store(
+                                tokens, start, end, specagent_block_size
+                            )
 
                 yield
 
@@ -1286,57 +1321,101 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         location = None
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens,
-            mask=mask,
-            request_configs=request_configs,
+        specagent_expected_tokens = kwargs.get("specagent_expected_tokens")
+        retrieved_tokens_count = 0
+        with _lmc_record(
+            "lmcache retrieve_layer: token_lookup "
+            f"req={req_id} tokens={len(tokens)} required={int(num_required_tokens)}"
         ):
-            assert isinstance(key, CacheEngineKey)
+            token_iter = iter(self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+            ))
+            while True:
+                with _lmc_record("lmcache token_lookup: next_key"):
+                    try:
+                        start, end, key = next(token_iter)
+                    except StopIteration:
+                        break
+                assert isinstance(key, CacheEngineKey)
 
-            keys_multi_layer = key.split_layers(self.num_layers)
+                with _lmc_record("lmcache token_lookup: split_layers"):
+                    keys_multi_layer = key.split_layers(self.num_layers)
 
-            layer_locations = [
-                self.storage_manager.contains(layer_key, self.retrieve_locations)
-                for layer_key in keys_multi_layer
-            ]
-            if all(layer_locations):
-                current_location = layer_locations[0]
-                if location is None:
-                    location = current_location
-                else:
-                    # TODO(Jiayi): Support multi-location retrieval in the future
-                    assert all(loc == location for loc in layer_locations), (
-                        "All retrieved keys should be from the same location "
-                        "when use layerwise retrieval."
-                        "Please support multi-location retrieval in the future."
+                with _lmc_record("lmcache token_lookup: batched_contains"):
+                    hit_layers, block_mapping = self.storage_manager.batched_contains(
+                        keys_multi_layer,
+                        self.retrieve_locations,
                     )
-            else:
-                break
+                if hit_layers == self.num_layers and len(block_mapping) == 1:
+                    current_location = next(iter(block_mapping.keys()))
+                    if location is None:
+                        location = current_location
+                    else:
+                        # TODO(Jiayi): Support multi-location retrieval in the future
+                        assert current_location == location, (
+                            "All retrieved keys should be from the same location "
+                            "when use layerwise retrieval."
+                            "Please support multi-location retrieval in the future."
+                        )
+                else:
+                    break
 
-            starts.append(start)
-            ends.append(end)
-            keys.append(keys_multi_layer)
+                starts.append(start)
+                ends.append(end)
+                keys.append(keys_multi_layer)
 
-            ret_mask[start:end] = True
+                ret_mask[start:end] = True
+                retrieved_tokens_count += end - start
 
         if keys:
             # Transpose the keys into layer major format
-            keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
+            with _lmc_record(
+                "lmcache retrieve_layer: setup_layerwise "
+                f"req={req_id} chunks={len(keys)} "
+                f"tokens={retrieved_tokens_count}"
+            ):
+                with _lmc_record(
+                    "lmcache retrieve_layer: setup transpose_keys "
+                    f"req={req_id} chunks={len(keys)}"
+                ):
+                    keys_layer_major = [
+                        list(row) for row in zip(*keys, strict=False)
+                    ]
 
-            get_generator = self.storage_manager.layerwise_batched_get(
-                keys_layer_major,
-                location=location,
-            )
+                with _lmc_record(
+                    "lmcache retrieve_layer: setup get_generator "
+                    f"req={req_id} chunks={len(keys)}"
+                ):
+                    get_generator = self.storage_manager.layerwise_batched_get(
+                        keys_layer_major,
+                        location=location,
+                    )
 
-            assert_layerwise_gpu_connector(self.gpu_connector)
+                with _lmc_record(
+                    "lmcache retrieve_layer: setup init_gpu_consumer "
+                    f"req={req_id} chunks={len(keys)}"
+                ):
+                    assert_layerwise_gpu_connector(self.gpu_connector)
 
-            mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
-            next(mem_obj_consumer)
+                    mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                        starts, ends, **kwargs
+                    )
+                    next(mem_obj_consumer)
 
             to_count_down = []
             cpu_prefetch_ahead = max(
                 0,
-                int(os.environ.get("SPECAGENT_CPU_PREFETCH_AHEAD_LAYERS", "0")),
+                int(
+                    kwargs.get(
+                        "specagent_cpu_prefetch_ahead_layers",
+                        os.environ.get(
+                            "SPECAGENT_CPU_PREFETCH_AHEAD_LAYERS", "0"
+                        ),
+                    )
+                    or 0
+                ),
             )
             cpu_prefetch_profile = bool(
                 os.environ.get("SPECAGENT_CPU_PREFETCH_PROFILE")
@@ -1353,7 +1432,12 @@ class LMCacheEngine:
                 nonlocal next_task_layer, prefetch_ms_total
                 while next_task_layer < min(self.num_layers, exclusive_layer):
                     prefetch_t0 = time.perf_counter()
-                    prefetched_tasks[next_task_layer] = next(get_generator)
+                    with _lmc_record(
+                        "lmcache retrieve_layer: submit_get "
+                        f"req={req_id} layer={next_task_layer} "
+                        f"chunks={len(keys)}"
+                    ):
+                        prefetched_tasks[next_task_layer] = next(get_generator)
                     prefetch_ms_total += (
                         time.perf_counter() - prefetch_t0
                     ) * 1000.0
@@ -1367,17 +1451,28 @@ class LMCacheEngine:
                 if layer_id == 0:
                     # NOTE(Yuwei): For sglang integration we need to provide retrieved
                     # tokens number in the first layer loading since there is no lookup
-                    yield torch.sum(ret_mask)
+                    if specagent_expected_tokens is not None:
+                        yield retrieved_tokens_count
+                    else:
+                        yield torch.sum(ret_mask)
                 else:
                     yield None
 
                 result_t0 = time.perf_counter()
-                mem_objs_layer = task.result()
+                with _lmc_record(
+                    "lmcache retrieve_layer: task_result "
+                    f"req={req_id} layer={layer_id} chunks={len(keys)}"
+                ):
+                    mem_objs_layer = task.result()
                 result_ms = (time.perf_counter() - result_t0) * 1000.0
                 result_ms_total += result_ms
                 result_ms_max = max(result_ms_max, result_ms)
                 send_t0 = time.perf_counter()
-                mem_obj_consumer.send(mem_objs_layer)
+                with _lmc_record(
+                    "lmcache retrieve_layer: gpu_send "
+                    f"req={req_id} layer={layer_id} chunks={len(keys)}"
+                ):
+                    mem_obj_consumer.send(mem_objs_layer)
                 send_ms = (time.perf_counter() - send_t0) * 1000.0
                 send_ms_total += send_ms
                 send_ms_max = max(send_ms_max, send_ms)

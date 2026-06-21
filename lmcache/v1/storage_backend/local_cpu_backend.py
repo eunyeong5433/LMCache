@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from contextlib import nullcontext
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
 import threading
@@ -33,6 +34,14 @@ if TYPE_CHECKING:
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
+
+try:
+    # vLLM emits these ranges into Nsight when profiling is enabled.  Keep
+    # LMCache importable in standalone contexts where vLLM is absent.
+    from vllm.v1.utils import record_function_or_nullcontext as _lmc_record
+except Exception:  # pragma: no cover - optional vLLM dependency.
+    def _lmc_record(_name: str):
+        return nullcontext()
 
 
 class LocalCPUBackend(AllocatorBackendInterface):
@@ -125,6 +134,27 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 self.keys_in_request.append(key)
             return True
 
+    def batched_contains(
+        self,
+        keys: List[CacheEngineKey],
+        pin: bool = False,
+    ) -> int:
+        with _lmc_record(f"lmcache local_cpu: batched_contains keys={len(keys)}"):
+            num_hit_chunks = 0
+            with self.cpu_lock:
+                with _lmc_record(
+                    f"lmcache local_cpu: batched_contains_locked keys={len(keys)}"
+                ):
+                    for key in keys:
+                        if key not in self.hot_cache:
+                            return num_hit_chunks
+                        if pin:
+                            self.hot_cache[key].pin()
+                            # vllm lookup sets pin to True
+                            self.keys_in_request.append(key)
+                        num_hit_chunks += 1
+            return num_hit_chunks
+
     def touch_cache(self):
         # flip the order of the keys in the request
         with self.cpu_lock:
@@ -193,11 +223,36 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if not self.use_hot:
             return
 
-        # TODO(Jiayi): optimize this with batching
-        for key, memory_obj in zip(keys, memory_objs, strict=False):
-            self.submit_put_task(
-                key, memory_obj, on_complete_callback=on_complete_callback
-            )
+        stored_keys: list[CacheEngineKey] = []
+        with _lmc_record(f"lmcache local_cpu: batched_put_core keys={len(keys)}"):
+            with self.cpu_lock:
+                for key, memory_obj in zip(keys, memory_objs, strict=False):
+                    if key in self.hot_cache:
+                        continue
+
+                    memory_obj.ref_count_up()
+                    self.hot_cache[key] = memory_obj
+                    self.cache_policy.update_on_put(key)
+
+                    # Push kv admit msg with batching
+                    if self.batched_msg_sender is not None:
+                        self.batched_msg_sender.add_kv_op(
+                            op_type=OpType.ADMIT,
+                            key=key.chunk_hash,
+                        )
+                    stored_keys.append(key)
+
+        if on_complete_callback is not None:
+            with _lmc_record(
+                f"lmcache local_cpu: batched_put_callbacks keys={len(stored_keys)}"
+            ):
+                for key in stored_keys:
+                    try:
+                        on_complete_callback(key)
+                    except Exception as e:
+                        logger.warning(
+                            f"on_complete_callback failed for key {key}: {e}"
+                        )
 
     def get_blocking(
         self,
@@ -212,6 +267,19 @@ class LocalCPUBackend(AllocatorBackendInterface):
             # ref count up themselves
             memory_obj.ref_count_up()
             return memory_obj
+
+    def batched_get_blocking(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[MemoryObj]]:
+        mem_objs: List[Optional[MemoryObj]] = []
+        with self.cpu_lock:
+            for key in keys:
+                mem_obj = self.hot_cache.get(key)
+                if mem_obj is not None:
+                    mem_obj.ref_count_up()
+                mem_objs.append(mem_obj)
+        return mem_objs
 
     async def batched_get_non_blocking(
         self,

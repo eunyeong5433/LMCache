@@ -488,6 +488,10 @@ class TensorMemoryObj(MemoryObj):
         self.valid = True
         self.lock = threading.Lock()
         self.parent_allocator = parent_allocator
+        self._cached_tensor: Optional[torch.Tensor] = None
+        self._cached_tensor_key: Optional[
+            tuple[int, int, torch.Size, torch.dtype]
+        ] = None
         # Calculate the prefix sum of the group sizes
         # If there are two groups, the prefix sum will be
         # [0, size_of_group_1, size_of_group_1 + size_of_group_2]
@@ -520,6 +524,8 @@ class TensorMemoryObj(MemoryObj):
 
     def invalidate(self):
         self.valid = False
+        self._cached_tensor = None
+        self._cached_tensor_key = None
 
     def is_valid(self):
         return self.valid
@@ -635,10 +641,24 @@ class TensorMemoryObj(MemoryObj):
             logger.warning("Trying to access an invalidated MemoryObj")
             return None
         assert self.meta.dtype is not None
+        tensor_key = (
+            self.raw_data.data_ptr(),
+            self.raw_data.numel(),
+            self.meta.shape,
+            self.meta.dtype,
+        )
+        if (
+            self._cached_tensor is not None
+            and self._cached_tensor_key == tensor_key
+        ):
+            return self._cached_tensor
         # TODO(Jiayi): consider caching the `get_size()`
-        return (
+        tensor = (
             self.raw_data[: self.get_size()].view(self.meta.dtype).view(self.meta.shape)
         )
+        self._cached_tensor = tensor
+        self._cached_tensor_key = tensor_key
+        return tensor
 
     @property
     def byte_array(self) -> memoryview:

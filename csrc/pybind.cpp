@@ -50,6 +50,10 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("reshape_and_cache_back_flash", &reshape_and_cache_back_flash);
   m.def("lmcache_memcpy_async", &lmcache_memcpy_async,
         py::call_guard<py::gil_scoped_release>());
+  // The batched path only enqueues cudaMemcpyAsync calls. Releasing the GIL here
+  // lets the model thread steal it before the load worker can enqueue the
+  // following KV-transfer kernel, which creates millisecond-scale stream gaps.
+  m.def("lmcache_memcpy_async_batch", &lmcache_memcpy_async_batch);
   m.def("encode_fast_new", &encode_cuda_new);
   m.def("decode_fast_new", &decode_cuda_new);
   m.def("decode_fast_prefsum", &decode_cuda_prefsum);

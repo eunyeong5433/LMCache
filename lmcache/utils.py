@@ -5,6 +5,7 @@ from __future__ import annotations
 # Standard
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 import asyncio
 import hashlib
@@ -346,6 +347,7 @@ class CacheEngineKey:
     request_configs: Optional[dict] = field(default_factory=dict)
     tags: Optional[tuple] = field(init=False, default=None)
     _dtype_str: str = field(init=False, default="")
+    _hash_value: int = field(init=False, default=0, repr=False, compare=False)
 
     def __post_init__(self):
         tag_list = None
@@ -360,9 +362,7 @@ class CacheEngineKey:
         self._dtype_str = TORCH_DTYPE_TO_STR_DTYPE[self.dtype]
         # use tuple to save tags
         self.tags = None if tag_list is None else tuple(tag_list)
-
-    def __hash__(self):
-        return hash(
+        self._hash_value = hash(
             (
                 self.model_name,
                 self.world_size,
@@ -372,6 +372,9 @@ class CacheEngineKey:
                 self.tags,
             )
         )
+
+    def __hash__(self):
+        return self._hash_value
 
     def __eq__(self, other):
         if type(self) is type(other):
@@ -398,6 +401,17 @@ class CacheEngineKey:
 
     def split_layers(self, num_layers: int) -> List["LayerCacheEngineKey"]:
         """Split the key into multiple keys for each layer"""
+        if self.tags is None and not self.request_configs:
+            return list(
+                _cached_split_layers_no_request_configs(
+                    self.model_name,
+                    self.world_size,
+                    self.worker_id,
+                    self.chunk_hash,
+                    self.dtype,
+                    num_layers,
+                )
+            )
         keys = []
         for layer_id in range(num_layers):
             keys.append(
@@ -507,8 +521,9 @@ class LayerCacheEngineKey(CacheEngineKey):
 
     layer_id: int = 0
 
-    def __hash__(self):
-        return hash(
+    def __post_init__(self):
+        CacheEngineKey.__post_init__(self)
+        self._hash_value = hash(
             (
                 self.model_name,
                 self.world_size,
@@ -519,6 +534,9 @@ class LayerCacheEngineKey(CacheEngineKey):
                 self.layer_id,
             )
         )
+
+    def __hash__(self):
+        return self._hash_value
 
     def __eq__(self, other):
         if super(LayerCacheEngineKey, self).__eq__(other):
@@ -538,6 +556,17 @@ class LayerCacheEngineKey(CacheEngineKey):
 
     def split_layers(self, num_layers: int) -> List["LayerCacheEngineKey"]:
         """Split the key into multiple keys for each layer"""
+        if self.tags is None and not self.request_configs:
+            return list(
+                _cached_split_layers_no_request_configs(
+                    self.model_name,
+                    self.world_size,
+                    self.worker_id,
+                    self.chunk_hash,
+                    self.dtype,
+                    num_layers,
+                )
+            )
         keys = []
         for layer_id in range(num_layers):
             keys.append(
@@ -575,6 +604,29 @@ class LayerCacheEngineKey(CacheEngineKey):
             request_configs=request_configs,
             layer_id=int(parts[5]),
         )
+
+
+@lru_cache(maxsize=4096)
+def _cached_split_layers_no_request_configs(
+    model_name: str,
+    world_size: int,
+    worker_id: int,
+    chunk_hash: int,
+    dtype: torch.dtype,
+    num_layers: int,
+) -> Tuple[LayerCacheEngineKey, ...]:
+    return tuple(
+        LayerCacheEngineKey(
+            model_name=model_name,
+            world_size=world_size,
+            worker_id=worker_id,
+            chunk_hash=chunk_hash,
+            dtype=dtype,
+            request_configs=None,
+            layer_id=layer_id,
+        )
+        for layer_id in range(num_layers)
+    )
 
 
 @dataclass

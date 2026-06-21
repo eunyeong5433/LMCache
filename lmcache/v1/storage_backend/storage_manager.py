@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import OrderedDict
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -239,6 +239,10 @@ class StorageManager:
 
         self.storage_backends: OrderedDict[str, StorageBackendInterface] = OrderedDict()
         self.manager_lock = threading.Lock()
+        self.local_cpu_get_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="lmcache-local-cpu-get",
+        )
         self.lmcache_worker = lmcache_worker
 
         # Use the unified create path so that init and
@@ -529,6 +533,11 @@ class StorageManager:
         for keys_multi_chunk in keys:
             # Retrieve all chunks for one layer
             backend = self.storage_backends[location]
+            if isinstance(backend, LocalCPUBackend):
+                yield self.local_cpu_get_executor.submit(
+                    backend.batched_get_blocking, keys_multi_chunk
+                )
+                continue
             # TODO(Jiayi): need to make async loading and layerwise compatible
             coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
@@ -1310,6 +1319,11 @@ class StorageManager:
 
     def close(self):
         logger.info("Closing StorageManager...")
+
+        try:
+            self.local_cpu_get_executor.shutdown(wait=True)
+        except Exception as e:
+            logger.error(f"Error shutting down LocalCPU get executor: {e}")
 
         # Close all backends
         for name, backend in self.storage_backends.items():
