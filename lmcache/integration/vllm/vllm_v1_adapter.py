@@ -546,6 +546,28 @@ class ReqMeta:
         # If we need to save, update the number of saved tokens.
         if not skip_save:
             tracker.num_saved_tokens = num_tokens_to_save
+        _sbd = os.environ.get("LMCACHE_SAVEBND_DEBUG")
+        if _sbd:
+            try:
+                import builtins as _b
+                _fh = getattr(_b, "_lmc_savebnd_fh", None)
+                if _fh is None:
+                    _fh = _b._lmc_savebnd_fh = open(_sbd, "a", buffering=1)
+                    _b._lmc_savebnd_n = 0
+                if _b._lmc_savebnd_n < 8000:
+                    _b._lmc_savebnd_n += 1
+                    _fh.write(
+                        "SAVEBND req=%s input_len=%d prompt_len=%d prev_saved=%d "
+                        "to_save=%d max_slot=%d nblocks=%d last_prefill=%s "
+                        "decode=%s skip_save=%s clamped=%s\n" % (
+                            tracker.req_id, input_token_len, tracker.prompt_len,
+                            skip_leading_tokens, num_tokens_to_save, max_slot_tokens,
+                            num_blocks, is_last_prefill, tracker.is_decode_phase,
+                            skip_save, num_tokens_to_save >= max_slot_tokens,
+                        )
+                    )
+            except Exception:
+                pass
         save_spec = SaveSpec(skip_leading_tokens, not skip_save)
 
         # Calculate the token ids and slot mappings for load and save

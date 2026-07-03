@@ -976,6 +976,22 @@ class LMCacheEngine:
             memory_objs.append(memory_objs_multi_layer)
             tot_token_num += num_tokens
 
+            _spd = os.environ.get("LMCACHE_STOREPUT_DEBUG")
+            if _spd:
+                try:
+                    import builtins as _b
+                    _fh = getattr(_b, "_lmc_storeput_fh", None)
+                    if _fh is None:
+                        _fh = _b._lmc_storeput_fh = open(_spd, "a", buffering=1)
+                        _b._lmc_storeput_n = 0
+                    if _b._lmc_storeput_n < 12000:
+                        _b._lmc_storeput_n += 1
+                        _fh.write("PUT ts=%.4f req=%s span=[%d:%d] key0=%s\n" % (
+                            time.monotonic(), req_id, start, end,
+                            keys_multi_layer[0].to_string()[:80]))
+                except Exception:
+                    pass
+
             # Create KV event
             if self.kv_events_enabled and tokens is not None:
                 stored_event = CacheStoreEvent(
@@ -1616,6 +1632,8 @@ class LMCacheEngine:
 
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
+                _dbg = os.environ.get("LMCACHE_LOOKUP_DEBUG")
+                _ci = 0
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
 
@@ -1638,8 +1656,46 @@ class LMCacheEngine:
                             location = next(iter(block_mapping.keys()))
                             self.lookup_pins[lookup_id][location].extend(key_all_layers)
                         res = end
+                        _ci += 1
                         continue
+                    # FIRST MISS: log where in the prefix the lookup stops and why,
+                    # then return res (LMCache stops at first unavailable chunk).
+                    if _dbg:
+                        try:
+                            import builtins as _b
+                            _fh = getattr(_b, "_lmc_lookupdbg_fh", None)
+                            if _fh is None:
+                                _fh = _b._lmc_lookupdbg_fh = open(_dbg, "a", buffering=1)
+                                _b._lmc_lookupdbg_n = 0
+                            if _b._lmc_lookupdbg_n < 8000:
+                                _b._lmc_lookupdbg_n += 1
+                                _fh.write(
+                                    "MISS ts=%.4f id=%s miss_chunk=%d "
+                                    "miss_span=[%d:%d] res=%d hit_layers=%d/%d "
+                                    "locs=%d key0=%s\n" % (
+                                        time.monotonic(),
+                                        lookup_id, _ci, start, end, res, hit_chunks,
+                                        self.num_layers, len(block_mapping),
+                                        key_all_layers[0].to_string()[:80],
+                                    )
+                                )
+                        except Exception:
+                            pass
                     return res
+                # whole prefix hit (loop exhausted) — log full hit occasionally
+                if _dbg:
+                    try:
+                        import builtins as _b
+                        _fh = getattr(_b, "_lmc_lookupdbg_fh", None)
+                        if _fh is None:
+                            _fh = _b._lmc_lookupdbg_fh = open(_dbg, "a", buffering=1)
+                            _b._lmc_lookupdbg_n = 0
+                        if _b._lmc_lookupdbg_n < 8000:
+                            _b._lmc_lookupdbg_n += 1
+                            _fh.write("FULLHIT id=%s chunks=%d res=%d\n"
+                                      % (lookup_id, _ci, res))
+                    except Exception:
+                        pass
             else:
                 chunk_info_list = []
                 keys = []
