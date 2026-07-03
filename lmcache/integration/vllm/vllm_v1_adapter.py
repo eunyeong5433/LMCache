@@ -413,6 +413,13 @@ class ReqMeta:
     request_configs: Optional[dict] = None
     # SpecAgent turn-end save emitted after the request actually stopped.
     is_finished_save: bool = False
+    # SpecAgent mid-turn preempt save: store the confirmed/verified KV region
+    # of a request that is being preempted (but is NOT finished) so it can
+    # restore to NORMAL via a CPU hit.  Stored synchronously without a forward,
+    # like is_finished_save, but must NOT be reported as finished_sending (the
+    # request is still alive; the scheduler frees its blocks itself once the
+    # store has landed).
+    is_preempt_save: bool = False
 
     @staticmethod
     def from_request_tracker(
@@ -741,6 +748,10 @@ class LMCacheConnectorV1Impl:
         if role == KVConnectorRole.SCHEDULER:
             self._unfinished_requests: dict[str, "Request"] = {}
             self._specagent_finished_save_metas: dict[str, ReqMeta] = {}
+            # Mid-turn preempt saves registered by the scheduler; emitted into
+            # the connector metadata (like finished saves) and stored on the
+            # worker WITHOUT a finished_sending report.
+            self._specagent_preempt_save_metas: dict[str, ReqMeta] = {}
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
@@ -2716,6 +2727,40 @@ class LMCacheConnectorV1Impl:
                     self._layerwise_save_storers.pop(request.req_id, None)
                     if request.is_finished_save:
                         self._specagent_finished_save_completed.add(request.req_id)
+                    # FIX: the layerwise store path (used for finished/turn-end
+                    # saves that are processed during a forward) never recorded
+                    # to the proof ledger -- only the bulk without_forward path
+                    # did, and it is skipped here because we mark the req
+                    # completed above.  So the ledger stayed nearly empty and the
+                    # scheduler's cpu_fetchable coverage massively understated
+                    # (-> restore under-fires, preempt frees unsafe blocks).
+                    # Record the chunks this store just wrote (skip_leading..len),
+                    # with the same (chunk_end, hash(token_ids[:chunk_end])) the
+                    # proven-check re-derives.  token_ids == all_token_ids[:limit]
+                    # so the hashes match.
+                    if (
+                        (request.is_finished_save or request.is_preempt_save)
+                        and request.save_spec is not None
+                        and request.save_spec.can_save
+                        and isinstance(request.token_ids, list)
+                    ):
+                        try:
+                            from lmcache.v1.cache_engine import (
+                                _specagent_record_actual_cpu_store,
+                            )
+                            _cs = int(self._lmcache_chunk_size)
+                            _tok = request.token_ids
+                            _skip = (
+                                request.save_spec.skip_leading_tokens // _cs * _cs
+                            )
+                            _last = len(_tok) // _cs * _cs
+                            for _ce in range(_cs, _last + 1, _cs):
+                                if _ce > _skip:
+                                    _specagent_record_actual_cpu_store(
+                                        _tok, 0, _ce, self._block_size
+                                    )
+                        except Exception:
+                            pass
 
         if timing:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -2905,11 +2950,21 @@ class LMCacheConnectorV1Impl:
     def _specagent_save_finished_meta_without_forward(
         self, request: ReqMeta
     ) -> bool:
-        """Store a finished SpecAgent turn when no model forward is running."""
-        if not request.is_finished_save:
+        """Store a SpecAgent KV region when no model forward is running.
+
+        Used for both turn-end finished saves (``is_finished_save``) and
+        mid-turn preempt saves (``is_preempt_save``).  The store itself is
+        identical (synchronous ``store_layer`` from the paged buffer); only the
+        caller differs in whether the request is subsequently reported as
+        finished_sending.
+        """
+        if not (request.is_finished_save or request.is_preempt_save):
             return False
+        builtins._sa_finsave_call = getattr(builtins, "_sa_finsave_call", 0) + 1
         save_spec = request.save_spec
         if save_spec is None or not save_spec.can_save:
+            builtins._sa_finsave_nocansave = getattr(
+                builtins, "_sa_finsave_nocansave", 0) + 1
             return True
         if self.kv_role == "kv_consumer":
             return True
@@ -2931,8 +2986,12 @@ class LMCacheConnectorV1Impl:
             * self._lmcache_chunk_size
         )
         if skip_leading_tokens >= len(token_ids):
+            builtins._sa_finsave_skipall = getattr(
+                builtins, "_sa_finsave_skipall", 0) + 1
             return True
 
+        builtins._sa_finsave_store = getattr(
+            builtins, "_sa_finsave_store", 0) + 1
         store_mask = torch.ones(len(token_ids), dtype=torch.bool)
         store_mask[:skip_leading_tokens] = False
         storer = self.lmcache_engine.store_layer(
@@ -2955,15 +3014,35 @@ class LMCacheConnectorV1Impl:
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
         connector_metadata = self._parent._get_connector_metadata()
+        builtins._sa_getfin_call = getattr(builtins, "_sa_getfin_call", 0) + 1
         if isinstance(connector_metadata, LMCacheConnectorMetadata):
+            builtins._sa_getfin_reqs = getattr(
+                builtins, "_sa_getfin_reqs", 0) + len(connector_metadata.requests)
+            builtins._sa_getfin_finmatch = getattr(
+                builtins, "_sa_getfin_finmatch", 0) + sum(
+                1 for r in connector_metadata.requests if r.is_finished_save)
             for request in connector_metadata.requests:
+                if request.is_finished_save and request.req_id in \
+                        self._specagent_finished_save_completed:
+                    builtins._sa_getfin_incompleted = getattr(
+                        builtins, "_sa_getfin_incompleted", 0) + 1
                 if (
                     request.is_finished_save
                     and request.req_id
                     not in self._specagent_finished_save_completed
                 ):
+                    builtins._sa_getfin_wouldcall = getattr(
+                        builtins, "_sa_getfin_wouldcall", 0) + 1
                     if self._specagent_save_finished_meta_without_forward(request):
                         self._specagent_finished_save_completed.add(request.req_id)
+                # Mid-turn preempt saves: store synchronously WITHOUT reporting
+                # the request as finished_sending (it is still alive; the
+                # scheduler frees its blocks itself once the ledger confirms).
+                # The meta is emitted once (build_connector_meta pops it), so it
+                # is processed exactly once here -- no persistent dedup (which
+                # would wrongly block a later re-preempt of the same req_id).
+                elif request.is_preempt_save:
+                    self._specagent_save_finished_meta_without_forward(request)
         finished_sending = set(self._specagent_finished_save_completed)
         self._specagent_finished_save_completed.clear()
         return finished_sending or None, None
@@ -3410,6 +3489,28 @@ class LMCacheConnectorV1Impl:
             if _specagent_env_true("SPECAGENT_SAVE_DEBUG"):
                 logger.warning(
                     "[SpecAgent][FINISH-SAVE-META] emit req=%s tokens=%d "
+                    "skip=%s",
+                    req_id,
+                    len(req_meta.token_ids),
+                    (
+                        req_meta.save_spec.skip_leading_tokens
+                        if req_meta.save_spec is not None
+                        else None
+                    ),
+                )
+
+        # Mid-turn preempt saves: emitted like finished saves so the worker can
+        # store them without a forward, but flagged is_preempt_save so they are
+        # NOT reported as finished_sending (the request stays alive).
+        for req_id, req_meta in list(
+            getattr(self, "_specagent_preempt_save_metas", {}).items()
+        ):
+            meta.add_request(req_meta)
+            emitted_req_ids.add(req_id)
+            self._specagent_preempt_save_metas.pop(req_id, None)
+            if _specagent_env_true("SPECAGENT_SAVE_DEBUG"):
+                logger.warning(
+                    "[SpecAgent][PREEMPT-SAVE-META] emit req=%s tokens=%d "
                     "skip=%s",
                     req_id,
                     len(req_meta.token_ids),
@@ -4249,6 +4350,8 @@ class LMCacheConnectorV1Impl:
                     is_finished_save=True,
                 )
                 self._specagent_finished_save_metas[request.request_id] = req_meta
+                builtins._sa_finmeta_emit = getattr(
+                    builtins, "_sa_finmeta_emit", 0) + 1
                 if _specagent_env_true("SPECAGENT_SAVE_DEBUG"):
                     logger.warning(
                         "[SpecAgent][FINISH-SAVE] req=%s tokens=%d "
@@ -4262,6 +4365,74 @@ class LMCacheConnectorV1Impl:
                 return True, return_params
 
         return False, return_params
+
+    def specagent_register_preempt_save(
+        self,
+        request: "Request",
+        block_ids: list[int],
+        save_upto_tokens: int,
+    ) -> int:
+        """Register a mid-turn CPU save of ``request``'s confirmed KV region.
+
+        Scheduler-side.  Mirrors the turn-end finished-save meta construction in
+        ``request_finished`` but (1) bounds the save to ``save_upto_tokens`` (the
+        VERIFIED/confirmed boundary, so unverified draft KV is never written) and
+        (2) marks the meta ``is_preempt_save`` so the worker stores it WITHOUT
+        reporting the request as finished_sending (the request is still alive).
+
+        Returns the token boundary that will be CPU-backed after the store lands
+        (== the ``token_limit`` actually registered), or 0 if nothing new needs
+        saving (already saved, or no room).
+        """
+        if self.kv_role == "kv_consumer":
+            return 0
+        if getattr(request, "job_id", None) is None:
+            return 0
+        tracker = self._request_trackers.get(request.request_id)
+        skip_leading_tokens = (
+            int(tracker.num_saved_tokens) if tracker is not None else 0
+        )
+        token_limit = min(
+            int(save_upto_tokens),
+            len(request.all_token_ids),
+            len(block_ids) * self._block_size,
+        )
+        if token_limit <= skip_leading_tokens:
+            # The confirmed region is already fully CPU-backed.
+            return token_limit
+        block_ids_tensor = torch.tensor(block_ids, dtype=torch.long)
+        block_offsets = torch.arange(0, self._block_size, dtype=torch.long)
+        slot_mapping = (
+            block_offsets.reshape((1, self._block_size))
+            + block_ids_tensor.reshape((len(block_ids), 1)) * self._block_size
+        ).flatten()[:token_limit]
+        req_meta = ReqMeta(
+            req_id=request.request_id,
+            token_ids=list(request.all_token_ids[:token_limit]),
+            slot_mapping=slot_mapping,
+            is_last_prefill=True,
+            save_spec=SaveSpec(skip_leading_tokens, True),
+            load_spec=None,
+            disagg_spec=None,
+            request_configs=(
+                tracker.request_configs if tracker is not None else None
+            ),
+            is_finished_save=False,
+            is_preempt_save=True,
+        )
+        self._specagent_preempt_save_metas[request.request_id] = req_meta
+        if tracker is not None:
+            # Advance the tracker's saved boundary so a later turn-end save does
+            # not redundantly re-store this region.
+            tracker.num_saved_tokens = token_limit
+        if _specagent_env_true("SPECAGENT_SAVE_DEBUG"):
+            logger.warning(
+                "[SpecAgent][PREEMPT-SAVE] register req=%s tokens=%d skip=%d "
+                "blocks=%d",
+                request.request_id, token_limit, skip_leading_tokens,
+                len(block_ids),
+            )
+        return token_limit
 
     @_lmcache_nvtx_annotate
     def get_kv_events(self) -> Iterable[CacheStoreEvent]:

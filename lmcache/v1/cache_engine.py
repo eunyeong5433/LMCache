@@ -98,6 +98,14 @@ def _specagent_record_actual_cpu_store(
         prefix_tokens = [int(t) for t in tokens[:end]]
     token_hash = hash(tuple(prefix_tokens))
     chunk_store.add((end, token_hash))
+    builtins._sa_record_n = getattr(builtins, "_sa_record_n", 0) + 1
+    if os.environ.get("SPECAGENT_HASH_DEBUG") and end <= 512:
+        import logging as _lg
+        _lg.getLogger("lmcache").info(
+            "[SpecAgent][HASH-STORE] end=%d hash=%d len=%d head=%s tail=%s",
+            end, token_hash, len(prefix_tokens),
+            prefix_tokens[:3], prefix_tokens[-3:],
+        )
 
     if not os.environ.get("SPECAGENT_LEGACY_PRESTORE_PROOF"):
         return
