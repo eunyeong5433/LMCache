@@ -986,9 +986,16 @@ class LMCacheEngine:
                         _b._lmc_storeput_n = 0
                     if _b._lmc_storeput_n < 12000:
                         _b._lmc_storeput_n += 1
-                        _fh.write("PUT ts=%.4f req=%s span=[%d:%d] key0=%s\n" % (
-                            time.monotonic(), req_id, start, end,
-                            keys_multi_layer[0].to_string()[:80]))
+                        _tk = tokens[start:end]
+                        if hasattr(_tk, "tolist"):
+                            _tk = _tk.tolist()
+                        _fp = "n%d_f%d_l%d_s%d" % (
+                            len(_tk), _tk[0] if _tk else 0,
+                            _tk[-1] if _tk else 0, sum(_tk) & 0xffffff)
+                        _fh.write(
+                            "PUT ts=%.4f req=%s span=[%d:%d] tokfp=%s key0=%s\n" % (
+                                time.monotonic(), req_id, start, end, _fp,
+                                keys_multi_layer[0].to_string()[:80]))
                 except Exception:
                     pass
 
@@ -1669,13 +1676,23 @@ class LMCacheEngine:
                                 _b._lmc_lookupdbg_n = 0
                             if _b._lmc_lookupdbg_n < 8000:
                                 _b._lmc_lookupdbg_n += 1
+                                if tokens is not None:
+                                    _tk = tokens[start:end]
+                                    if hasattr(_tk, "tolist"):
+                                        _tk = _tk.tolist()
+                                    _fp = "n%d_f%d_l%d_s%d" % (
+                                        len(_tk), _tk[0] if _tk else 0,
+                                        _tk[-1] if _tk else 0, sum(_tk) & 0xffffff)
+                                else:
+                                    _fp = "NOTOKENS_hashes"
                                 _fh.write(
                                     "MISS ts=%.4f id=%s miss_chunk=%d "
                                     "miss_span=[%d:%d] res=%d hit_layers=%d/%d "
-                                    "locs=%d key0=%s\n" % (
+                                    "locs=%d tokfp=%s key0=%s\n" % (
                                         time.monotonic(),
                                         lookup_id, _ci, start, end, res, hit_chunks,
                                         self.num_layers, len(block_mapping),
+                                        _fp,
                                         key_all_layers[0].to_string()[:80],
                                     )
                                 )

@@ -2987,6 +2987,21 @@ class LMCacheConnectorV1Impl:
         if save_spec is None or not save_spec.can_save:
             builtins._sa_finsave_nocansave = getattr(
                 builtins, "_sa_finsave_nocansave", 0) + 1
+            _fnd = os.environ.get("LMCACHE_FINSAVE2_DEBUG")
+            if _fnd:
+                try:
+                    import builtins as _b
+                    _fh = getattr(_b, "_lmc_finsave2_fh", None)
+                    if _fh is None:
+                        _fh = _b._lmc_finsave2_fh = open(_fnd, "a", buffering=1)
+                    _fh.write(
+                        "FINSAVE2 req=%s kind=%s reason=NOCANSAVE save_spec=%s\n" % (
+                            request.req_id,
+                            "preempt" if request.is_preempt_save else "finished",
+                            "None" if save_spec is None else
+                            ("can_save=%s" % save_spec.can_save)))
+                except Exception:
+                    pass
             return True
         if self.kv_role == "kv_consumer":
             return True
@@ -3007,6 +3022,24 @@ class LMCacheConnectorV1Impl:
             // self._lmcache_chunk_size
             * self._lmcache_chunk_size
         )
+        _fnd = os.environ.get("LMCACHE_FINSAVE2_DEBUG")
+        if _fnd:
+            try:
+                import builtins as _b
+                _fh = getattr(_b, "_lmc_finsave2_fh", None)
+                if _fh is None:
+                    _fh = _b._lmc_finsave2_fh = open(_fnd, "a", buffering=1)
+                _reason = ("SKIPALL" if skip_leading_tokens >= len(token_ids)
+                           else "STORE")
+                _fh.write(
+                    "FINSAVE2 req=%s kind=%s can_save=%s skip_raw=%d "
+                    "skip_chunked=%d len_tok=%d reason=%s\n" % (
+                        request.req_id,
+                        "preempt" if request.is_preempt_save else "finished",
+                        save_spec.can_save, save_spec.skip_leading_tokens,
+                        skip_leading_tokens, len(token_ids), _reason))
+            except Exception:
+                pass
         if skip_leading_tokens >= len(token_ids):
             builtins._sa_finsave_skipall = getattr(
                 builtins, "_sa_finsave_skipall", 0) + 1
