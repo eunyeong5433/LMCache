@@ -4452,6 +4452,16 @@ class LMCacheConnectorV1Impl:
             len(request.all_token_ids),
             len(block_ids) * self._block_size,
         )
+        # Align DOWN to the LMCache chunk boundary.  An unaligned save
+        # advances tracker.num_saved_tokens past the last complete chunk,
+        # so the later turn-end save skips the [aligned, unaligned) piece
+        # and the containing chunk is never completed — the coverage
+        # ledger then caps at the previous chunk forever, and the next
+        # turn crashes with FETCH-UNRECOVERABLE once the GPU ghosts of
+        # that region are reallocated.  The dropped partial-chunk tail is
+        # recomputed on resume, which the preempt path already assumes.
+        chunk_size = max(1, int(self._lmcache_chunk_size or 256))
+        token_limit = (token_limit // chunk_size) * chunk_size
         if token_limit <= skip_leading_tokens:
             # The confirmed region is already fully CPU-backed.
             return token_limit
