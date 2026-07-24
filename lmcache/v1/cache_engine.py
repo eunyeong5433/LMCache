@@ -1043,6 +1043,9 @@ class LMCacheEngine:
             store_current_layer_only = bool(
                 kwargs.get("specagent_save_current_layer_only", False)
             )
+            defer_layerwise_commit = bool(
+                kwargs.get("specagent_defer_layerwise_store_commit", False)
+            )
             if not store_current_layer_only:
                 # The layerwise D2H generator yields immediately after
                 # starting a layer transfer. The following next() waits for
@@ -1051,21 +1054,9 @@ class LMCacheEngine:
                 next(mem_obj_generator)
 
             specagent_block_size = int(kwargs.get("specagent_block_size", 16))
-            for layer_id in range(self.num_layers):
-                with _lmc_record(
-                    "lmcache store_layer: d2h_wait "
-                    f"req={req_id} layer={layer_id} "
-                    f"chunks={len(keys[layer_id])}"
-                ):
-                    if store_current_layer_only:
-                        # SpecAgent calls this generator after each model layer.
-                        # Start and finish only the current layer here; do not
-                        # advance into the next layer before its KV has been
-                        # computed.
-                        next(mem_obj_generator)
-                        next(mem_obj_generator)
-                    else:
-                        next(mem_obj_generator)
+
+            def commit_layer(layer_id: int) -> None:
+                """Publish one fully copied CPU layer to the storage manager."""
                 with _lmc_record(
                     "lmcache store_layer: batched_put "
                     f"req={req_id} layer={layer_id} "
@@ -1111,17 +1102,43 @@ class LMCacheEngine:
                                 tokens, start, end, specagent_block_size
                             )
 
+            for layer_id in range(self.num_layers):
+                with _lmc_record(
+                    "lmcache store_layer: d2h_wait "
+                    f"req={req_id} layer={layer_id} "
+                    f"chunks={len(keys[layer_id])}"
+                ):
+                    if store_current_layer_only:
+                        # SpecAgent calls this generator after each model layer.
+                        # Start and finish only the current layer here; do not
+                        # advance into the next layer before its KV has been
+                        # computed.
+                        next(mem_obj_generator)
+                        next(mem_obj_generator)
+                    else:
+                        next(mem_obj_generator)
+                if not defer_layerwise_commit:
+                    commit_layer(layer_id)
+
                 yield
 
             if (
                 store_current_layer_only
-                and not os.environ.get("SPECAGENT_DISABLE_STORE_CLEANUP")
+                and (
+                    defer_layerwise_commit
+                    or not os.environ.get("SPECAGENT_DISABLE_STORE_CLEANUP")
+                )
             ):
                 # Finish the GPU connector generator so its temporary transfer
                 # buffer reaches ref_count_down(). In layerwise mode the
                 # per-layer loop above stops immediately after the last layer
                 # yield, leaving connector cleanup pending unless we drain it.
                 next(mem_obj_generator, None)
+            if defer_layerwise_commit:
+                # batched_from_gpu synchronized its store stream during the
+                # cleanup step above.  Only now expose CPU KV to retrievers.
+                for layer_id in range(self.num_layers):
+                    commit_layer(layer_id)
 
             tot_time = time.perf_counter() - t_start
             logger.info(
@@ -1364,21 +1381,22 @@ class LMCacheEngine:
                 request_configs=request_configs,
             ))
             while True:
-                with _lmc_record("lmcache token_lookup: next_key"):
-                    try:
-                        start, end, key = next(token_iter)
-                    except StopIteration:
-                        break
+                # Keep the aggregate token_lookup range above, but avoid three
+                # NVTX push/pop pairs per cache chunk.  At 140 chunks those
+                # profiling calls alone inflated a 4.4 ms lookup to 133 ms in
+                # Nsight and produced artificial 200 ms forward outliers.
+                try:
+                    start, end, key = next(token_iter)
+                except StopIteration:
+                    break
                 assert isinstance(key, CacheEngineKey)
 
-                with _lmc_record("lmcache token_lookup: split_layers"):
-                    keys_multi_layer = key.split_layers(self.num_layers)
+                keys_multi_layer = key.split_layers(self.num_layers)
 
-                with _lmc_record("lmcache token_lookup: batched_contains"):
-                    hit_layers, block_mapping = self.storage_manager.batched_contains(
-                        keys_multi_layer,
-                        self.retrieve_locations,
-                    )
+                hit_layers, block_mapping = self.storage_manager.batched_contains(
+                    keys_multi_layer,
+                    self.retrieve_locations,
+                )
                 if hit_layers == self.num_layers and len(block_mapping) == 1:
                     current_location = next(iter(block_mapping.keys()))
                     if location is None:

@@ -129,6 +129,23 @@ void lmcache_memcpy_async_batch(const std::vector<uintptr_t>& dests,
                                 const std::vector<size_t>& host_buffer_offsets,
                                 const std::vector<size_t>& host_buffer_alignments);
 
+// CUDA 12.8+ scatter/gather batch-copy API.  Unlike
+// lmcache_memcpy_async_batch, this is one runtime submission for the whole
+// independent pointer list instead of one cudaMemcpyAsync call per entry.
+void lmcache_memcpy_batch_async(const std::vector<uintptr_t>& dests,
+                                const std::vector<uintptr_t>& srcs,
+                                const std::vector<size_t>& nbytes,
+                                TransferDirection direction);
+
+// Submit all disjoint scratch scatters for one model layer from one Python
+// call.  The caller may batch H2D first and insert the scratch-slot WAR event
+// before invoking this function.
+void specagent_multi_scatter(
+    const std::vector<torch::Tensor>& transfer_tensors,
+    const std::vector<torch::Tensor>& target_kv_caches,
+    const std::vector<torch::Tensor>& slot_mappings,
+    const GPUKVFormat gpu_kv_format);
+
 // deprecated / unused except in unit tests
 void load_and_reshape_flash(torch::Tensor& key_value, torch::Tensor& key_cache,
                             torch::Tensor& value_cache,

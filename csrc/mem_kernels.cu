@@ -1117,3 +1117,63 @@ void lmcache_memcpy_async_batch(
                               host_buffer_alignments[i], stream);
   }
 }
+
+void lmcache_memcpy_batch_async(
+    const std::vector<uintptr_t>& dests, const std::vector<uintptr_t>& srcs,
+    const std::vector<size_t>& nbytes, TransferDirection direction) {
+  const size_t count = dests.size();
+  TORCH_CHECK(srcs.size() == count, "srcs size must match dests size");
+  TORCH_CHECK(nbytes.size() == count, "nbytes size must match dests size");
+  if (count == 0) {
+    return;
+  }
+#if CUDART_VERSION >= 12080
+  std::vector<void*> dst_ptrs(count);
+  std::vector<void*> src_ptrs(count);
+  std::vector<size_t> sizes(nbytes);
+  for (size_t i = 0; i < count; ++i) {
+    TORCH_CHECK(nbytes[i] > 0, "zero-sized copies are not supported");
+    dst_ptrs[i] = reinterpret_cast<void*>(dests[i]);
+    src_ptrs[i] = reinterpret_cast<void*>(srcs[i]);
+  }
+
+  cudaMemcpyAttributes attrs{};
+  attrs.srcAccessOrder =
+      direction == TransferDirection::H2D
+          ? cudaMemcpySrcAccessOrderAny
+          : cudaMemcpySrcAccessOrderStream;
+  attrs.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+  size_t attrs_idx = 0;
+  size_t fail_idx = SIZE_MAX;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  CHECK_CUDA_CALL(cudaMemcpyBatchAsync(
+      dst_ptrs.data(), src_ptrs.data(), sizes.data(), count, &attrs,
+      &attrs_idx, 1, &fail_idx, stream));
+#else
+  TORCH_CHECK(false,
+              "lmcache_memcpy_batch_async requires CUDA runtime 12.8+");
+#endif
+}
+
+void specagent_multi_scatter(
+    const std::vector<torch::Tensor>& transfer_tensors,
+    const std::vector<torch::Tensor>& target_kv_caches,
+    const std::vector<torch::Tensor>& slot_mappings,
+    const GPUKVFormat gpu_kv_format) {
+  const size_t count = transfer_tensors.size();
+  TORCH_CHECK(target_kv_caches.size() == count,
+              "target_kv_caches size must match transfer_tensors");
+  TORCH_CHECK(slot_mappings.size() == count,
+              "slot_mappings size must match transfer_tensors");
+  for (size_t i = 0; i < count; ++i) {
+    // single_layer_kv_transfer only launches work on the current CUDA stream.
+    // Tensor handles are copied so its legacy non-const reference signature
+    // does not weaken this batched interface.
+    torch::Tensor transfer = transfer_tensors[i];
+    torch::Tensor target = target_kv_caches[i];
+    torch::Tensor mapping = slot_mappings[i];
+    single_layer_kv_transfer(
+        transfer, target, mapping, TransferDirection::H2D, gpu_kv_format,
+        true);
+  }
+}

@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorWorkerMetadata,
 )
 from vllm.distributed.parallel_state import (
     get_pp_group,
@@ -62,6 +63,26 @@ if TYPE_CHECKING:
     from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 
 logger = init_logger(__name__)
+
+
+def _specagent_record_cuda_event(
+    stream: torch.cuda.Stream,
+) -> torch.cuda.Event:
+    """Create/record events under one process-wide cross-thread lock.
+
+    PyTorch event recording from the model and LMCache producer threads at
+    exactly the same time has been observed to deadlock after both enter
+    cudaStreamIsCapturing.  The CUDA work remains asynchronous; only the tiny
+    host-side event-record calls are serialized.
+    """
+    lock = getattr(builtins, "_specagent_cuda_event_record_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        builtins._specagent_cuda_event_record_lock = lock
+    with lock:
+        event = torch.cuda.Event()
+        event.record(stream)
+    return event
 
 
 def _specagent_env_true(env_name: str) -> bool:
@@ -420,6 +441,9 @@ class ReqMeta:
     # request is still alive; the scheduler frees its blocks itself once the
     # store has landed).
     is_preempt_save: bool = False
+    # Identity of this particular mid-turn save. The same live request may be
+    # SPEC-preempted more than once.
+    specagent_preempt_save_id: int = 0
 
     @staticmethod
     def from_request_tracker(
@@ -664,6 +688,36 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
         self.requests.append(req_meta)
 
 
+@dataclass
+class LMCacheSpecAgentWorkerMetadata(KVConnectorWorkerMetadata):
+    """Worker-to-scheduler acknowledgements for exact mid-turn saves."""
+
+    # save key -> (minimum proven prefix tokens, reporting worker count)
+    completed_preempt_saves: dict[
+        tuple[str, int], tuple[int, int]
+    ] = field(
+        default_factory=dict
+    )
+
+    def aggregate(
+        self, other: "KVConnectorWorkerMetadata"
+    ) -> "LMCacheSpecAgentWorkerMetadata":
+        if not isinstance(other, LMCacheSpecAgentWorkerMetadata):
+            return self
+        for save_key, (proven, count) in (
+            other.completed_preempt_saves.items()
+        ):
+            previous = self.completed_preempt_saves.get(save_key)
+            if previous is None:
+                self.completed_preempt_saves[save_key] = (proven, count)
+            else:
+                self.completed_preempt_saves[save_key] = (
+                    min(previous[0], proven),
+                    previous[1] + count,
+                )
+        return self
+
+
 class LMCacheConnectorV1Impl:
     def __init__(
         self,
@@ -745,6 +799,7 @@ class LMCacheConnectorV1Impl:
         )
         self._specagent_prefetch_future: Future | None = None
         self._specagent_prefetch_target = -1
+        self._specagent_prefetch_scan_layer = 0
         self._specagent_prefetch_executor: ThreadPoolExecutor | None = (
             None if role == KVConnectorRole.SCHEDULER
             else ThreadPoolExecutor(
@@ -774,10 +829,22 @@ class LMCacheConnectorV1Impl:
             # the connector metadata (like finished saves) and stored on the
             # worker WITHOUT a finished_sending report.
             self._specagent_preempt_save_metas: dict[str, ReqMeta] = {}
+            self._specagent_preempt_save_acks: dict[
+                tuple[str, int], int
+            ] = {}
+            # A worker-proven, CPU-pinned prefix committed immediately before
+            # a running SPEC request is preempted.  The scheduler lookup
+            # service can still hold the answer from before that synchronous
+            # store; use this exact coverage until the restore allocation
+            # consumes it.
+            self._specagent_preempt_forced_lookup: dict[str, int] = {}
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
             self._specagent_finished_save_completed: set[str] = set()
+            self._specagent_preempt_save_completed: dict[
+                tuple[str, int], tuple[int, int]
+            ] = {}
 
             if self.enable_blending:
                 assert self.lmcache_engine is not None
@@ -1028,12 +1095,22 @@ class LMCacheConnectorV1Impl:
         sa_extra = forward_context.additional_kwargs or {}
         sa_dest_kvcaches = sa_extra.get("destination_kvcaches")
         sa_dest_slot_mapping = sa_extra.get("destination_slot_mapping") or {}
+        sa_scratch_reuse_event = sa_extra.get(
+            "specagent_scratch_reuse_event"
+        )
         sa_fetch_reqs = sa_extra.get("specagent_fetch_reqs") or {}
         sa_fetch_token_ranges = sa_extra.get("specagent_fetch_token_ranges") or {}
         sa_cascade_maps = sa_extra.get("specagent_cascade_maps") or {}
         sa_fetch_buf_blocks = sa_extra.get("specagent_fetch_buf_blocks")
         sa_fetch_paged_blocks = sa_extra.get("specagent_fetch_paged_blocks")
-        self._specagent_async_save_this_step = bool(sa_fetch_reqs)
+        # Layerwise stores use deferred commit: each layer only enqueues D2H
+        # work on the store stream, and the single synchronization/publication
+        # happens in wait_for_save.  Running those cheap enqueue steps through
+        # a Python executor makes the model and save threads contend once per
+        # layer, stretching both compute and fetch spans for short forwards.
+        # Keep submission on the model thread; the GPU transfer itself remains
+        # asynchronous and overlaps through the dedicated store stream.
+        self._specagent_async_save_this_step = False
         sa_cpu_prefetch_ahead_layers = max(
             0,
             int(sa_extra.get("specagent_cpu_prefetch_ahead_layers", 0) or 0),
@@ -1052,6 +1129,14 @@ class LMCacheConnectorV1Impl:
             return
 
         assert self.lmcache_engine is not None
+        if sa_scratch_reuse_event is not None:
+            load_stream = getattr(
+                getattr(self.lmcache_engine, "gpu_connector", None),
+                "load_stream",
+                None,
+            )
+            if load_stream is not None:
+                load_stream.wait_event(sa_scratch_reuse_event)
 
         self.layerwise_retrievers = []
         self._specagent_layerwise_meta = []
@@ -1059,6 +1144,7 @@ class LMCacheConnectorV1Impl:
         self._specagent_prefetch_lead = sa_lead
         self._specagent_layer_group_size = sa_lead
         self._specagent_waited_layer_groups.clear()
+        self._specagent_prefetch_scan_layer = 0
         self._specagent_layerwise_check_period = max(1, 2 * sa_lead)
         sa_verbose = (
             _specagent_env_true("SPECAGENT_VERBOSE")
@@ -1319,6 +1405,25 @@ class LMCacheConnectorV1Impl:
                         # relaxed with per-segment events/double buffering.
                         sync = True
                         layer_events: list[Any] = [None] * self.num_layers
+                        defer_layer_submit = bool(
+                            use_specagent_buf
+                            and not use_paged_restore_target
+                            and not os.environ.get(
+                                "SPECAGENT_DISABLE_FUSED_LAYER_SUBMIT"
+                            )
+                        )
+                        if os.environ.get("SPECAGENT_FUSED_TRANSFER_DEBUG"):
+                            logger.warning(
+                                "[SpecAgent][FUSED-ADMISSION] req=%s "
+                                "reason=%s scratch=%s paged_restore=%s "
+                                "defer=%s segments=%s",
+                                request.req_id,
+                                specagent_fetch_reason,
+                                use_specagent_buf,
+                                use_paged_restore_target,
+                                defer_layer_submit,
+                                effective_chunk_segments,
+                            )
                         with record_function_or_nullcontext(
                             "lmcache adapter: specagent retrieve_layer "
                             f"req={request.req_id} seg={seg_start}-{seg_end} "
@@ -1334,6 +1439,7 @@ class LMCacheConnectorV1Impl:
                                 sync=sync,
                                 req_id=request.req_id,
                                 specagent_layer_events=layer_events,
+                                specagent_defer_layer_submit=defer_layer_submit,
                                 specagent_write_token_mask=(
                                     specagent_write_token_mask
                                 ),
@@ -1356,6 +1462,7 @@ class LMCacheConnectorV1Impl:
                             "is_specagent": True,
                             "fetch_reason": specagent_fetch_reason,
                             "is_paged_restore": use_paged_restore_target,
+                            "defer_layer_submit": defer_layer_submit,
                             "expected_tokens": num_expected_tokens,
                             "expected_fetch_tokens": num_expected_tokens,
                             "layer_events": layer_events,
@@ -1479,7 +1586,30 @@ class LMCacheConnectorV1Impl:
                     )
                     self._invalid_block_ids.update(missing_blocks)
 
-        if self._specagent_all_fetches_paged_restore():
+        profile_cascade_only = bool(
+            self._specagent_has_layerwise_fetch()
+            and _specagent_env_true("SPECAGENT_PROFILE_CASCADE_ONLY")
+        )
+        if profile_cascade_only:
+            # Performance-only ablation: preserve the exact scratch-cascade
+            # attention path while removing its layer producer and all transfer
+            # dependencies.  Scratch contents are intentionally unspecified;
+            # outputs from a run with this knob must never be used for
+            # correctness or acceptance measurements.
+            ready = _specagent_record_cuda_event(
+                torch.cuda.current_stream(self.device)
+            )
+            for meta in self._specagent_layerwise_meta:
+                events = (
+                    meta.get("layer_events")
+                    if isinstance(meta, dict)
+                    else None
+                )
+                if isinstance(events, list):
+                    events[:] = [ready] * len(events)
+            self.layerwise_retrievers = []
+            self._specagent_prefetch_scan_layer = self.num_layers
+        elif self._specagent_all_fetches_paged_restore():
             self._specagent_request_async_prefetch(self.num_layers - 1)
         elif self._specagent_has_layerwise_fetch():
             group_size = max(
@@ -1648,7 +1778,6 @@ class LMCacheConnectorV1Impl:
             f"expected_wait_mib={expected_wait_mib:.1f}"
         ):
             if specagent_fetch:
-                self.prefetch_next_layer_load(layer_name)
                 self._specagent_wait_for_async_prefetch(group_end_layer)
             else:
                 while (
@@ -1787,7 +1916,11 @@ class LMCacheConnectorV1Impl:
                 return False
         return True
 
-    def _specagent_advance_retrievers_until(self, target_layer: int) -> None:
+    def _specagent_advance_retrievers_until(
+        self,
+        target_layer: int,
+        stream_wait_event: object | None = None,
+    ) -> None:
         if target_layer < 0:
             return
         target_layer = min(int(target_layer), self.num_layers - 1)
@@ -1827,13 +1960,25 @@ class LMCacheConnectorV1Impl:
                     f"fetched={fetched} expected={expected}"
                 )
 
+        gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
+        flush_deferred = getattr(
+            gpu_connector, "specagent_flush_deferred_layer", None
+        )
+        has_deferred = getattr(
+            gpu_connector, "specagent_has_deferred_layer", None
+        )
+
         # Advance layer-major across retrievers.  With multiple SpecAgent
         # segments, draining retriever 0 through layer 63 before touching
         # retriever 1 can make layer 0 attention wait behind unrelated later
         # layers.  Interleaving by layer keeps the event needed by the consumer
         # near the front of the producer queue while preserving each retriever's
         # internal layer order.
-        for layer_id in range(target_layer + 1):
+        scan_layer = min(
+            max(0, int(self._specagent_prefetch_scan_layer)),
+            target_layer + 1,
+        )
+        for layer_id in range(scan_layer, target_layer + 1):
             for idx, layerwise_retriever in enumerate(self.layerwise_retrievers):
                 meta = (
                     self._specagent_layerwise_meta[idx]
@@ -1843,11 +1988,20 @@ class LMCacheConnectorV1Impl:
                 events = (
                     meta.get("layer_events") if isinstance(meta, dict) else None
                 )
+                is_deferred = bool(
+                    isinstance(meta, dict)
+                    and meta.get("defer_layer_submit")
+                    and callable(has_deferred)
+                )
                 guard = 0
                 while (
                     isinstance(events, list)
                     and layer_id < len(events)
-                    and events[layer_id] is None
+                    and (
+                        not has_deferred(layer_id, events)
+                        if is_deferred
+                        else events[layer_id] is None
+                    )
                     and guard < self.num_layers + 4
                 ):
                     try:
@@ -1862,6 +2016,21 @@ class LMCacheConnectorV1Impl:
                     with self._specagent_prefetch_cond:
                         self._specagent_prefetch_cond.notify_all()
                     validate_result(meta, ret_token_mask)
+            if callable(flush_deferred):
+                did_flush = flush_deferred(
+                    layer_id,
+                    scratch_free_event=stream_wait_event,
+                )
+                if did_flush:
+                    # One wait in the load stream orders this and every later
+                    # fused scatter in the same advance call.
+                    stream_wait_event = None
+            if not self._specagent_events_ready(layer_id):
+                # Do not skip an incomplete layer.  This is only expected for
+                # a non-deferred compatibility retriever that yielded without
+                # publishing its event.
+                break
+            self._specagent_prefetch_scan_layer = layer_id + 1
         with self._specagent_prefetch_cond:
             self._specagent_prefetch_cond.notify_all()
 
@@ -1967,7 +2136,11 @@ class LMCacheConnectorV1Impl:
                 f"target={target_layer}"
             ):
                 previous.result()
-        if stream_wait_event is not None:
+        all_deferred = bool(self._specagent_layerwise_meta) and all(
+            isinstance(meta, dict) and meta.get("defer_layer_submit")
+            for meta in self._specagent_layerwise_meta
+        )
+        if stream_wait_event is not None and not all_deferred:
             load_stream = getattr(
                 getattr(self.lmcache_engine, "gpu_connector", None),
                 "load_stream",
@@ -1987,7 +2160,12 @@ class LMCacheConnectorV1Impl:
             "lmcache prefetch worker: advance "
             f"target={target_layer}"
         ):
-            self._specagent_advance_retrievers_until(target_layer)
+            self._specagent_advance_retrievers_until(
+                target_layer,
+                stream_wait_event=(
+                    stream_wait_event if all_deferred else None
+                ),
+            )
 
     def _specagent_request_async_prefetch(
         self,
@@ -1996,9 +2174,30 @@ class LMCacheConnectorV1Impl:
     ) -> Future | None:
         if target_layer < 0:
             return None
+        all_deferred = bool(self._specagent_layerwise_meta) and all(
+            isinstance(meta, dict) and meta.get("defer_layer_submit")
+            for meta in self._specagent_layerwise_meta
+        )
+        if all_deferred:
+            # torch.cuda.Event.record() from this background executor can
+            # intermittently stop forever immediately after
+            # cudaStreamIsCapturing when CUDA graphs are enabled.  The producer
+            # work here only prepares descriptors and enqueues H2D/scatter on
+            # load_stream; running that host enqueue on the model thread does
+            # not serialize the GPU streams.  It also removes executor/GIL
+            # submission gaps from the layer pipeline.
+            with record_function_or_nullcontext(
+                "lmcache prefetch request: inline_deferred_advance "
+                f"target={target_layer}"
+            ):
+                self._specagent_advance_retrievers_until(
+                    target_layer,
+                    stream_wait_event=stream_wait_event,
+                )
+            return None
         executor = self._specagent_prefetch_executor
         if executor is None:
-            if stream_wait_event is not None:
+            if stream_wait_event is not None and not all_deferred:
                 load_stream = getattr(
                     getattr(self.lmcache_engine, "gpu_connector", None),
                     "load_stream",
@@ -2018,7 +2217,12 @@ class LMCacheConnectorV1Impl:
                 "lmcache prefetch request: inline_advance "
                 f"target={target_layer}"
             ):
-                self._specagent_advance_retrievers_until(target_layer)
+                self._specagent_advance_retrievers_until(
+                    target_layer,
+                    stream_wait_event=(
+                        stream_wait_event if all_deferred else None
+                    ),
+                )
             return None
         with record_function_or_nullcontext(
             "lmcache prefetch request: lock "
@@ -2097,7 +2301,23 @@ class LMCacheConnectorV1Impl:
         if self._specagent_events_ready(target_layer):
             self._specagent_clear_done_prefetch_future()
             return
-        future = self._specagent_request_async_prefetch(target_layer)
+        group_size = max(
+            1,
+            min(
+                int(getattr(self, "_specagent_layer_group_size", 1) or 1),
+                self.num_layers,
+            ),
+        )
+        initial_ring_end = min(2 * group_size - 1, self.num_layers - 1)
+        reuse_event = None
+        if target_layer > initial_ring_end:
+            reuse_event = _specagent_record_cuda_event(
+                torch.cuda.current_stream(self.device)
+            )
+        future = self._specagent_request_async_prefetch(
+            target_layer,
+            stream_wait_event=reuse_event,
+        )
         if future is None:
             return
         while not self._specagent_events_ready(target_layer):
@@ -2153,7 +2373,18 @@ class LMCacheConnectorV1Impl:
         )
         target_layer = next_group_end_layer
         stream_wait_event = None
-        if attention_done_event is not None and requested_layer >= group_end_layer:
+        if attention_done_event is None:
+            # Only the two initially free parity slots may be populated
+            # without a scratch-read completion dependency.
+            target_layer = min(
+                target_layer,
+                2 * group_size - 1,
+                self.num_layers - 1,
+            )
+        elif requested_layer >= group_end_layer:
+            # For group G, the expression below ends at G+2 when group_size=1:
+            # (G + 3) * 1 - 1.  That is exactly the parity slot released by
+            # attention G; do not reduce this to ``G + 2 - 1``.
             reuse_group_end_layer = min(
                 (group_id + 3) * group_size - 1,
                 self.num_layers - 1,
@@ -2292,8 +2523,9 @@ class LMCacheConnectorV1Impl:
                             dst_blocks,
                         )
                         if isinstance(events, list):
-                            copied_event = torch.cuda.Event()
-                            copied_event.record(current_stream)
+                            copied_event = _specagent_record_cuda_event(
+                                current_stream
+                            )
                             events[layer_idx] = copied_event
                         if os.environ.get("SPECAGENT_FETCH_DEBUG") and (
                             layer_idx == 0
@@ -2373,8 +2605,9 @@ class LMCacheConnectorV1Impl:
                             )
                             events = meta.get("layer_events")
                             if isinstance(events, list):
-                                copied_event = torch.cuda.Event()
-                                copied_event.record(torch.cuda.current_stream())
+                                copied_event = _specagent_record_cuda_event(
+                                    torch.cuda.current_stream()
+                                )
                                 events[layer_idx] = copied_event
                             if os.environ.get("SPECAGENT_FETCH_DEBUG"):
                                 logger.info(
@@ -2487,6 +2720,31 @@ class LMCacheConnectorV1Impl:
                         save_spec.can_save if save_spec is not None else None,
                         len(request.token_ids),
                     )
+                continue
+
+            # The generator created on layer 0 owns the immutable token,
+            # slot-mapping and store-mask state for the whole layerwise save.
+            # Rebuilding those tensors (including slot_mapping.to(cuda)) on
+            # every subsequent model layer used to add roughly 1--2 ms of
+            # model-thread work per layer.  Once the generator exists, only
+            # advance it.
+            layerwise_storer = self._layerwise_save_storers.get(request.req_id)
+            if layerwise_storer is not None:
+                if self._specagent_async_save_this_step:
+                    self._specagent_submit_save_step(
+                        request.req_id,
+                        layer_name,
+                        layerwise_storer,
+                    )
+                else:
+                    try:
+                        next(layerwise_storer)
+                    except StopIteration:
+                        self._layerwise_save_storers.pop(request.req_id, None)
+                        if request.is_finished_save:
+                            self._specagent_finished_save_completed.add(
+                                request.req_id
+                            )
                 continue
 
             token_ids = request.token_ids
@@ -2731,6 +2989,11 @@ class LMCacheConnectorV1Impl:
                     req_id=request.req_id,
                     specagent_block_size=self._block_size,
                     specagent_save_current_layer_only=True,
+                    # Enqueue each layer's D2H behind its producer and publish
+                    # CPU cache entries only after one final stream completion.
+                    # This removes 46 host synchronizations while preserving
+                    # the rule that readers never see partially copied KV.
+                    specagent_defer_layerwise_store_commit=True,
                 )
                 self._layerwise_save_storers[request.req_id] = layerwise_storer
                 if is_first:
@@ -3002,9 +3265,9 @@ class LMCacheConnectorV1Impl:
                             ("can_save=%s" % save_spec.can_save)))
                 except Exception:
                     pass
-            return True
+            return not request.is_preempt_save
         if self.kv_role == "kv_consumer":
-            return True
+            return not request.is_preempt_save
         assert self.lmcache_engine is not None
         assert len(self.kv_caches) > 0
 
@@ -3014,7 +3277,7 @@ class LMCacheConnectorV1Impl:
         assert isinstance(slot_mapping, torch.Tensor)
         assert len(slot_mapping) == len(token_ids)
         if not token_ids:
-            return True
+            return not request.is_preempt_save
 
         slot_mapping = slot_mapping.to(self.device)
         skip_leading_tokens = (
@@ -3043,6 +3306,9 @@ class LMCacheConnectorV1Impl:
         if skip_leading_tokens >= len(token_ids):
             builtins._sa_finsave_skipall = getattr(
                 builtins, "_sa_finsave_skipall", 0) + 1
+            # A preempt save may intentionally be probe-only when the tracker
+            # says the whole prefix was saved earlier. The post-call lookup is
+            # what validates whether that old prefix still exists.
             return True
 
         builtins._sa_finsave_store = getattr(
@@ -3097,10 +3363,117 @@ class LMCacheConnectorV1Impl:
                 # is processed exactly once here -- no persistent dedup (which
                 # would wrongly block a later re-preempt of the same req_id).
                 elif request.is_preempt_save:
-                    self._specagent_save_finished_meta_without_forward(request)
+                    save_completed = (
+                        self._specagent_save_finished_meta_without_forward(
+                            request
+                        )
+                    )
+                    if save_completed:
+                        save_key = (
+                            request.req_id,
+                            int(request.specagent_preempt_save_id),
+                        )
+                        # Store completion alone is not enough: the scheduler's
+                        # saved-token tracker may outlive LMCache CPU eviction.
+                        # Probe the exact token prefix after publication and
+                        # report only the prefix that is recoverable now.
+                        assert self.lmcache_engine is not None
+                        try:
+                            proven_tokens = int(
+                                self.lmcache_engine.lookup(
+                                    tokens=request.token_ids,
+                                    search_range=["LocalCPUBackend"],
+                                    lookup_id=request.req_id,
+                                    pin=True,
+                                    request_configs=request.request_configs,
+                                )
+                                or 0
+                            )
+                        except Exception:
+                            logger.exception(
+                                "[SpecAgent][PREEMPT-SAVE-ACK] coverage "
+                                "probe failed req=%s save_id=%d",
+                                save_key[0], save_key[1],
+                            )
+                            continue
+                        if proven_tokens < len(request.token_ids):
+                            # Do not retain a partial pin when the scheduler
+                            # cannot safely evict this request. A full pin stays
+                            # live until the normal restore/load path calls
+                            # lookup_unpin(req_id).
+                            self.lmcache_engine.lookup_unpin(request.req_id)
+                        self._specagent_preempt_save_completed[save_key] = (
+                            proven_tokens,
+                            1,
+                        )
+                        log_ack = (
+                            logger.warning
+                            if _specagent_env_true("SPECAGENT_SAVE_DEBUG")
+                            else logger.info
+                        )
+                        log_ack(
+                            "[SpecAgent][PREEMPT-SAVE-ACK] req=%s save_id=%d "
+                            "proven_tokens=%d requested_tokens=%d",
+                            save_key[0], save_key[1], proven_tokens,
+                            len(request.token_ids),
+                        )
         finished_sending = set(self._specagent_finished_save_completed)
         self._specagent_finished_save_completed.clear()
         return finished_sending or None, None
+
+    def build_connector_worker_meta(
+        self,
+    ) -> LMCacheSpecAgentWorkerMetadata | None:
+        """Return exact save ACKs over the normal worker IPC channel."""
+        if not self._specagent_preempt_save_completed:
+            return None
+        meta = LMCacheSpecAgentWorkerMetadata(
+            completed_preempt_saves=self._specagent_preempt_save_completed
+        )
+        self._specagent_preempt_save_completed = {}
+        return meta
+
+    def specagent_update_worker_meta(
+        self, meta: object
+    ) -> None:
+        """Consume aggregated worker ACKs on the scheduler side."""
+        if not isinstance(meta, LMCacheSpecAgentWorkerMetadata):
+            return
+        for save_key, (proven, count) in (
+            meta.completed_preempt_saves.items()
+        ):
+            if count >= self.worker_count:
+                self._specagent_preempt_save_acks[save_key] = proven
+
+    def specagent_consume_preempt_save_ack(
+        self, req_id: str, save_id: int
+    ) -> int | None:
+        save_key = (req_id, int(save_id))
+        return self._specagent_preempt_save_acks.pop(save_key, None)
+
+    def specagent_commit_preempt_save(
+        self, req_id: str, proven_tokens: int
+    ) -> None:
+        """Commit worker-proven coverage for the ensuing NORMAL restore."""
+        self._specagent_preempt_forced_lookup[req_id] = int(proven_tokens)
+        logger.info(
+            "[SpecAgent][SPEC-FIRST-PREEMPT] committed authoritative "
+            "lookup req=%s proven_tokens=%d",
+            req_id, int(proven_tokens),
+        )
+        # Discard a lookup result issued before this synchronous store.  Some
+        # lookup-server implementations can still return that stale answer,
+        # so get_num_new_matched_tokens also uses the committed coverage
+        # directly until update_state_after_alloc consumes it.
+        cancel_lookup = getattr(self.lookup_client, "cancel_lookup", None)
+        if callable(cancel_lookup):
+            cancel_lookup(req_id)
+        else:
+            clear_lookup = getattr(
+                self.lookup_client, "clear_lookup_status", None
+            )
+            if callable(clear_lookup):
+                clear_lookup(req_id)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         invalid_blocks = self._invalid_block_ids.copy()
@@ -3163,7 +3536,18 @@ class LMCacheConnectorV1Impl:
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
 
-        if (
+        forced_lookup = self._specagent_preempt_forced_lookup.get(req_id)
+        if forced_lookup is not None:
+            num_external_hit_tokens = min(
+                int(forced_lookup), len(request.all_token_ids)
+            )
+            lookup_cached = True
+            logger.info(
+                "[SpecAgent][SPEC-FIRST-PREEMPT] authoritative lookup "
+                "req=%s hit_tokens=%d",
+                req_id, num_external_hit_tokens,
+            )
+        elif (
             num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
         ) != -1:
             # -1 means no result cached
@@ -3319,6 +3703,21 @@ class LMCacheConnectorV1Impl:
         # successfully scheduled.
         assert self.lookup_client is not None
         self.lookup_client.clear_lookup_status(request.request_id)
+        # Consume the override only when this allocation actually admitted an
+        # external restore. update_state_after_alloc can also be called for a
+        # zero-external allocation before a preempted request reaches its
+        # restore admission; dropping it there re-exposes the stale async
+        # lookup answer.
+        if num_external_tokens > 0:
+            forced = self._specagent_preempt_forced_lookup.pop(
+                request.request_id, None
+            )
+            if forced is not None:
+                logger.info(
+                    "[SpecAgent][SPEC-FIRST-PREEMPT] consumed authoritative "
+                    "lookup req=%s proven_tokens=%d external_tokens=%d",
+                    request.request_id, forced, num_external_tokens,
+                )
 
         kv_transfer_params = (
             request.kv_transfer_params
@@ -4375,8 +4774,21 @@ class LMCacheConnectorV1Impl:
                 int(tracker.num_saved_tokens)
                 if tracker is not None else 0
             )
+            # The final sampled output token has not been used as a model
+            # input yet, so its paged slot does not contain valid KV even when
+            # async scheduler accounting reports num_computed == num_tokens.
+            # Publishing it advances the saved-token tracker over a zero row;
+            # a later sparse/paged restore then faithfully restores corrupted
+            # KV. The next turn will compute this token and a later save can
+            # safely include it.
+            valid_kv_token_limit = max(
+                0,
+                len(request.all_token_ids)
+                - (1 if request.output_token_ids else 0),
+            )
             token_limit = min(
                 int(getattr(request, "num_computed_tokens", 0) or 0),
+                valid_kv_token_limit,
                 len(request.all_token_ids),
                 len(block_ids) * self._block_size,
             )
@@ -4426,6 +4838,7 @@ class LMCacheConnectorV1Impl:
         request: "Request",
         block_ids: list[int],
         save_upto_tokens: int,
+        save_id: int,
     ) -> int:
         """Register a mid-turn CPU save of ``request``'s confirmed KV region.
 
@@ -4435,9 +4848,9 @@ class LMCacheConnectorV1Impl:
         (2) marks the meta ``is_preempt_save`` so the worker stores it WITHOUT
         reporting the request as finished_sending (the request is still alive).
 
-        Returns the token boundary that will be CPU-backed after the store lands
-        (== the ``token_limit`` actually registered), or 0 if nothing new needs
-        saving (already saved, or no room).
+        Returns the token boundary requested from this save/probe. The worker
+        ACK separately reports the prefix LMCache can actually resolve after
+        the store lands. Returns 0 if no complete chunk can be covered.
         """
         if self.kv_role == "kv_consumer":
             return 0
@@ -4447,8 +4860,14 @@ class LMCacheConnectorV1Impl:
         skip_leading_tokens = (
             int(tracker.num_saved_tokens) if tracker is not None else 0
         )
+        valid_kv_token_limit = max(
+            0,
+            len(request.all_token_ids)
+            - (1 if request.output_token_ids else 0),
+        )
         token_limit = min(
             int(save_upto_tokens),
+            valid_kv_token_limit,
             len(request.all_token_ids),
             len(block_ids) * self._block_size,
         )
@@ -4462,9 +4881,12 @@ class LMCacheConnectorV1Impl:
         # recomputed on resume, which the preempt path already assumes.
         chunk_size = max(1, int(self._lmcache_chunk_size or 256))
         token_limit = (token_limit // chunk_size) * chunk_size
+        if token_limit <= 0:
+            return 0
         if token_limit <= skip_leading_tokens:
-            # The confirmed region is already fully CPU-backed.
-            return token_limit
+            # Emit a zero-copy coverage probe. A stale tracker is not proof:
+            # the worker ACK reports the prefix LMCache can actually find.
+            skip_leading_tokens = token_limit
         block_ids_tensor = torch.tensor(block_ids, dtype=torch.long)
         block_offsets = torch.arange(0, self._block_size, dtype=torch.long)
         slot_mapping = (
@@ -4484,12 +4906,9 @@ class LMCacheConnectorV1Impl:
             ),
             is_finished_save=False,
             is_preempt_save=True,
+            specagent_preempt_save_id=int(save_id),
         )
         self._specagent_preempt_save_metas[request.request_id] = req_meta
-        if tracker is not None:
-            # Advance the tracker's saved boundary so a later turn-end save does
-            # not redundantly re-store this region.
-            tracker.num_saved_tokens = token_limit
         if _specagent_env_true("SPECAGENT_SAVE_DEBUG"):
             logger.warning(
                 "[SpecAgent][PREEMPT-SAVE] register req=%s tokens=%d skip=%d "

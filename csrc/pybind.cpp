@@ -54,6 +54,8 @@ PYBIND11_MODULE(c_ops, m) {
   // lets the model thread steal it before the load worker can enqueue the
   // following KV-transfer kernel, which creates millisecond-scale stream gaps.
   m.def("lmcache_memcpy_async_batch", &lmcache_memcpy_async_batch);
+  m.def("lmcache_memcpy_batch_async", &lmcache_memcpy_batch_async);
+  m.def("specagent_multi_scatter", &specagent_multi_scatter);
   m.def("encode_fast_new", &encode_cuda_new);
   m.def("decode_fast_new", &decode_cuda_new);
   m.def("decode_fast_prefsum", &decode_cuda_prefsum);

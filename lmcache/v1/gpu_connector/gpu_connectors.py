@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple, Union
 import abc
 import builtins
 import os
+import threading
 from contextlib import nullcontext
 
 # Third Party
@@ -24,6 +25,7 @@ from lmcache.v1.gpu_connector.utils import (
     get_num_blocks,
     get_page_buffer_size,
     get_tokens_per_layer,
+    is_hnd,
     permute_kv_caches_to_contiguous,
 )
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
@@ -35,6 +37,21 @@ if torch.cuda.is_available():
     import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+
+def _specagent_record_cuda_event(
+    stream: torch.cuda.Stream,
+    *,
+    enable_timing: bool = False,
+) -> torch.cuda.Event:
+    lock = getattr(builtins, "_specagent_cuda_event_record_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        builtins._specagent_cuda_event_record_lock = lock
+    with lock:
+        event = torch.cuda.Event(enable_timing=enable_timing)
+        event.record(stream)
+    return event
 
 
 def _next_power_of_2(value: int) -> int:
@@ -75,6 +92,24 @@ def _raw_h2d_copy_batch_async(
 ) -> None:
     if not dsts:
         return
+    # CUDA 12.8 can submit independent scatter/gather copies as one batch.
+    # Keep the older per-range implementation as an explicit compatibility
+    # fallback.  Deferred plans retain their pinned sources and temporary GPU
+    # allocation until the recorded ready event completes, so neither side of
+    # the asynchronous batch can be recycled while CUDA still consumes it.
+    native_batch_copy = getattr(lmc_ops, "lmcache_memcpy_batch_async", None)
+    if (
+        native_batch_copy is not None
+        and not os.environ.get("SPECAGENT_DISABLE_CUDA_MEMCPY_BATCH")
+    ):
+        native_batch_copy(
+            [int(dst.data_ptr()) for dst in dsts],
+            [int(src.data_ptr()) for src in srcs],
+            [int(src.numel() * src.element_size()) for src in srcs],
+            lmc_ops.TransferDirection.H2D,
+        )
+        return
+
     batch_copy = getattr(lmc_ops, "lmcache_memcpy_async_batch", None)
     if batch_copy is None:
         for dst, src in zip(dsts, srcs, strict=False):
@@ -1195,8 +1230,289 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         self._specagent_pending_store_buffer_frees: list[
             tuple[torch.cuda.Event, MemoryObj]
         ] = []
+        # Plans from all SpecAgent scratch retrievers are collected per layer
+        # and submitted together by the adapter.  CPU memory and the existing
+        # per-retriever temporary GPU buffers remain owned by their generators;
+        # this queue adds descriptors only.
+        self._specagent_deferred_layer_fetches: dict[int, list[dict]] = {}
+        # A deferred submission is genuinely asynchronous.  Keep every tensor
+        # descriptor (in particular pinned CPU source views and slot mappings)
+        # alive until the load-stream event says that both H2D and scatter are
+        # finished.  The retriever generator may otherwise advance/finish and
+        # drop the last Python reference while CUDA still consumes the memory.
+        self._specagent_pending_deferred_plans: list[
+            tuple[torch.cuda.Event, list[dict]]
+        ] = []
+        self._specagent_fused_debug_checked_layers: set[int] = set()
 
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
+
+    def specagent_has_deferred_layer(
+        self,
+        layer_id: int,
+        layer_events: object,
+    ) -> bool:
+        """Whether this retriever has queued its plan for ``layer_id``.
+
+        Deferred plans intentionally do not publish their CUDA ready event
+        until all retrievers for the layer are flushed together.  The adapter
+        therefore cannot use ``events[layer_id] is None`` as its generator
+        advancement condition: doing so drains later layers into the queue
+        and reuses the retriever's temporary double-buffer slot too early.
+        """
+        return any(
+            plan.get("layer_events") is layer_events
+            for plan in self._specagent_deferred_layer_fetches.get(
+                int(layer_id), ()
+            )
+        )
+
+    def specagent_flush_deferred_layer(
+        self,
+        layer_id: int,
+        scratch_free_event: object | None = None,
+    ) -> bool:
+        still_pending: list[tuple[torch.cuda.Event, list[dict]]] = []
+        for event, pending_plans in self._specagent_pending_deferred_plans:
+            if event.query():
+                # The generator deliberately transferred ownership of its
+                # temporary allocation to the last-layer plan.  Return it to
+                # the allocator only after the last GPU consumer has finished.
+                for pending_plan in pending_plans:
+                    release_obj = pending_plan.get("release_obj")
+                    if release_obj is not None:
+                        release_obj.ref_count_down()
+            else:
+                still_pending.append((event, pending_plans))
+        self._specagent_pending_deferred_plans = still_pending
+        plans = self._specagent_deferred_layer_fetches.pop(
+            int(layer_id), None
+        )
+        if plans and os.environ.get("SPECAGENT_FUSED_TRANSFER_DEBUG"):
+            logger.error(
+                "[SpecAgent][FUSED-FLUSH] layer=%d plans=%d event=%s "
+                "connector_id=%d",
+                layer_id,
+                len(plans) if plans else 0,
+                scratch_free_event is not None,
+                id(self),
+            )
+        if not plans:
+            return False
+
+        if (
+            int(layer_id) == 0
+            and os.environ.get("SPECAGENT_FUSED_MAPPING_DEBUG")
+        ):
+            for plan_idx, plan in enumerate(plans):
+                mapping = plan["slot_mapping"]
+                transfer = plan["transfer_tensor"]
+                target = plan["target_kv_cache"]
+                mapping_min = int(mapping.min().item()) if mapping.numel() else 0
+                mapping_max = int(mapping.max().item()) if mapping.numel() else -1
+                if transfer.dim() != 3:
+                    raise RuntimeError(
+                        "[SpecAgent][FUSED-MAP-ERROR] unexpected transfer "
+                        f"shape={tuple(transfer.shape)}"
+                    )
+                transfer_tokens = int(
+                    transfer.shape[1]
+                    if transfer.shape[0] == 2
+                    else transfer.shape[0]
+                )
+                if self.use_mla:
+                    target_slots = int(target.shape[0] * target.shape[1])
+                elif is_hnd(self.gpu_kv_format):
+                    target_slots = int(target.shape[1] * target.shape[3])
+                else:
+                    target_slots = int(target.shape[1] * target.shape[2])
+                logger.error(
+                    "[SpecAgent][FUSED-MAP] plan=%d mapping=%d range=[%d,%d] "
+                    "transfer_tokens=%d target_slots=%d target_shape=%s",
+                    plan_idx,
+                    int(mapping.numel()),
+                    mapping_min,
+                    mapping_max,
+                    transfer_tokens,
+                    target_slots,
+                    tuple(target.shape),
+                )
+                if mapping_min < -1 or mapping_max >= target_slots:
+                    raise RuntimeError(
+                        "[SpecAgent][FUSED-MAP-ERROR] slot mapping outside "
+                        f"scratch target: range=[{mapping_min},{mapping_max}] "
+                        f"target_slots={target_slots}"
+                    )
+                if int(mapping.numel()) > transfer_tokens:
+                    raise RuntimeError(
+                        "[SpecAgent][FUSED-MAP-ERROR] mapping longer than "
+                        f"transfer buffer: mapping={mapping.numel()} "
+                        f"transfer_tokens={transfer_tokens}"
+                    )
+
+        with torch.cuda.stream(self.load_stream):
+            copy_dsts = [
+                dst for plan in plans for dst in plan["copy_dsts"]
+            ]
+            copy_srcs = [
+                src for plan in plans for src in plan["copy_srcs"]
+            ]
+            if copy_dsts:
+                if all(
+                    _can_raw_h2d_copy(dst, src)
+                    for dst, src in zip(
+                        copy_dsts, copy_srcs, strict=False
+                    )
+                ):
+                    _raw_h2d_copy_batch_async(copy_dsts, copy_srcs)
+                else:
+                    # Preserve the existing correctness fallback for unusual
+                    # storage backends or tensor layouts.
+                    for plan in plans:
+                        torch._foreach_copy_(
+                            plan["copy_dsts"],
+                            plan["copy_srcs"],
+                            non_blocking=True,
+                        )
+
+            # H2D targets only the existing per-retriever temporary buffers,
+            # so it can run while the current layer reads scratch.  Delay only
+            # the writes into the two-slot scratch ring.
+            if scratch_free_event is not None:
+                self.load_stream.wait_event(scratch_free_event)
+            lmc_ops.specagent_multi_scatter(
+                [plan["transfer_tensor"] for plan in plans],
+                [plan["target_kv_cache"] for plan in plans],
+                [plan["slot_mapping"] for plan in plans],
+                self.gpu_kv_format,
+            )
+            ready = _specagent_record_cuda_event(self.load_stream)
+
+        for plan in plans:
+            events = plan["layer_events"]
+            if int(layer_id) < len(events):
+                events[int(layer_id)] = ready
+        self._specagent_pending_deferred_plans.append((ready, plans))
+
+        # Debug-only, exact payload validation.  Full-model recomputation is
+        # not bit-identical for this path, so validate the two operations that
+        # the fused submit changes instead: pinned CPU -> temporary GPU tensor,
+        # then temporary tensor -> paged scratch KV.  Synchronization and
+        # device-to-host copies are intentionally confined to this opt-in path.
+        if os.environ.get("SPECAGENT_FUSED_TRANSFER_DEBUG"):
+            layer_filter_raw = os.environ.get(
+                "SPECAGENT_FUSED_TRANSFER_DEBUG_LAYERS", "0,1,45"
+            )
+            if layer_filter_raw.strip().lower() == "all":
+                layer_filter = set(range(self.num_layers))
+            else:
+                layer_filter = {
+                    int(value)
+                    for value in layer_filter_raw.split(",")
+                    if value.strip()
+                }
+            if (
+                int(layer_id) in layer_filter
+                and int(layer_id)
+                not in self._specagent_fused_debug_checked_layers
+            ):
+                ready.synchronize()
+                for plan_idx, plan in enumerate(plans):
+                    h2d_mismatch = 0
+                    h2d_max = 0.0
+                    for dst, src in zip(
+                        plan["copy_dsts"],
+                        plan["copy_srcs"],
+                        strict=True,
+                    ):
+                        actual = dst.detach().cpu()
+                        expected = src.detach().cpu()
+                        h2d_mismatch += int(
+                            torch.count_nonzero(actual != expected).item()
+                        )
+                        if actual.numel():
+                            h2d_max = max(
+                                h2d_max,
+                                float(
+                                    (
+                                        actual.float()
+                                        - expected.float()
+                                    ).abs().max().item()
+                                ),
+                            )
+
+                    transfer = plan["transfer_tensor"]
+                    target = plan["target_kv_cache"]
+                    mapping = plan["slot_mapping"].to(
+                        device=transfer.device, dtype=torch.long
+                    )
+                    block_size = int(target.shape[2])
+                    scatter_mismatch = 0
+                    scatter_max = 0.0
+                    checked_tokens = 0
+                    for begin in range(0, int(mapping.numel()), 256):
+                        slots = mapping[begin : begin + 256]
+                        valid = slots >= 0
+                        if not bool(valid.any().item()):
+                            continue
+                        token_indices = (
+                            torch.arange(
+                                begin,
+                                begin + int(slots.numel()),
+                                device=slots.device,
+                            )[valid]
+                        )
+                        slots = slots[valid]
+                        blocks = torch.div(
+                            slots, block_size, rounding_mode="floor"
+                        )
+                        offsets = slots.remainder(block_size)
+                        if transfer.dim() == 3 and transfer.shape[0] == 2:
+                            expected = transfer[:, token_indices, :]
+                        elif transfer.dim() == 3 and transfer.shape[1] == 2:
+                            expected = transfer[token_indices, :, :].permute(
+                                1, 0, 2
+                            )
+                        else:
+                            raise AssertionError(
+                                "Unexpected transfer tensor shape "
+                                f"{tuple(transfer.shape)}"
+                            )
+                        actual = target[:, blocks, offsets].reshape(
+                            2, int(slots.numel()), -1
+                        )
+                        expected = expected.reshape(
+                            2, int(slots.numel()), -1
+                        )
+                        scatter_mismatch += int(
+                            torch.count_nonzero(actual != expected).item()
+                        )
+                        if actual.numel():
+                            scatter_max = max(
+                                scatter_max,
+                                float(
+                                    (
+                                        actual.float()
+                                        - expected.float()
+                                    ).abs().max().item()
+                                ),
+                            )
+                        checked_tokens += int(slots.numel())
+                    logger.error(
+                        "[SpecAgent][FUSED-CHECK] layer=%d plan=%d "
+                        "copies=%d tokens=%d h2d_mismatch=%d h2d_max=%.6g "
+                        "scatter_mismatch=%d scatter_max=%.6g",
+                        layer_id,
+                        plan_idx,
+                        len(plan["copy_dsts"]),
+                        checked_tokens,
+                        h2d_mismatch,
+                        h2d_max,
+                        scatter_mismatch,
+                        scatter_max,
+                    )
+                self._specagent_fused_debug_checked_layers.add(int(layer_id))
+        return True
 
     def _specagent_release_completed_store_buffers(self) -> None:
         if not self._specagent_pending_store_buffer_frees:
@@ -1210,9 +1526,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         self._specagent_pending_store_buffer_frees = pending
 
     def _specagent_defer_store_buffer_free(self, memory_obj: MemoryObj) -> None:
-        event = torch.cuda.Event()
         with torch.cuda.stream(self.store_stream):
-            event.record(self.store_stream)
+            event = _specagent_record_cuda_event(self.store_stream)
         self._specagent_pending_store_buffer_frees.append((event, memory_obj))
 
     def _specagent_wait_one_store_buffer(self) -> None:
@@ -1489,6 +1804,25 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         bw_profile_records = []
         specagent_layer_events = kwargs.get("specagent_layer_events")
         event_synchronized_load = isinstance(specagent_layer_events, list)
+        defer_layer_submit = bool(
+            kwargs.get("specagent_defer_layer_submit")
+            and self.use_gpu
+            and event_synchronized_load
+        )
+        if os.environ.get("SPECAGENT_FUSED_TRANSFER_DEBUG"):
+            logger.error(
+                "[SpecAgent][FUSED-CONNECTOR] requested=%s use_gpu=%s "
+                "event_synchronized=%s defer=%s starts=%d",
+                bool(kwargs.get("specagent_defer_layer_submit")),
+                self.use_gpu,
+                event_synchronized_load,
+                defer_layer_submit,
+                len(starts),
+            )
+        if defer_layer_submit:
+            # Timing events and payload checks belong around the eventual
+            # fused flush, not descriptor collection.
+            bw_profile = False
 
         _hb = bool(os.environ.get("SPECAGENT_HOST_BREAKDOWN"))
         import time as _hbt
@@ -1506,11 +1840,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             prof_h2d_bytes = 0
             prof_gpu_copy_bytes = 0
             if bw_profile:
-                prof_start = torch.cuda.Event(enable_timing=True)
-                prof_end = torch.cuda.Event(enable_timing=True)
+                prof_end = True
             with torch.cuda.stream(self.load_stream):
-                if prof_start is not None:
-                    prof_start.record(self.load_stream)
+                if bw_profile:
+                    prof_start = _specagent_record_cuda_event(
+                        self.load_stream, enable_timing=True
+                    )
                 buffer_offset = 0
                 debug_first: Optional[tuple[int, int, int, int]] = None
                 debug_targets: list[tuple[int, int, int, int, int]] = []
@@ -1550,7 +1885,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         else:
                             _fa_srcs = [mo.tensor for mo in memory_objs_layer]
                     _fa_n = min(len(_fa_dsts), len(_fa_srcs))
-                    if _fa_n:
+                    if _fa_n and not defer_layer_submit:
                         with _lmc_record(
                             "lmcache gpu_send: h2d_copy "
                             f"layer={layer_id} copies={_fa_n}"
@@ -1598,18 +1933,35 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 if self.use_gpu:
                     transfer_tensor = tmp_gpu_buffer_obj.tensor
                     transfer_slot_mapping = slot_mapping_full
-                    with _lmc_record(
-                        "lmcache gpu_send: xfer_to_kvcache "
-                        f"layer={layer_id} tokens={num_tokens}"
-                    ):
-                        lmc_ops.single_layer_kv_transfer(
-                            transfer_tensor,
-                            kvcaches[layer_id],
-                            transfer_slot_mapping,
-                            lmc_ops.TransferDirection.H2D,
-                            self.gpu_kv_format,
-                            token_major=True,
-                        )
+                    if defer_layer_submit:
+                        self._specagent_deferred_layer_fetches.setdefault(
+                            int(layer_id), []
+                        ).append({
+                            "copy_dsts": list(_fa_dsts[:_fa_n]),
+                            "copy_srcs": list(_fa_srcs[:_fa_n]),
+                            "transfer_tensor": transfer_tensor,
+                            "target_kv_cache": kvcaches[layer_id],
+                            "slot_mapping": transfer_slot_mapping,
+                            "layer_events": specagent_layer_events,
+                            "release_obj": (
+                                tmp_gpu_buffer_obj
+                                if layer_id == self.num_layers - 1
+                                else None
+                            ),
+                        })
+                    else:
+                        with _lmc_record(
+                            "lmcache gpu_send: xfer_to_kvcache "
+                            f"layer={layer_id} tokens={num_tokens}"
+                        ):
+                            lmc_ops.single_layer_kv_transfer(
+                                transfer_tensor,
+                                kvcaches[layer_id],
+                                transfer_slot_mapping,
+                                lmc_ops.TransferDirection.H2D,
+                                self.gpu_kv_format,
+                                token_major=True,
+                            )
                     if _hb:
                         _hb_xfer += _hbt.perf_counter() - _hb_c1
                     if bw_profile:
@@ -1617,7 +1969,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             tmp_gpu_buffer_obj.tensor.numel()
                             * tmp_gpu_buffer_obj.tensor.element_size()
                         )
-                    if (debug_transfer and debug_count < debug_limit
+                    if (not defer_layer_submit
+                            and debug_transfer and debug_count < debug_limit
                             and debug_first is not None):
                         debug_points = [
                             ("CHECK", -1, *debug_first),
@@ -1697,7 +2050,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                                     dst_numel,
                                 )
                         debug_count += 1
-                if os.environ.get("SPECAGENT_SCRATCH_TAG_DEBUG"):
+                if (not defer_layer_submit
+                        and os.environ.get("SPECAGENT_SCRATCH_TAG_DEBUG")):
                     tag_store = getattr(
                         builtins, "_specagent_scratch_layer_tags", None)
                     if not isinstance(tag_store, dict):
@@ -1715,10 +2069,14 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         "ends": [int(x) for x in ends],
                     }
                 if prof_end is not None:
-                    prof_end.record(self.load_stream)
-                if isinstance(specagent_layer_events, list):
-                    event = torch.cuda.Event()
-                    event.record(self.load_stream)
+                    prof_end = _specagent_record_cuda_event(
+                        self.load_stream, enable_timing=True
+                    )
+                if (
+                    isinstance(specagent_layer_events, list)
+                    and not defer_layer_submit
+                ):
+                    event = _specagent_record_cuda_event(self.load_stream)
                     if layer_id < len(specagent_layer_events):
                         specagent_layer_events[layer_id] = event
             if bw_profile and prof_start is not None and prof_end is not None:
@@ -1786,7 +2144,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         # free the buffer memory
         if tmp_gpu_buffer_obj is not None:
-            tmp_gpu_buffer_obj.ref_count_down()
+            if not defer_layer_submit:
+                tmp_gpu_buffer_obj.ref_count_down()
 
         logger.debug(f"Finished loading all {self.num_layers} layers.")
         yield
@@ -1842,6 +2201,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         )
         current_layer_only = bool(
             kwargs.get("specagent_save_current_layer_only", False)
+        )
+        defer_layerwise_commit = bool(
+            kwargs.get("specagent_defer_layerwise_store_commit", False)
         )
 
         self._lazy_initialize_buffer(self.kvcaches)
@@ -1932,10 +2294,14 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
             yield
-            if (sync or current_layer_only) and not (
+            if (
+                not defer_layerwise_commit
+                and (sync or current_layer_only)
+                and not (
                 defer_tmp_buffer_free
                 and self.use_gpu
                 and layer_id == self.num_layers - 1
+                )
             ):
                 self.store_stream.synchronize()
             logger.debug(f"Finished offloading layer {layer_id}")
@@ -1945,6 +2311,13 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 # save from each model-layer hook, so reading layer N+1 here
                 # would race before that layer has produced KV.
                 yield
+
+        # In the deferred SpecAgent path, every layer copy was queued on this
+        # one stream after the corresponding model-layer dependency.  A single
+        # completion here is sufficient before CacheEngine publishes any CPU
+        # memory object, and lets all earlier D2H copies overlap model compute.
+        if defer_layerwise_commit:
+            self.store_stream.synchronize()
 
         # free the buffer memory
         if tmp_gpu_buffer_obj is not None:
