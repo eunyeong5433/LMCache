@@ -1454,96 +1454,151 @@ class LMCacheEngine:
                     next(mem_obj_consumer)
 
             to_count_down = []
-            cpu_prefetch_ahead = max(
-                0,
-                int(
-                    kwargs.get(
-                        "specagent_cpu_prefetch_ahead_layers",
-                        os.environ.get(
-                            "SPECAGENT_CPU_PREFETCH_AHEAD_LAYERS", "0"
-                        ),
-                    )
-                    or 0
-                ),
-            )
-            cpu_prefetch_profile = bool(
-                os.environ.get("SPECAGENT_CPU_PREFETCH_PROFILE")
-            )
-            prefetch_ms_total = 0.0
-            result_ms_total = 0.0
-            send_ms_total = 0.0
-            result_ms_max = 0.0
-            send_ms_max = 0.0
-            prefetched_tasks: dict[int, Any] = {}
-            next_task_layer = 0
-
-            def prefetch_until(exclusive_layer: int) -> None:
-                nonlocal next_task_layer, prefetch_ms_total
-                while next_task_layer < min(self.num_layers, exclusive_layer):
-                    prefetch_t0 = time.perf_counter()
+            full_plan_objs = None
+            if kwargs.get("specagent_full_plan_fetch"):
+                resolve_location = location or "LocalCPUBackend"
+                backend = self.storage_manager.storage_backends.get(
+                    resolve_location
+                )
+                if backend is not None and hasattr(
+                    backend, "batched_get_blocking"
+                ):
+                    # Resolve every layer's CPU MemoryObj references here, in
+                    # the retriever's first step, so the per-layer loop below
+                    # never touches the get executor, futures, or
+                    # task.result().  References are held (ref_count_up inside
+                    # batched_get_blocking) and released via to_count_down
+                    # exactly like the task path.
                     with _lmc_record(
-                        "lmcache retrieve_layer: submit_get "
-                        f"req={req_id} layer={next_task_layer} "
+                        "lmcache retrieve_layer: full_plan_resolve "
+                        f"req={req_id} layers={self.num_layers} "
                         f"chunks={len(keys)}"
                     ):
-                        prefetched_tasks[next_task_layer] = next(get_generator)
-                    prefetch_ms_total += (
-                        time.perf_counter() - prefetch_t0
-                    ) * 1000.0
-                    assert prefetched_tasks[next_task_layer] is not None
-                    next_task_layer += 1
+                        full_plan_objs = [
+                            backend.batched_get_blocking(keys_layer)
+                            for keys_layer in keys_layer_major
+                        ]
+                    for layer_id, mem_objs_layer in enumerate(full_plan_objs):
+                        for chunk_idx, mem_obj in enumerate(mem_objs_layer):
+                            if mem_obj is None:
+                                raise RuntimeError(
+                                    "[SpecAgent][FULL-PLAN] CPU MemoryObj "
+                                    f"missing for req={req_id} "
+                                    f"layer={layer_id} chunk={chunk_idx}: "
+                                    "evicted between contains and resolve"
+                                )
+                        to_count_down.extend(mem_objs_layer)
 
-            for layer_id in range(self.num_layers):
-                prefetch_until(layer_id + cpu_prefetch_ahead + 1)
-                task = prefetched_tasks.pop(layer_id)
-
-                if layer_id == 0:
-                    # NOTE(Yuwei): For sglang integration we need to provide retrieved
-                    # tokens number in the first layer loading since there is no lookup
-                    if specagent_expected_tokens is not None:
-                        yield retrieved_tokens_count
+            if full_plan_objs is not None:
+                for layer_id in range(self.num_layers):
+                    if layer_id == 0:
+                        if specagent_expected_tokens is not None:
+                            yield retrieved_tokens_count
+                        else:
+                            yield torch.sum(ret_mask)
                     else:
-                        yield torch.sum(ret_mask)
-                else:
-                    yield None
-
-                result_t0 = time.perf_counter()
-                with _lmc_record(
-                    "lmcache retrieve_layer: task_result "
-                    f"req={req_id} layer={layer_id} chunks={len(keys)}"
-                ):
-                    mem_objs_layer = task.result()
-                result_ms = (time.perf_counter() - result_t0) * 1000.0
-                result_ms_total += result_ms
-                result_ms_max = max(result_ms_max, result_ms)
-                send_t0 = time.perf_counter()
-                with _lmc_record(
-                    "lmcache retrieve_layer: gpu_send "
-                    f"req={req_id} layer={layer_id} chunks={len(keys)}"
-                ):
-                    mem_obj_consumer.send(mem_objs_layer)
-                send_ms = (time.perf_counter() - send_t0) * 1000.0
-                send_ms_total += send_ms
-                send_ms_max = max(send_ms_max, send_ms)
-                to_count_down.extend(mem_objs_layer)
-
-            if cpu_prefetch_profile:
-                logger.info(
-                    "[SpecAgent][CPU-PREFETCH] req=%s layers=%d ahead=%d "
-                    "chunks=%d tokens=%d prefetch_ms=%.3f "
-                    "task_result_ms_sum=%.3f task_result_ms_max=%.3f "
-                    "gpu_send_ms_sum=%.3f gpu_send_ms_max=%.3f",
-                    req_id,
-                    self.num_layers,
-                    cpu_prefetch_ahead,
-                    len(keys),
-                    int(torch.sum(ret_mask).item()),
-                    prefetch_ms_total,
-                    result_ms_total,
-                    result_ms_max,
-                    send_ms_total,
-                    send_ms_max,
+                        yield None
+                    with _lmc_record(
+                        "lmcache retrieve_layer: gpu_send "
+                        f"req={req_id} layer={layer_id} chunks={len(keys)}"
+                    ):
+                        mem_obj_consumer.send(full_plan_objs[layer_id])
+            else:
+                cpu_prefetch_ahead = max(
+                    0,
+                    int(
+                        kwargs.get(
+                            "specagent_cpu_prefetch_ahead_layers",
+                            os.environ.get(
+                                "SPECAGENT_CPU_PREFETCH_AHEAD_LAYERS", "0"
+                            ),
+                        )
+                        or 0
+                    ),
                 )
+                cpu_prefetch_profile = bool(
+                    os.environ.get("SPECAGENT_CPU_PREFETCH_PROFILE")
+                )
+                prefetch_ms_total = 0.0
+                result_ms_total = 0.0
+                send_ms_total = 0.0
+                result_ms_max = 0.0
+                send_ms_max = 0.0
+                prefetched_tasks: dict[int, Any] = {}
+                next_task_layer = 0
+
+                def prefetch_until(exclusive_layer: int) -> None:
+                    nonlocal next_task_layer, prefetch_ms_total
+                    while next_task_layer < min(
+                        self.num_layers, exclusive_layer
+                    ):
+                        prefetch_t0 = time.perf_counter()
+                        with _lmc_record(
+                            "lmcache retrieve_layer: submit_get "
+                            f"req={req_id} layer={next_task_layer} "
+                            f"chunks={len(keys)}"
+                        ):
+                            prefetched_tasks[next_task_layer] = next(
+                                get_generator
+                            )
+                        prefetch_ms_total += (
+                            time.perf_counter() - prefetch_t0
+                        ) * 1000.0
+                        assert prefetched_tasks[next_task_layer] is not None
+                        next_task_layer += 1
+
+                for layer_id in range(self.num_layers):
+                    prefetch_until(layer_id + cpu_prefetch_ahead + 1)
+                    task = prefetched_tasks.pop(layer_id)
+
+                    if layer_id == 0:
+                        # NOTE(Yuwei): For sglang integration we need to
+                        # provide retrieved tokens number in the first layer
+                        # loading since there is no lookup
+                        if specagent_expected_tokens is not None:
+                            yield retrieved_tokens_count
+                        else:
+                            yield torch.sum(ret_mask)
+                    else:
+                        yield None
+
+                    result_t0 = time.perf_counter()
+                    with _lmc_record(
+                        "lmcache retrieve_layer: task_result "
+                        f"req={req_id} layer={layer_id} chunks={len(keys)}"
+                    ):
+                        mem_objs_layer = task.result()
+                    result_ms = (time.perf_counter() - result_t0) * 1000.0
+                    result_ms_total += result_ms
+                    result_ms_max = max(result_ms_max, result_ms)
+                    send_t0 = time.perf_counter()
+                    with _lmc_record(
+                        "lmcache retrieve_layer: gpu_send "
+                        f"req={req_id} layer={layer_id} chunks={len(keys)}"
+                    ):
+                        mem_obj_consumer.send(mem_objs_layer)
+                    send_ms = (time.perf_counter() - send_t0) * 1000.0
+                    send_ms_total += send_ms
+                    send_ms_max = max(send_ms_max, send_ms)
+                    to_count_down.extend(mem_objs_layer)
+
+                if cpu_prefetch_profile:
+                    logger.info(
+                        "[SpecAgent][CPU-PREFETCH] req=%s layers=%d ahead=%d "
+                        "chunks=%d tokens=%d prefetch_ms=%.3f "
+                        "task_result_ms_sum=%.3f task_result_ms_max=%.3f "
+                        "gpu_send_ms_sum=%.3f gpu_send_ms_max=%.3f",
+                        req_id,
+                        self.num_layers,
+                        cpu_prefetch_ahead,
+                        len(keys),
+                        int(torch.sum(ret_mask).item()),
+                        prefetch_ms_total,
+                        result_ms_total,
+                        result_ms_max,
+                        send_ms_total,
+                        send_ms_max,
+                    )
 
             for mem_obj in to_count_down:
                 mem_obj.ref_count_down()

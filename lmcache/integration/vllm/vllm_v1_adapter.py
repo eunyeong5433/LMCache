@@ -1115,6 +1115,7 @@ class LMCacheConnectorV1Impl:
             0,
             int(sa_extra.get("specagent_cpu_prefetch_ahead_layers", 0) or 0),
         )
+        sa_full_plan_fetch = bool(sa_extra.get("specagent_full_plan_fetch"))
 
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
@@ -1447,6 +1448,7 @@ class LMCacheConnectorV1Impl:
                                 specagent_cpu_prefetch_ahead_layers=(
                                     sa_cpu_prefetch_ahead_layers
                                 ),
+                                specagent_full_plan_fetch=sa_full_plan_fetch,
                             )
                         # The first generator step performs the expensive
                         # token/chunk lookup and submits CPU get work.  Let
