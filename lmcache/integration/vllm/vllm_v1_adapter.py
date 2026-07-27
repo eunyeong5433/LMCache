@@ -3111,8 +3111,16 @@ class LMCacheConnectorV1Impl:
                     except StopIteration:
                         pass
                     finalized += 1
-                if request.is_finished_save:
-                    self._specagent_finished_save_completed.add(request.req_id)
+                    if request.is_finished_save:
+                        self._specagent_finished_save_completed.add(
+                            request.req_id
+                        )
+                # A finished-save whose layerwise storer was never created
+                # (decode-only steps -- the common case under
+                # save_kv_on_turn_end_only) must stay un-completed here so
+                # get_finished()'s no-forward bulk store still runs.
+                # Marking it completed unconditionally silently dropped the
+                # entire turn-end CPU save (external hit 0-43% vs vanilla 95%).
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
             if timing:
@@ -3338,6 +3346,25 @@ class LMCacheConnectorV1Impl:
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
         connector_metadata = self._parent._get_connector_metadata()
         builtins._sa_getfin_call = getattr(builtins, "_sa_getfin_call", 0) + 1
+        if not isinstance(connector_metadata, LMCacheConnectorMetadata):
+            builtins._sa_getfin_nometa = getattr(
+                builtins, "_sa_getfin_nometa", 0) + 1
+        if _specagent_env_true("SPECAGENT_SAVE_DEBUG") and (
+            builtins._sa_getfin_call % 500 == 0
+        ):
+            logger.warning(
+                "[SpecAgent][GETFIN-COUNTERS] calls=%d nometa=%d reqs=%d "
+                "finmatch=%d incompleted=%d wouldcall=%d finsave_call=%d "
+                "finsave_nocansave=%d",
+                builtins._sa_getfin_call,
+                getattr(builtins, "_sa_getfin_nometa", 0),
+                getattr(builtins, "_sa_getfin_reqs", 0),
+                getattr(builtins, "_sa_getfin_finmatch", 0),
+                getattr(builtins, "_sa_getfin_incompleted", 0),
+                getattr(builtins, "_sa_getfin_wouldcall", 0),
+                getattr(builtins, "_sa_finsave_call", 0),
+                getattr(builtins, "_sa_finsave_nocansave", 0),
+            )
         if isinstance(connector_metadata, LMCacheConnectorMetadata):
             builtins._sa_getfin_reqs = getattr(
                 builtins, "_sa_getfin_reqs", 0) + len(connector_metadata.requests)

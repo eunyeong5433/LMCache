@@ -5,6 +5,7 @@ import abc
 import builtins
 import os
 import threading
+import time
 from contextlib import nullcontext
 
 # Third Party
@@ -1767,6 +1768,28 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
                     buffer_shape, self.dtype, MemoryFormat.KV_T2D
                 )
+            if tmp_gpu_buffer_obj is None:
+                # Transient exhaustion: concurrent verify fetches can briefly
+                # hold the whole staging pool (observed 2x on 2026-07-26 at
+                # 24-30 concurrent requests; the previous assert killed the
+                # engine).  Buffers free asynchronously as load-stream events
+                # complete, so a bounded retry resolves it without new memory.
+                _alloc_deadline = time.monotonic() + 5.0
+                while tmp_gpu_buffer_obj is None:
+                    self._specagent_release_completed_store_buffers()
+                    self.specagent_flush_deferred_layer(-1)  # reap done plans
+                    tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                        buffer_shape, self.dtype, MemoryFormat.KV_T2D
+                    )
+                    if tmp_gpu_buffer_obj is not None:
+                        break
+                    if time.monotonic() > _alloc_deadline:
+                        raise RuntimeError(
+                            "GPU staging buffer exhausted for >5s "
+                            f"(need shape={buffer_shape}); concurrent "
+                            "verify fetches exceed the staging pool"
+                        )
+                    time.sleep(0.002)
             assert tmp_gpu_buffer_obj is not None, (
                 "Failed to allocate GPU buffer in GPUConnector"
             )
@@ -2237,6 +2260,28 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
                     buffer_shape, self.dtype, MemoryFormat.KV_T2D
                 )
+            if tmp_gpu_buffer_obj is None:
+                # Transient exhaustion: concurrent verify fetches can briefly
+                # hold the whole staging pool (observed 2x on 2026-07-26 at
+                # 24-30 concurrent requests; the previous assert killed the
+                # engine).  Buffers free asynchronously as load-stream events
+                # complete, so a bounded retry resolves it without new memory.
+                _alloc_deadline = time.monotonic() + 5.0
+                while tmp_gpu_buffer_obj is None:
+                    self._specagent_release_completed_store_buffers()
+                    self.specagent_flush_deferred_layer(-1)  # reap done plans
+                    tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                        buffer_shape, self.dtype, MemoryFormat.KV_T2D
+                    )
+                    if tmp_gpu_buffer_obj is not None:
+                        break
+                    if time.monotonic() > _alloc_deadline:
+                        raise RuntimeError(
+                            "GPU staging buffer exhausted for >5s "
+                            f"(need shape={buffer_shape}); concurrent "
+                            "verify fetches exceed the staging pool"
+                        )
+                    time.sleep(0.002)
             assert tmp_gpu_buffer_obj is not None, (
                 "Failed to allocate GPU buffer in GPUConnector"
             )
