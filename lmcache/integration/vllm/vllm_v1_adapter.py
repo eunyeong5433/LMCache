@@ -1486,9 +1486,23 @@ class LMCacheConnectorV1Impl:
                             "dst_blocks": sa_fetch_paged_blocks,
                         })
                     else:
+                        sa_retrieve_mask = seg_token_mask
+                        if specagent_write_token_mask is not None:
+                            # Non-layerwise retrieve() has no separate write
+                            # mask, so restrict the fetch/scatter mask itself
+                            # to the missing ranges.  Without this the
+                            # chunk-aligned segment overwrites resident
+                            # tokens with the older CPU copy and, worse,
+                            # spills into logical blocks that have no real
+                            # destination -- their slot-map filler is
+                            # physical block 0, so the spill scribbles over
+                            # the shared null/hole block.
+                            sa_retrieve_mask = (
+                                seg_token_mask & specagent_write_token_mask
+                            )
                         ret_token_mask = self.lmcache_engine.retrieve(
                             tokens[:seg_end],
-                            seg_token_mask,
+                            sa_retrieve_mask,
                             kvcaches=target_kvcaches,
                             slot_mapping=slot_mapping[:seg_end],
                             vllm_cached_tokens=seg_start,
@@ -1496,7 +1510,8 @@ class LMCacheConnectorV1Impl:
                             req_id=request.req_id,
                         )
                         num_retrieved_tokens = ret_token_mask.sum().item()
-                        num_expected_tokens = int(seg_token_mask.sum().item())
+                        num_expected_tokens = int(
+                            sa_retrieve_mask.sum().item())
                         if num_retrieved_tokens < num_expected_tokens:
                             raise RuntimeError(
                                 "Request %s retrieved %d tokens, expected %d "
