@@ -98,6 +98,16 @@ def _specagent_record_actual_cpu_store(
         prefix_tokens = [int(t) for t in tokens[:end]]
     token_hash = hash(tuple(prefix_tokens))
     chunk_store.add((end, token_hash))
+    if (
+        os.environ.get("SPECAGENT_TAIL_SAVE_DEBUG")
+        and end % 256 != 0
+    ):
+        logger.error(
+            "[SpecAgent][OBS-TAIL-PROOF] end=%d start=%d hash=%d",
+            end,
+            start,
+            token_hash,
+        )
     builtins._sa_record_n = getattr(builtins, "_sa_record_n", 0) + 1
     if os.environ.get("SPECAGENT_HASH_DEBUG") and end <= 512:
         import logging as _lg
@@ -495,12 +505,11 @@ class LMCacheEngine:
         chunk_size = int(getattr(self.token_database, "chunk_size", 0) or 0)
         if chunk_size <= 0:
             return 0
-        aligned = (limit // chunk_size) * chunk_size
-        if aligned <= 0:
+        if limit <= 0:
             return 0
 
         live_tokens = 0
-        probe_tokens = tokens[:aligned]
+        probe_tokens = tokens[:limit]
         for start, end, key in self.token_database.process_tokens(
             tokens=probe_tokens,
             request_configs=None,
@@ -516,14 +525,14 @@ class LMCacheEngine:
                 present_layers = sum(1 for loc in layer_locations if loc)
                 logger.info(
                     "[SpecAgent][CPU-LIVE-PROBE-LMCACHE] engine_id=%s "
-                    "worker_id=%s chunk=[%d,%d) aligned=%d chunk_size=%d "
+                    "worker_id=%s chunk=[%d,%d) limit=%d chunk_size=%d "
                     "key_hash=%s present_layers=%d/%d first_location=%s "
                     "retrieve_locations=%s store_location=%s",
                     id(self),
                     getattr(self.metadata, "worker_id", None),
                     start,
                     end,
-                    aligned,
+                    limit,
                     chunk_size,
                     str(key.chunk_hash),
                     present_layers,
@@ -935,6 +944,60 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         prev_key = 0
+        merge_prefix_tokens = int(
+            kwargs.get("specagent_tail_merge_prefix_tokens", 0) or 0
+        )
+        chunk_size = int(getattr(self.token_database, "chunk_size", 0) or 0)
+        merge_chunk_start = (
+            merge_prefix_tokens // chunk_size * chunk_size
+            if chunk_size > 0 and merge_prefix_tokens % chunk_size
+            else -1
+        )
+        merge_source_objs: Optional[List[MemoryObj]] = None
+        if merge_chunk_start >= 0:
+            source_key = None
+            source_start = source_end = -1
+            for source_start, source_end, candidate_key in (
+                self.token_database.process_tokens(
+                    tokens=tokens[:merge_prefix_tokens],
+                    request_configs=request_configs,
+                )
+            ):
+                source_key = candidate_key
+            if (
+                source_key is None
+                or source_start != merge_chunk_start
+                or source_end != merge_prefix_tokens
+            ):
+                raise RuntimeError(
+                    "SpecAgent observation-tail merge could not identify the "
+                    f"previous partial chunk: req={req_id} "
+                    f"merge_prefix={merge_prefix_tokens}"
+                )
+            assert isinstance(source_key, CacheEngineKey)
+            merge_source_objs = self.storage_manager.batched_get(
+                source_key.split_layers(self.num_layers),
+                self.retrieve_locations,
+            )
+            if any(obj is None for obj in merge_source_objs):
+                for obj in merge_source_objs:
+                    if obj is not None:
+                        obj.ref_count_down()
+                raise RuntimeError(
+                    "SpecAgent observation-tail merge is missing the previous "
+                    f"CPU partial chunk: req={req_id} "
+                    f"chunk=[{merge_chunk_start},{merge_prefix_tokens})"
+                )
+            if os.environ.get("SPECAGENT_TAIL_SAVE_DEBUG"):
+                logger.error(
+                    "[SpecAgent][OBS-TAIL-MERGE] req=%s "
+                    "chunk=[%d,%d) new_end=%d layers=%d",
+                    req_id,
+                    merge_chunk_start,
+                    merge_prefix_tokens,
+                    len(tokens),
+                    len(merge_source_objs),
+                )
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs
         ):
@@ -1057,6 +1120,37 @@ class LMCacheEngine:
 
             def commit_layer(layer_id: int) -> None:
                 """Publish one fully copied CPU layer to the storage manager."""
+                if merge_source_objs is not None:
+                    source_obj = merge_source_objs[layer_id]
+                    assert source_obj is not None
+                    merged = False
+                    for start, end, memory_obj in zip(
+                        starts, ends, memory_objs[layer_id], strict=False
+                    ):
+                        if start != merge_chunk_start:
+                            continue
+                        prefix_len = merge_prefix_tokens - start
+                        source_tensor = source_obj.tensor
+                        target_tensor = memory_obj.tensor
+                        assert source_tensor is not None
+                        assert target_tensor is not None
+                        if source_tensor.shape[0] != prefix_len:
+                            raise RuntimeError(
+                                "SpecAgent observation-tail source has wrong "
+                                f"length: req={req_id} layer={layer_id} "
+                                f"expected={prefix_len} "
+                                f"actual={source_tensor.shape[0]}"
+                            )
+                        target_tensor[:prefix_len].copy_(source_tensor)
+                        merged = True
+                        break
+                    source_obj.ref_count_down()
+                    if not merged:
+                        raise RuntimeError(
+                            "SpecAgent observation-tail target chunk was not "
+                            f"scheduled: req={req_id} layer={layer_id} "
+                            f"chunk_start={merge_chunk_start}"
+                        )
                 with _lmc_record(
                     "lmcache store_layer: batched_put "
                     f"req={req_id} layer={layer_id} "

@@ -444,6 +444,11 @@ class ReqMeta:
     # Identity of this particular mid-turn save. The same live request may be
     # SPEC-preempted more than once.
     specagent_preempt_save_id: int = 0
+    # Forced observation-prefill saves can extend a partial LMCache chunk
+    # whose old prefix came from CPU scratch and whose new suffix is in paged
+    # GPU KV. The store path merges those two sources before publication.
+    specagent_tail_merge_prefix_tokens: int = 0
+    specagent_observation_tail_save: bool = False
 
     @staticmethod
     def from_request_tracker(
@@ -2811,7 +2816,11 @@ class LMCacheConnectorV1Impl:
 
             store_mask = torch.ones(len(token_ids), dtype=torch.bool)
             store_mask[:skip_leading_tokens] = False
-            if skip_leading_tokens > 0 and not request.is_finished_save:
+            if (
+                skip_leading_tokens > 0
+                and not request.is_finished_save
+                and not request.specagent_observation_tail_save
+            ):
                 aligned_token_len = (
                     len(token_ids)
                     // self._lmcache_chunk_size
@@ -3011,6 +3020,9 @@ class LMCacheConnectorV1Impl:
                     # This removes 46 host synchronizations while preserving
                     # the rule that readers never see partially copied KV.
                     specagent_defer_layerwise_store_commit=True,
+                    specagent_tail_merge_prefix_tokens=(
+                        request.specagent_tail_merge_prefix_tokens
+                    ),
                 )
                 self._layerwise_save_storers[request.req_id] = layerwise_storer
                 if is_first:
@@ -3580,8 +3592,33 @@ class LMCacheConnectorV1Impl:
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
 
+        nosave_probe = getattr(request, "specagent_nosave_resume_probe", None)
+        nosave_live_hit = 0
+        if isinstance(nosave_probe, dict):
+            nosave_proven = min(
+                int(nosave_probe.get("proven_tokens", 0) or 0),
+                len(request.all_token_ids),
+            )
+            live_probe = getattr(
+                builtins, "_specagent_lmcache_live_saved_tokens", None
+            )
+            if nosave_proven > 0 and callable(live_probe):
+                nosave_live_hit = int(
+                    live_probe(request.all_token_ids, nosave_proven) or 0
+                )
+
         forced_lookup = self._specagent_preempt_forced_lookup.get(req_id)
-        if forced_lookup is not None:
+        if nosave_live_hit > 0:
+            num_external_hit_tokens = nosave_live_hit
+            lookup_cached = True
+            logger.info(
+                "[SpecAgent][NOSAVE-PARTIAL-LOOKUP] req=%s "
+                "hit_tokens=%d proven_tokens=%d",
+                req_id,
+                num_external_hit_tokens,
+                int(nosave_probe.get("proven_tokens", 0)),
+            )
+        elif forced_lookup is not None:
             num_external_hit_tokens = min(
                 int(forced_lookup), len(request.all_token_ids)
             )
@@ -3909,6 +3946,8 @@ class LMCacheConnectorV1Impl:
             getattr(scheduler_output, "specagent_current_block_ids", None) or {}
         )
         emitted_req_ids: set[str] = set()
+        specagent_scratch_safe_suffix_starts: dict[str, int] = {}
+        specagent_scratch_merge_prefix_starts: dict[str, int] = {}
 
         def flatten_block_ids(
             block_ids: Union[tuple[list[int], ...], list[int], None],
@@ -4062,9 +4101,16 @@ class LMCacheConnectorV1Impl:
                 )
 
             min_save_start = max(old_saved_tokens, safe_suffix_start)
+            specagent_scratch_safe_suffix_starts[req_id] = int(
+                safe_suffix_start
+            )
             save_floor = (
                 min_save_start // self._lmcache_chunk_size
                 * self._lmcache_chunk_size
+            )
+            merge_observation_tail = (
+                specagent_step_force_save(req_id)
+                and specagent_fetch_reqs.get(req_id) == "observation_prefill"
             )
             if save_floor < min_save_start:
                 boundary_chunk = (save_floor, save_floor + self._lmcache_chunk_size)
@@ -4093,10 +4139,15 @@ class LMCacheConnectorV1Impl:
                         overlaps_missing = True
                         break
                 if overlaps_missing:
-                    save_floor = (
-                        cdiv(min_save_start, self._lmcache_chunk_size)
-                        * self._lmcache_chunk_size
-                    )
+                    if merge_observation_tail:
+                        specagent_scratch_merge_prefix_starts[req_id] = int(
+                            safe_suffix_start
+                        )
+                    else:
+                        save_floor = (
+                            cdiv(min_save_start, self._lmcache_chunk_size)
+                            * self._lmcache_chunk_size
+                        )
             if save_floor > old_saved_tokens:
                 request_tracker.num_saved_tokens = save_floor
                 if _specagent_env_true("SPECAGENT_SAVE_DEBUG"):
@@ -4137,10 +4188,33 @@ class LMCacheConnectorV1Impl:
             req_id: str,
             req_meta: Optional[ReqMeta],
         ) -> Optional[ReqMeta]:
-            if req_id not in specagent_fetch_reqs or req_meta is None:
+            if req_meta is None:
                 return req_meta
             save_spec = req_meta.save_spec
             if save_spec is None or not save_spec.can_save:
+                return req_meta
+            if specagent_step_force_save(req_id):
+                # Observation completion is a stable prefill checkpoint even
+                # for ordinary paged/full-context requests. Do not let the
+                # layerwise path re-trim its final partial chunk.
+                req_meta.specagent_observation_tail_save = True
+            if req_id not in specagent_fetch_reqs:
+                return req_meta
+            merge_observation_tail = (
+                specagent_step_force_save(req_id)
+                and specagent_fetch_reqs.get(req_id) == "observation_prefill"
+            )
+            if merge_observation_tail:
+                safe_suffix_start = int(
+                    specagent_scratch_safe_suffix_starts.get(req_id, 0)
+                )
+                req_meta.specagent_tail_merge_prefix_tokens = int(
+                    specagent_scratch_merge_prefix_starts.get(req_id, 0)
+                )
+                save_spec.skip_leading_tokens = (
+                    safe_suffix_start // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
+                )
                 return req_meta
             skip_leading_tokens = (
                 save_spec.skip_leading_tokens
