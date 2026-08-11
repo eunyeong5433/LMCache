@@ -3350,6 +3350,29 @@ class LMCacheConnectorV1Impl:
 
         builtins._sa_finsave_store = getattr(
             builtins, "_sa_finsave_store", 0) + 1
+        # lmcache 계약: mask 의 False(=건너뛸 앞부분) 개수는 청크 배수여야
+        # 한다(청크 키가 prefix[:chunk_end] 해시라 경계에서만 시작 가능).
+        # 어긋나면 엔진이 ValueError 로 죽어 런 전체가 날아가므로, 죽이지
+        # 말고 숫자를 남긴 뒤 위로 정렬한다(위로 = 조금 덜 저장, 쓰레기
+        # 저장 위험 없음).  이 로그가 뜨면 skip 을 만든 쪽이 범인이다.
+        _engine_chunk = int(getattr(
+            getattr(self.lmcache_engine, "token_database", None),
+            "chunk_size", self._lmcache_chunk_size) or self._lmcache_chunk_size)
+        if _engine_chunk > 0 and skip_leading_tokens % _engine_chunk:
+            _aligned = (
+                (skip_leading_tokens + _engine_chunk - 1)
+                // _engine_chunk * _engine_chunk
+            )
+            logger.error(
+                "[SpecAgent][SAVE-MASK-MISALIGN] req=%s skip=%d "
+                "adapter_chunk=%d engine_chunk=%d len_tok=%d -> %d",
+                request.req_id, skip_leading_tokens,
+                self._lmcache_chunk_size, _engine_chunk,
+                len(token_ids), _aligned,
+            )
+            skip_leading_tokens = _aligned
+            if skip_leading_tokens >= len(token_ids):
+                return True
         store_mask = torch.ones(len(token_ids), dtype=torch.bool)
         store_mask[:skip_leading_tokens] = False
         storer = self.lmcache_engine.store_layer(
