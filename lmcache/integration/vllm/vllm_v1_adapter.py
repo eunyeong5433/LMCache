@@ -9,6 +9,8 @@ import os
 import threading
 import time
 
+import numpy as np
+
 # Third Party
 from vllm.config import (
     VllmConfig,
@@ -478,6 +480,7 @@ class ReqMeta:
         """
         timing = _specagent_timing_enabled()
         t0 = time.perf_counter() if timing else 0.0
+        _ft_t0 = time.perf_counter()
         input_token_ids = tracker.token_ids
         input_token_len = len(input_token_ids)
 
@@ -509,6 +512,11 @@ class ReqMeta:
         )
 
         if skip_save and load_spec is None:
+            builtins._lmc_ms_from_tracker = getattr(
+                builtins, "_lmc_ms_from_tracker", 0.0) + (
+                time.perf_counter() - _ft_t0) * 1000.0
+            builtins._lmc_n_from_tracker = getattr(
+                builtins, "_lmc_n_from_tracker", 0) + 1
             if timing:
                 logger.info(
                     "[SpecAgent][LMCACHE-TIMING] from_tracker req=%s "
@@ -628,14 +636,16 @@ class ReqMeta:
                 block_size,
             )
 
-        block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
-        block_offsets = torch.arange(0, block_size, dtype=torch.long)
-        slot_mapping = (
-            block_offsets.reshape((1, block_size))
-            + block_ids.reshape((num_blocks, 1)) * block_size
-        )
-
-        slot_mapping = slot_mapping.flatten()[: len(token_ids)]
+        # Build the slot mapping with numpy: the equivalent torch broadcast
+        # pays multi-ms fork/join overhead in torch's intra-op thread pool
+        # (128 threads on this host) for a ~48k-element op, and this runs on
+        # the scheduler thread for every fetch request every step.
+        block_ids_np = np.asarray(tracker.allocated_block_ids, dtype=np.int64)
+        slot_mapping_np = (
+            np.arange(block_size, dtype=np.int64).reshape((1, block_size))
+            + block_ids_np.reshape((num_blocks, 1)) * block_size
+        ).reshape(-1)[: len(token_ids)]
+        slot_mapping = torch.from_numpy(slot_mapping_np)
         assert slot_mapping.dtype == torch.long  # TODO: this could be removed
 
         # For load operation: log if the request is scheduled to load
@@ -647,6 +657,11 @@ class ReqMeta:
                 tracker.req_id,
             )
 
+        builtins._lmc_ms_from_tracker = getattr(
+            builtins, "_lmc_ms_from_tracker", 0.0) + (
+            time.perf_counter() - _ft_t0) * 1000.0
+        builtins._lmc_n_from_tracker = getattr(
+            builtins, "_lmc_n_from_tracker", 0) + 1
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
         req_meta = ReqMeta(
             req_id=tracker.req_id,
@@ -4108,6 +4123,7 @@ class LMCacheConnectorV1Impl:
             old_saved_tokens = request_tracker.num_saved_tokens
             if req_id not in specagent_fetch_reqs:
                 return old_saved_tokens
+            _sf_t0 = time.perf_counter()
 
             if safe_suffix_start is None:
                 # SpecAgent full-attention recovery may consume missing prefix
@@ -4149,18 +4165,21 @@ class LMCacheConnectorV1Impl:
                         resident_logical.update(int(i) for i in group)
                     else:
                         resident_logical.add(int(group))
+                # Only logical blocks intersecting the single boundary chunk
+                # can satisfy the overlap predicate; iterating the full
+                # cpu_prefix_blocks range (O(context), every fetch req, every
+                # step) is equivalent but wasteful.
                 overlaps_missing = False
-                for logical_i in range(cpu_prefix_blocks):
+                overlap_lo = max(0, boundary_chunk[0] // self._block_size)
+                overlap_hi = min(
+                    cpu_prefix_blocks,
+                    cdiv(boundary_chunk[1], self._block_size),
+                )
+                for logical_i in range(overlap_lo, overlap_hi):
                     if logical_i in resident_logical:
                         continue
-                    block_start = logical_i * self._block_size
-                    block_end = block_start + self._block_size
-                    if (
-                        block_start < boundary_chunk[1]
-                        and boundary_chunk[0] < block_end
-                    ):
-                        overlaps_missing = True
-                        break
+                    overlaps_missing = True
+                    break
                 if overlaps_missing:
                     if merge_observation_tail:
                         specagent_scratch_merge_prefix_starts[req_id] = int(
@@ -4189,6 +4208,9 @@ class LMCacheConnectorV1Impl:
                             or 0
                         ),
                     )
+            builtins._lmc_ms_save_floor = getattr(
+                builtins, "_lmc_ms_save_floor", 0.0) + (
+                time.perf_counter() - _sf_t0) * 1000.0
             return old_saved_tokens
 
         def restore_specagent_scratch_save_floor_if_unsaved(
@@ -4633,6 +4655,7 @@ class LMCacheConnectorV1Impl:
             emit_missing_specagent_fetch_meta()
             return meta
 
+        _tl_t0 = time.perf_counter()
         for i, req_id in enumerate(cached_reqs.req_ids):
             request_tracker = self._request_trackers[req_id]
             num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
@@ -4847,6 +4870,9 @@ class LMCacheConnectorV1Impl:
                 meta.add_request(req_meta)
                 emitted_req_ids.add(req_id)
 
+        builtins._lmc_ms_tracker_loop = getattr(
+            builtins, "_lmc_ms_tracker_loop", 0.0) + (
+            time.perf_counter() - _tl_t0) * 1000.0
         emit_missing_specagent_fetch_meta()
         return meta
 
