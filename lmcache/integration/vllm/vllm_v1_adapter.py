@@ -4571,7 +4571,12 @@ class LMCacheConnectorV1Impl:
                 if load_spec is not None:
                     lmcache_cached_tokens = load_spec.lmcache_cached_tokens
                     vllm_cached_tokens = load_spec.vllm_cached_tokens
-                request_tracker = self._request_trackers[req.req_id]
+                request_tracker = self._request_trackers.get(req.req_id)
+                if request_tracker is None:
+                    logger.warning(
+                        "[SpecAgent][TRACKER-MISS] extra-fetch req without "
+                        "tracker req=%s -- skipped", req.req_id)
+                    continue
 
                 # Pass all_token_ids for preempted requests to restore
                 # token_ids correctly for chunk key computation
@@ -4657,7 +4662,16 @@ class LMCacheConnectorV1Impl:
 
         _tl_t0 = time.perf_counter()
         for i, req_id in enumerate(cached_reqs.req_ids):
-            request_tracker = self._request_trackers[req_id]
+            request_tracker = self._request_trackers.get(req_id)
+            if request_tracker is None:
+                # (2026-08-18) attach/DRAFT 경로로 첫 스케줄이 cached 로
+                # 분류된 요청 — tracker 미등록. 엔진을 죽이는 대신 이번
+                # 스텝 메타를 생략(그 턴은 커넥터 저장/로드 없이 진행,
+                # 재계산 경로가 정확성 보장). 배선 근본수정용 단서 로그.
+                logger.warning(
+                    "[SpecAgent][TRACKER-MISS] cached req without tracker "
+                    "req=%s -- skipping connector meta this step", req_id)
+                continue
             num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
             # TODO: this is a dangerous reference to the request object inside vllm
             if request := self._unfinished_requests.get(req_id):

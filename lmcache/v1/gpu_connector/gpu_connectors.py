@@ -824,7 +824,18 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             logger.info(
                 f"Lazily initializing GPU buffer (max tokens={self.tokens_per_layer})."
             )
-            gpu_buffer_size = self.elements_per_layer * self.element_size
+            # (2026-08-17) 풀 크기가 paged 캡(tokens_per_layer)에 결합돼
+            # 있어 KV를 조인 레짐에서 staging이 같이 조여져 고갈-fatal이
+            # 난다(SEEDKV_OFF 실측: 55K 프리필 fetch 1건이 57.6K 풀의
+            # 95% 점유).  env 하한으로 분리한다(풀은 KV 예산 밖 VRAM).
+            _min_tok = int(os.environ.get(
+                "LMCACHE_STAGING_MIN_TOKENS", "0") or 0)
+            _eff_elems = self.elements_per_layer
+            if _min_tok > 0 and self.tokens_per_layer > 0:
+                _per_tok = self.elements_per_layer // self.tokens_per_layer
+                _eff_elems = max(
+                    self.elements_per_layer, _min_tok * _per_tok)
+            gpu_buffer_size = _eff_elems * self.element_size
             self.gpu_buffer_allocator = GPUMemoryAllocator(
                 gpu_buffer_size, device=self.device
             )
@@ -1608,7 +1619,18 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             logger.info(
                 f"Lazily initializing GPU buffer (max tokens={self.tokens_per_layer})."
             )
-            gpu_buffer_size = self.elements_per_layer * self.element_size
+            # (2026-08-17) 풀 크기가 paged 캡(tokens_per_layer)에 결합돼
+            # 있어 KV를 조인 레짐에서 staging이 같이 조여져 고갈-fatal이
+            # 난다(SEEDKV_OFF 실측: 55K 프리필 fetch 1건이 57.6K 풀의
+            # 95% 점유).  env 하한으로 분리한다(풀은 KV 예산 밖 VRAM).
+            _min_tok = int(os.environ.get(
+                "LMCACHE_STAGING_MIN_TOKENS", "0") or 0)
+            _eff_elems = self.elements_per_layer
+            if _min_tok > 0 and self.tokens_per_layer > 0:
+                _per_tok = self.elements_per_layer // self.tokens_per_layer
+                _eff_elems = max(
+                    self.elements_per_layer, _min_tok * _per_tok)
+            gpu_buffer_size = _eff_elems * self.element_size
             self.gpu_buffer_allocator = GPUMemoryAllocator(
                 gpu_buffer_size, device=self.device
             )
