@@ -1295,10 +1295,13 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             allocated_bytes // per_token_bytes if per_token_bytes else 0
         )
         pool_tokens = pool_bytes // per_token_bytes if per_token_bytes else 0
+        import builtins as _sa_b
+        _sa_b._sa_staging_physical_allocated_tokens = allocated_tokens
+        _sa_b._sa_staging_physical_pool_tokens = pool_tokens
         logger.info(
             "[SpecAgent][STAGING-PHYSICAL] action=%s kind=%s tokens=%d "
             "success=%s allocated_tokens=%d pool_tokens=%d active=%d "
-            "pending_load_plans=%d pending_store_frees=%d",
+            "pending_load_plans=%d pending_store_frees=%d mono=%.6f",
             action,
             kind,
             int(num_tokens),
@@ -1308,6 +1311,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             int(getattr(allocator, "num_active_allocations", 0) or 0),
             len(self._specagent_pending_deferred_plans),
             len(self._specagent_pending_store_buffer_frees),
+            time.monotonic(),
         )
 
     def specagent_has_deferred_layer(
