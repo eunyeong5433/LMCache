@@ -1259,6 +1259,57 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
 
+    def _specagent_log_staging_physical(
+        self,
+        action: str,
+        kind: str,
+        num_tokens: int,
+        success: bool = True,
+    ) -> None:
+        """Log actual staging-pool ownership without changing allocation.
+
+        Scheduler reservations finish with their model futures, while a
+        layerwise CUDA copy may retain its temporary allocation longer.  This
+        opt-in trace exposes that lifetime gap so defer decisions can be
+        audited against physical capacity rather than inferred from the
+        scheduler ledger.
+        """
+        if not os.environ.get("LMCACHE_ALLOC_TRACE"):
+            return
+        gpu_allocator = self.gpu_buffer_allocator
+        allocator = getattr(gpu_allocator, "allocator", None)
+        address_manager = getattr(allocator, "address_manager", None)
+        allocated_bytes = int(getattr(
+            address_manager, "total_allocated_size", 0,
+        ) or 0)
+        pool_bytes = int(getattr(
+            address_manager, "_size", 0,
+        ) or 0)
+        if pool_bytes <= 0:
+            buffer = getattr(allocator, "buffer", None)
+            pool_bytes = int(buffer.numel()) if buffer is not None else 0
+        per_token_bytes = int(self.hidden_dim_size) * int(self.element_size)
+        if not self.use_mla:
+            per_token_bytes *= 2
+        allocated_tokens = (
+            allocated_bytes // per_token_bytes if per_token_bytes else 0
+        )
+        pool_tokens = pool_bytes // per_token_bytes if per_token_bytes else 0
+        logger.info(
+            "[SpecAgent][STAGING-PHYSICAL] action=%s kind=%s tokens=%d "
+            "success=%s allocated_tokens=%d pool_tokens=%d active=%d "
+            "pending_load_plans=%d pending_store_frees=%d",
+            action,
+            kind,
+            int(num_tokens),
+            bool(success),
+            allocated_tokens,
+            pool_tokens,
+            int(getattr(allocator, "num_active_allocations", 0) or 0),
+            len(self._specagent_pending_deferred_plans),
+            len(self._specagent_pending_store_buffer_frees),
+        )
+
     def specagent_has_deferred_layer(
         self,
         layer_id: int,
@@ -1293,7 +1344,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 for pending_plan in pending_plans:
                     release_obj = pending_plan.get("release_obj")
                     if release_obj is not None:
+                        release_tokens = int(release_obj.tensor.shape[0])
                         release_obj.ref_count_down()
+                        self._specagent_log_staging_physical(
+                            "free", "load", release_tokens,
+                        )
             else:
                 still_pending.append((event, pending_plans))
         self._specagent_pending_deferred_plans = still_pending
@@ -1532,7 +1587,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         pending: list[tuple[torch.cuda.Event, MemoryObj]] = []
         for event, memory_obj in self._specagent_pending_store_buffer_frees:
             if event.query():
+                release_tokens = int(memory_obj.tensor.shape[0])
                 memory_obj.ref_count_down()
+                self._specagent_log_staging_physical(
+                    "free", "store", release_tokens,
+                )
             else:
                 pending.append((event, memory_obj))
         self._specagent_pending_store_buffer_frees = pending
@@ -1547,7 +1606,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             return
         event, memory_obj = self._specagent_pending_store_buffer_frees.pop(0)
         event.synchronize()
+        release_tokens = int(memory_obj.tensor.shape[0])
         memory_obj.ref_count_down()
+        self._specagent_log_staging_physical(
+            "free_wait", "store", release_tokens,
+        )
         self._specagent_release_completed_store_buffers()
 
     @classmethod
@@ -1785,10 +1848,18 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
                 buffer_shape, self.dtype, MemoryFormat.KV_T2D
             )
+            self._specagent_log_staging_physical(
+                "alloc", "load", num_tokens,
+                success=tmp_gpu_buffer_obj is not None,
+            )
             if tmp_gpu_buffer_obj is None:
                 self._specagent_wait_one_store_buffer()
                 tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
                     buffer_shape, self.dtype, MemoryFormat.KV_T2D
+                )
+                self._specagent_log_staging_physical(
+                    "alloc_retry", "load", num_tokens,
+                    success=tmp_gpu_buffer_obj is not None,
                 )
             if tmp_gpu_buffer_obj is None:
                 # Transient exhaustion: concurrent verify fetches can briefly
@@ -2190,7 +2261,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         # free the buffer memory
         if tmp_gpu_buffer_obj is not None:
             if not defer_layer_submit:
+                release_tokens = int(tmp_gpu_buffer_obj.tensor.shape[0])
                 tmp_gpu_buffer_obj.ref_count_down()
+                self._specagent_log_staging_physical(
+                    "free", "load", release_tokens,
+                )
 
         logger.debug(f"Finished loading all {self.num_layers} layers.")
         yield
@@ -2277,10 +2352,18 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
                 buffer_shape, self.dtype, MemoryFormat.KV_T2D
             )
+            self._specagent_log_staging_physical(
+                "alloc", "store", num_tokens,
+                success=tmp_gpu_buffer_obj is not None,
+            )
             if tmp_gpu_buffer_obj is None:
                 self._specagent_wait_one_store_buffer()
                 tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
                     buffer_shape, self.dtype, MemoryFormat.KV_T2D
+                )
+                self._specagent_log_staging_physical(
+                    "alloc_retry", "store", num_tokens,
+                    success=tmp_gpu_buffer_obj is not None,
                 )
             if tmp_gpu_buffer_obj is None:
                 # Transient exhaustion: concurrent verify fetches can briefly
@@ -2391,7 +2474,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             if defer_tmp_buffer_free:
                 self._specagent_defer_store_buffer_free(tmp_gpu_buffer_obj)
             else:
+                release_tokens = int(tmp_gpu_buffer_obj.tensor.shape[0])
                 tmp_gpu_buffer_obj.ref_count_down()
+                self._specagent_log_staging_physical(
+                    "free", "store", release_tokens,
+                )
 
         yield
 
