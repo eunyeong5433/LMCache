@@ -1098,6 +1098,15 @@ class LMCacheConnectorV1Impl:
         self._specagent_join_prefetch_future()
         self._specagent_join_save_futures()
 
+        gpu_connector = getattr(
+            getattr(self, "lmcache_engine", None), "gpu_connector", None
+        )
+        reap_completed_staging = getattr(
+            gpu_connector, "specagent_reap_completed_staging", None
+        )
+        if callable(reap_completed_staging):
+            reap_completed_staging()
+
         if len(self.kv_caches) == 0:
             logger.warning(
                 "Please update LMCacheConnector, "

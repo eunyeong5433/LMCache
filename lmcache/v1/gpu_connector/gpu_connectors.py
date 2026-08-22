@@ -1616,6 +1616,17 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 pending.append((event, memory_obj))
         self._specagent_pending_store_buffer_frees = pending
 
+    def specagent_reap_completed_staging(self) -> None:
+        """Return completed asynchronous staging owners to the allocator.
+
+        This must run even on model steps that launch no new fetch. Otherwise
+        scheduler-side staging backpressure can prevent the next fetch from
+        entering the worker, which used to be the only place completed load
+        plans were reaped, creating a circular wait.
+        """
+        self._specagent_release_completed_store_buffers()
+        self.specagent_flush_deferred_layer(-1)
+
     def _specagent_defer_store_buffer_free(self, memory_obj: MemoryObj) -> None:
         with torch.cuda.stream(self.store_stream):
             event = _specagent_record_cuda_event(self.store_stream)
