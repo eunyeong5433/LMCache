@@ -1274,8 +1274,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         audited against physical capacity rather than inferred from the
         scheduler ledger.
         """
-        if not os.environ.get("LMCACHE_ALLOC_TRACE"):
-            return
+        trace_enabled = bool(os.environ.get("LMCACHE_ALLOC_TRACE"))
         gpu_allocator = self.gpu_buffer_allocator
         allocator = getattr(gpu_allocator, "allocator", None)
         address_manager = getattr(allocator, "address_manager", None)
@@ -1295,12 +1294,27 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             allocated_bytes // per_token_bytes if per_token_bytes else 0
         )
         pool_tokens = pool_bytes // per_token_bytes if per_token_bytes else 0
+        free_span_bytes = (
+            address_manager.free_block_sizes()
+            if address_manager is not None
+            and hasattr(address_manager, "free_block_sizes")
+            else []
+        )
+        free_span_tokens = [
+            int(size) // per_token_bytes
+            for size in free_span_bytes
+            if per_token_bytes and int(size) > 0
+        ]
         import builtins as _sa_b
         _sa_b._sa_staging_physical_allocated_tokens = allocated_tokens
         _sa_b._sa_staging_physical_pool_tokens = pool_tokens
+        _sa_b._sa_staging_physical_free_spans_tokens = free_span_tokens
+        if not trace_enabled:
+            return
         logger.info(
             "[SpecAgent][STAGING-PHYSICAL] action=%s kind=%s tokens=%d "
             "success=%s allocated_tokens=%d pool_tokens=%d active=%d "
+            "largest_free_tokens=%d free_spans=%s "
             "pending_load_plans=%d pending_store_frees=%d mono=%.6f",
             action,
             kind,
@@ -1309,6 +1323,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             allocated_tokens,
             pool_tokens,
             int(getattr(allocator, "num_active_allocations", 0) or 0),
+            max(free_span_tokens, default=0),
+            free_span_tokens,
             len(self._specagent_pending_deferred_plans),
             len(self._specagent_pending_store_buffer_frees),
             time.monotonic(),

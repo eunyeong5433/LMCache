@@ -1228,6 +1228,11 @@ class AddressManager:
         self.total_allocated_size -= size
 
     @synchronized("_lock")
+    def free_block_sizes(self) -> list[int]:
+        """Return an atomic snapshot of contiguous free-span sizes."""
+        return [int(block.size) for block in self._explicit_list]
+
+    @synchronized("_lock")
     def sbrk(self, size: int):
         """
         Expand the virtual address space by a given size.
