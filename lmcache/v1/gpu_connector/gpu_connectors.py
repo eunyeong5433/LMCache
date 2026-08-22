@@ -1330,6 +1330,48 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             time.monotonic(),
         )
 
+    @staticmethod
+    def _specagent_claim_pending_fetch_reservation(num_tokens: int) -> int:
+        """Transfer ownership from scheduler-pending to physical staging.
+
+        Reservations are submitted and executed FIFO by the uniprocess worker.
+        Claiming at successful allocation closes the submit/allocation race
+        without charging the staging pool until the much later model-future
+        completion.
+        """
+        requested = max(0, int(num_tokens))
+        if requested <= 0:
+            return 0
+        lock = getattr(builtins, "_sa_staging_reservation_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            builtins._sa_staging_reservation_lock = lock
+        claimed = 0
+        with lock:
+            entries = getattr(
+                builtins, "_sa_staging_pending_reservations", None
+            )
+            if not isinstance(entries, list):
+                return 0
+            left = requested
+            for entry in entries:
+                remaining = max(0, int(entry.get("remaining", 0) or 0))
+                if remaining <= 0:
+                    continue
+                take = min(left, remaining)
+                entry["remaining"] = remaining - take
+                claimed += take
+                left -= take
+                if left <= 0:
+                    break
+            builtins._sa_staging_inflight_fetch_tokens = max(
+                0,
+                int(getattr(
+                    builtins, "_sa_staging_inflight_fetch_tokens", 0
+                ) or 0) - claimed,
+            )
+        return claimed
+
     def specagent_has_deferred_layer(
         self,
         layer_id: int,
@@ -1917,6 +1959,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             assert tmp_gpu_buffer_obj is not None, (
                 "Failed to allocate GPU buffer in GPUConnector"
             )
+            self._specagent_claim_pending_fetch_reservation(num_tokens)
             assert tmp_gpu_buffer_obj.tensor is not None
 
         # foreach-alt: precompute layer-invariant dst views into the tmp buffer
