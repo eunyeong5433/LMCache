@@ -56,6 +56,14 @@ def test_chunked_token_database(chunk_length, save_unfull_chunk):
     for i in range(0, test_length // chunk_length):
         mask[: num_falses[i]] = False
         new_results = list(db.process_tokens(tokens=tokens, mask=mask))
+        known_prefix_results = list(
+            db.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                mask_num_falses=num_falses[i],
+            )
+        )
+        assert known_prefix_results == new_results
         assert len(new_results) == len(original_results) - i
 
         for j in range(len(new_results)):

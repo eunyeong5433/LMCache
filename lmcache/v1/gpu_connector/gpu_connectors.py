@@ -40,6 +40,34 @@ if torch.cuda.is_available():
 logger = init_logger(__name__)
 
 
+def _specagent_acquire_memory_obj_leases(
+    memory_objs: list[MemoryObj],
+) -> list[MemoryObj]:
+    """Hold each distinct CPU source until its CUDA consumer completes."""
+    leases: list[MemoryObj] = []
+    seen: set[int] = set()
+    try:
+        for memory_obj in memory_objs:
+            identity = id(memory_obj)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            memory_obj.ref_count_up()
+            leases.append(memory_obj)
+    except BaseException:
+        for memory_obj in reversed(leases):
+            memory_obj.ref_count_down()
+        raise
+    return leases
+
+
+def _specagent_release_memory_obj_leases(
+    memory_objs: list[MemoryObj],
+) -> None:
+    for memory_obj in memory_objs:
+        memory_obj.ref_count_down()
+
+
 def _specagent_record_cuda_event(
     stream: torch.cuda.Stream,
     *,
@@ -1255,6 +1283,17 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         self._specagent_pending_deferred_plans: list[
             tuple[torch.cuda.Event, list[dict]]
         ] = []
+        self._specagent_pending_fused_bw_profiles: list[
+            tuple[
+                int,
+                int,
+                int,
+                torch.cuda.Event,
+                torch.cuda.Event,
+                torch.cuda.Event,
+                torch.cuda.Event,
+            ]
+        ] = []
         self._specagent_fused_debug_checked_layers: set[int] = set()
 
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
@@ -1404,6 +1443,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 # temporary allocation to the last-layer plan.  Return it to
                 # the allocator only after the last GPU consumer has finished.
                 for pending_plan in pending_plans:
+                    _specagent_release_memory_obj_leases(
+                        pending_plan.get("source_lease_objs") or []
+                    )
                     release_obj = pending_plan.get("release_obj")
                     if release_obj is not None:
                         release_tokens = int(release_obj.tensor.shape[0])
@@ -1486,6 +1528,21 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             copy_srcs = [
                 src for plan in plans for src in plan["copy_srcs"]
             ]
+            profile_bw = bool(os.environ.get("SPECAGENT_BW_PROFILE"))
+            h2d_bytes = sum(
+                int(src.numel() * src.element_size()) for src in copy_srcs
+            )
+            scatter_bytes = sum(
+                int(plan["transfer_tensor"].numel())
+                * int(plan["transfer_tensor"].element_size())
+                for plan in plans
+            )
+            h2d_start = (
+                _specagent_record_cuda_event(
+                    self.load_stream, enable_timing=True
+                )
+                if profile_bw else None
+            )
             if copy_dsts:
                 if all(
                     _can_raw_h2d_copy(dst, src)
@@ -1503,19 +1560,53 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             plan["copy_srcs"],
                             non_blocking=True,
                         )
+            h2d_end = (
+                _specagent_record_cuda_event(
+                    self.load_stream, enable_timing=True
+                )
+                if profile_bw else None
+            )
 
             # H2D targets only the existing per-retriever temporary buffers,
             # so it can run while the current layer reads scratch.  Delay only
             # the writes into the two-slot scratch ring.
             if scratch_free_event is not None:
                 self.load_stream.wait_event(scratch_free_event)
+            scatter_start = (
+                _specagent_record_cuda_event(
+                    self.load_stream, enable_timing=True
+                )
+                if profile_bw else None
+            )
             lmc_ops.specagent_multi_scatter(
                 [plan["transfer_tensor"] for plan in plans],
                 [plan["target_kv_cache"] for plan in plans],
                 [plan["slot_mapping"] for plan in plans],
                 self.gpu_kv_format,
             )
+            scatter_end = (
+                _specagent_record_cuda_event(
+                    self.load_stream, enable_timing=True
+                )
+                if profile_bw else None
+            )
             ready = _specagent_record_cuda_event(self.load_stream)
+
+        if (
+            h2d_start is not None
+            and h2d_end is not None
+            and scatter_start is not None
+            and scatter_end is not None
+        ):
+            self._specagent_pending_fused_bw_profiles.append((
+                int(layer_id),
+                h2d_bytes,
+                scatter_bytes,
+                h2d_start,
+                h2d_end,
+                scatter_start,
+                scatter_end,
+            ))
 
         for plan in plans:
             events = plan["layer_events"]
@@ -1668,6 +1759,52 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         """
         self._specagent_release_completed_store_buffers()
         self.specagent_flush_deferred_layer(-1)
+        pending_profiles = []
+        for profile in self._specagent_pending_fused_bw_profiles:
+            (
+                layer_id,
+                h2d_bytes,
+                scatter_bytes,
+                h2d_start,
+                h2d_end,
+                scatter_start,
+                scatter_end,
+            ) = profile
+            if not scatter_end.query():
+                pending_profiles.append(profile)
+                continue
+            h2d_ms = float(h2d_start.elapsed_time(h2d_end))
+            scatter_ms = float(scatter_start.elapsed_time(scatter_end))
+            builtins._sa_fused_h2d_bytes = int(getattr(
+                builtins, "_sa_fused_h2d_bytes", 0
+            ) or 0) + h2d_bytes
+            builtins._sa_fused_h2d_ms = float(getattr(
+                builtins, "_sa_fused_h2d_ms", 0.0
+            ) or 0.0) + h2d_ms
+            builtins._sa_fused_scatter_bytes = int(getattr(
+                builtins, "_sa_fused_scatter_bytes", 0
+            ) or 0) + scatter_bytes
+            builtins._sa_fused_scatter_ms = float(getattr(
+                builtins, "_sa_fused_scatter_ms", 0.0
+            ) or 0.0) + scatter_ms
+            # This record is emitted only for the explicit bandwidth-profiling
+            # path.  Keep it visible with the normal ERROR-only experiment
+            # logging so unrelated LMCache INFO traffic cannot bury/truncate
+            # the CUDA-event measurements.
+            logger.error(
+                "[SpecAgent][LMC-FUSED-BW] layer=%d h2d_bytes=%d "
+                "h2d_ms=%.3f h2d_gbps=%.3f scatter_bytes=%d "
+                "scatter_ms=%.3f scatter_gbps=%.3f",
+                layer_id,
+                h2d_bytes,
+                h2d_ms,
+                h2d_bytes / h2d_ms / 1.0e6 if h2d_ms > 0 else 0.0,
+                scatter_bytes,
+                scatter_ms,
+                scatter_bytes / scatter_ms / 1.0e6
+                if scatter_ms > 0 else 0.0,
+            )
+        self._specagent_pending_fused_bw_profiles = pending_profiles
 
     def _specagent_defer_store_buffer_free(self, memory_obj: MemoryObj) -> None:
         with torch.cuda.stream(self.store_stream):
@@ -1820,6 +1957,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
+        profile_req_id = str(kwargs.get("req_id") or "unknown")
+        profile_requested_tokens = sum(
+            int(end) - int(start) for start, end in zip(
+                starts, ends, strict=False
+            )
+        )
         offset: int = int(kwargs.get("offset", 0) or 0)
         write_token_mask: Optional[torch.Tensor] = kwargs.get(
             "specagent_write_token_mask"
@@ -2026,11 +2169,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 logger.debug(f"Finished loading layer {layer_id - 1}")
 
             # memobj -> gpu_buffer -> kvcaches
-            prof_start = prof_end = None
+            prof_start = prof_h2d_end = prof_scatter_end = None
             prof_h2d_bytes = 0
             prof_gpu_copy_bytes = 0
-            if bw_profile:
-                prof_end = True
             with torch.cuda.stream(self.load_stream):
                 if bw_profile:
                     prof_start = _specagent_record_cuda_event(
@@ -2098,6 +2239,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                                     _copy_srcs,
                                     non_blocking=True,
                                 )
+                    if bw_profile and not defer_layer_submit:
+                        prof_h2d_end = _specagent_record_cuda_event(
+                            self.load_stream, enable_timing=True
+                        )
                     if bw_profile:
                         for _src in _fa_srcs:
                             prof_h2d_bytes += int(
@@ -2124,6 +2269,16 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     transfer_tensor = tmp_gpu_buffer_obj.tensor
                     transfer_slot_mapping = slot_mapping_full
                     if defer_layer_submit:
+                        # cache_engine releases the reference obtained from
+                        # batched_get as soon as this generator is drained.
+                        # Acquire a distinct CUDA-consumer lease before handing
+                        # the raw CPU tensor views to a deferred plan; release
+                        # it only after the plan's ready event completes.
+                        source_lease_objs = (
+                            _specagent_acquire_memory_obj_leases(
+                                list(memory_objs_layer)
+                            )
+                        )
                         self._specagent_deferred_layer_fetches.setdefault(
                             int(layer_id), []
                         ).append({
@@ -2133,6 +2288,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             "target_kv_cache": kvcaches[layer_id],
                             "slot_mapping": transfer_slot_mapping,
                             "layer_events": specagent_layer_events,
+                            "source_lease_objs": source_lease_objs,
                             "release_obj": (
                                 tmp_gpu_buffer_obj
                                 if layer_id == self.num_layers - 1
@@ -2151,6 +2307,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                                 lmc_ops.TransferDirection.H2D,
                                 self.gpu_kv_format,
                                 token_major=True,
+                            )
+                        if bw_profile:
+                            prof_scatter_end = _specagent_record_cuda_event(
+                                self.load_stream, enable_timing=True
                             )
                     if _hb:
                         _hb_xfer += _hbt.perf_counter() - _hb_c1
@@ -2258,10 +2418,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         "starts": [int(x) for x in starts],
                         "ends": [int(x) for x in ends],
                     }
-                if prof_end is not None:
-                    prof_end = _specagent_record_cuda_event(
-                        self.load_stream, enable_timing=True
-                    )
                 if (
                     isinstance(specagent_layer_events, list)
                     and not defer_layer_submit
@@ -2269,10 +2425,15 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     event = _specagent_record_cuda_event(self.load_stream)
                     if layer_id < len(specagent_layer_events):
                         specagent_layer_events[layer_id] = event
-            if bw_profile and prof_start is not None and prof_end is not None:
+            if (
+                bw_profile
+                and prof_start is not None
+                and prof_h2d_end is not None
+                and prof_scatter_end is not None
+            ):
                 bw_profile_records.append(
                     (layer_id, prof_h2d_bytes, prof_gpu_copy_bytes,
-                     prof_start, prof_end)
+                     prof_start, prof_h2d_end, prof_scatter_end)
                 )
         if _hb:
             logger.error(
@@ -2292,44 +2453,60 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         if bw_profile and bw_profile_records:
             total_h2d = 0
             total_gpu_copy = 0
-            total_ms = 0.0
+            total_h2d_ms = 0.0
+            total_scatter_ms = 0.0
             for (
                 layer_id,
                 h2d_bytes,
                 gpu_copy_bytes,
                 start_event,
-                end_event,
+                h2d_end_event,
+                scatter_end_event,
             ) in bw_profile_records:
-                end_event.synchronize()
-                elapsed_ms = float(start_event.elapsed_time(end_event))
+                scatter_end_event.synchronize()
+                h2d_ms = float(start_event.elapsed_time(h2d_end_event))
+                scatter_ms = float(
+                    h2d_end_event.elapsed_time(scatter_end_event)
+                )
                 total_h2d += h2d_bytes
                 total_gpu_copy += gpu_copy_bytes
-                total_ms += elapsed_ms
+                total_h2d_ms += h2d_ms
+                total_scatter_ms += scatter_ms
                 if layer_id < 4 or layer_id == self.num_layers - 1:
                     logger.info(
                         "[SpecAgent][LMC-BW] layer=%d h2d_bytes=%d "
-                        "gpu_copy_bytes=%d elapsed_ms=%.3f h2d_gbps=%.3f "
-                        "combined_gbps=%.3f",
+                        "h2d_ms=%.3f h2d_gbps=%.3f "
+                        "scatter_bytes=%d scatter_ms=%.3f "
+                        "scatter_gbps=%.3f",
                         layer_id,
                         h2d_bytes,
+                        h2d_ms,
+                        h2d_bytes / h2d_ms / 1.0e6
+                        if h2d_ms > 0 else 0.0,
                         gpu_copy_bytes,
-                        elapsed_ms,
-                        h2d_bytes / elapsed_ms / 1.0e6
-                        if elapsed_ms > 0 else 0.0,
-                        (h2d_bytes + gpu_copy_bytes) / elapsed_ms / 1.0e6
-                        if elapsed_ms > 0 else 0.0,
+                        scatter_ms,
+                        gpu_copy_bytes / scatter_ms / 1.0e6
+                        if scatter_ms > 0 else 0.0,
                     )
             logger.info(
-                "[SpecAgent][LMC-BW] summary layers=%d h2d_bytes=%d "
-                "gpu_copy_bytes=%d elapsed_ms_sum=%.3f h2d_gbps=%.3f "
-                "combined_gbps=%.3f",
+                "[SpecAgent][LMC-BW] summary req=%s requested_tokens=%d "
+                "transfer_tokens=%d chunks=%d layers=%d h2d_bytes=%d "
+                "h2d_ms_sum=%.3f h2d_gbps=%.3f "
+                "scatter_bytes=%d scatter_ms_sum=%.3f "
+                "scatter_gbps=%.3f",
+                profile_req_id,
+                profile_requested_tokens,
+                num_tokens,
+                len(starts),
                 len(bw_profile_records),
                 total_h2d,
+                total_h2d_ms,
+                total_h2d / total_h2d_ms / 1.0e6
+                if total_h2d_ms > 0 else 0.0,
                 total_gpu_copy,
-                total_ms,
-                total_h2d / total_ms / 1.0e6 if total_ms > 0 else 0.0,
-                (total_h2d + total_gpu_copy) / total_ms / 1.0e6
-                if total_ms > 0 else 0.0,
+                total_scatter_ms,
+                total_gpu_copy / total_scatter_ms / 1.0e6
+                if total_scatter_ms > 0 else 0.0,
             )
 
         # free the buffer memory

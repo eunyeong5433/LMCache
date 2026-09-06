@@ -17,9 +17,14 @@ from lmcache.utils import (
     mock_up_broadcast_fn,
     mock_up_broadcast_object_fn,
 )
-from lmcache.v1.cache_engine import LMCacheEngineBuilder
+from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventStatus, EventType
+from lmcache.v1.gpu_connector.gpu_connectors import (
+    _specagent_acquire_memory_obj_leases,
+    _specagent_release_memory_obj_leases,
+)
+from lmcache.v1.token_database import ChunkedTokenDatabase
 
 # Local
 from .utils import (
@@ -49,6 +54,192 @@ def get_expected_count(token_len, save_unfull_chunk, chunk_size):
     if save_unfull_chunk:
         return token_len
     return (token_len // chunk_size) * chunk_size
+
+
+def test_specagent_memory_obj_lease_balances_distinct_sources():
+    """A deferred CUDA plan holds one ref per distinct CPU MemoryObj."""
+
+    class FakeMemoryObj:
+        def __init__(self):
+            self.ref_count = 1
+
+        def ref_count_up(self):
+            self.ref_count += 1
+
+        def ref_count_down(self):
+            self.ref_count -= 1
+
+    first = FakeMemoryObj()
+    second = FakeMemoryObj()
+    leases = _specagent_acquire_memory_obj_leases(
+        [first, first, second]
+    )
+    assert leases == [first, second]
+    assert (first.ref_count, second.ref_count) == (2, 2)
+
+    _specagent_release_memory_obj_leases(leases)
+    assert (first.ref_count, second.ref_count) == (1, 1)
+
+
+def test_plan_sparse_layerwise_chunks_matches_independent_plans():
+    """A shared prefix scan must preserve each segment's exact chunk keys."""
+    config = LMCacheEngineConfig.from_legacy(
+        chunk_size=4,
+        backend="cpu",
+        save_unfull_chunk=True,
+    )
+    token_database = ChunkedTokenDatabase(config, dumb_metadata())
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.token_database = token_database
+    tokens = list(range(21))
+    segments = [(4, 8), (12, 21)]
+
+    shared_plans = engine.plan_sparse_layerwise_chunks(tokens, segments)
+
+    for shared_plan, (start, end) in zip(
+        shared_plans, segments, strict=True
+    ):
+        mask = torch.ones(end, dtype=torch.bool)
+        mask[:start] = False
+        independent_plan = list(
+            token_database.process_tokens(tokens=tokens[:end], mask=mask)
+        )
+        assert shared_plan == independent_plan
+
+
+def test_bulk_validate_sparse_layerwise_plan_uses_one_contains_call():
+    """A complete single-backend plan should validate in one bulk lookup."""
+    config = LMCacheEngineConfig.from_legacy(
+        chunk_size=4,
+        backend="cpu",
+        save_unfull_chunk=True,
+    )
+    token_database = ChunkedTokenDatabase(config, dumb_metadata())
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.token_database = token_database
+    engine.num_layers = 3
+    plans = engine.plan_sparse_layerwise_chunks(
+        list(range(21)), [(4, 8), (12, 20)]
+    )
+    flat_count = sum(len(plan) for plan in plans) * engine.num_layers
+
+    class CompleteStorage:
+        def __init__(self):
+            self.calls = 0
+
+        def batched_contains(self, keys, _locations):
+            self.calls += 1
+            assert len(keys) == flat_count
+            return len(keys), {"LocalCPUBackend": keys}
+
+    storage = CompleteStorage()
+    engine.storage_manager = storage
+
+    validated = engine.bulk_validate_sparse_layerwise_plan(plans)
+
+    assert validated is not None
+    starts, ends, keys, location = validated
+    assert starts == [4, 12, 16]
+    assert ends == [8, 16, 20]
+    assert len(keys) == 3
+    assert all(len(layer_keys) == engine.num_layers for layer_keys in keys)
+    assert location == "LocalCPUBackend"
+    assert storage.calls == 1
+
+
+def test_bulk_validate_sparse_layerwise_plan_rejects_partial_hit():
+    """A partial bulk hit must fall back instead of accepting missing KV."""
+    config = LMCacheEngineConfig.from_legacy(
+        chunk_size=4,
+        backend="cpu",
+        save_unfull_chunk=True,
+    )
+    token_database = ChunkedTokenDatabase(config, dumb_metadata())
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.token_database = token_database
+    engine.num_layers = 3
+    plans = engine.plan_sparse_layerwise_chunks(
+        list(range(12)), [(4, 12)]
+    )
+
+    class PartialStorage:
+        def batched_contains(self, keys, _locations):
+            return len(keys) - 1, {"LocalCPUBackend": keys[:-1]}
+
+    engine.storage_manager = PartialStorage()
+
+    assert engine.bulk_validate_sparse_layerwise_plan(plans) is None
+
+
+def test_prepare_sparse_layerwise_plans_partitions_and_balances_refs():
+    """CPU prepare is equivalent by segment and has explicit lease owners."""
+    config = LMCacheEngineConfig.from_legacy(
+        chunk_size=4,
+        backend="cpu",
+        save_unfull_chunk=True,
+    )
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.token_database = ChunkedTokenDatabase(config, dumb_metadata())
+    engine.num_layers = 3
+    engine.retrieve_locations = None
+    plans = engine.plan_sparse_layerwise_chunks(
+        list(range(21)), [(4, 8), (12, 20)]
+    )
+
+    class FakeMemoryObj:
+        def __init__(self):
+            self.ref_count = 1
+
+        def ref_count_up(self):
+            self.ref_count += 1
+
+        def ref_count_down(self):
+            self.ref_count -= 1
+
+    all_keys = [
+        layer_key
+        for plan in plans
+        for _, _, key in plan
+        for layer_key in key.split_layers(engine.num_layers)
+    ]
+    objects = {key: FakeMemoryObj() for key in all_keys}
+
+    class Backend:
+        def __init__(self):
+            self.calls = 0
+
+        def batched_get_blocking(self, keys):
+            self.calls += 1
+            result = [objects[key] for key in keys]
+            for obj in result:
+                obj.ref_count_up()
+            return result
+
+    backend = Backend()
+
+    class Storage:
+        storage_backends = {"LocalCPUBackend": backend}
+
+        def batched_contains(self, keys, _locations):
+            return len(keys), {"LocalCPUBackend": keys}
+
+    engine.storage_manager = Storage()
+    prepared = engine.prepare_sparse_layerwise_plans(plans)
+
+    assert prepared is not None
+    assert backend.calls == engine.num_layers
+    first = prepared.claim(0)
+    assert first.starts == [4]
+    assert first.ends == [8]
+    assert [len(layer) for layer in first.memory_objs_by_layer] == [1, 1, 1]
+
+    # The consumer releases its claimed segment; the batch releases only the
+    # segment that was never claimed (e.g. because a request was cancelled).
+    for layer in first.memory_objs_by_layer:
+        for obj in layer:
+            obj.ref_count_down()
+    prepared.release_unclaimed()
+    assert all(obj.ref_count == 1 for obj in objects.values())
 
 
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])

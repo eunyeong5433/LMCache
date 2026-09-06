@@ -2,6 +2,7 @@
 # Standard
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import builtins
@@ -46,7 +47,10 @@ from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
-from lmcache.v1.cache_engine import LMCacheEngine
+from lmcache.v1.cache_engine import (
+    LMCacheEngine,
+    SpecAgentProgressiveLayerwiseBatch,
+)
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
@@ -827,6 +831,16 @@ class LMCacheConnectorV1Impl:
                 thread_name_prefix="specagent-kv-prefetch",
             )
         )
+        # CPU-only membership lookup and MemoryObj resolution.  Keep this
+        # separate from the layer producer: that producer may run CUDA work,
+        # while this executor must remain CUDA-free and may be awaited by it.
+        self._specagent_cpu_prepare_executor: ThreadPoolExecutor | None = (
+            None if role == KVConnectorRole.SCHEDULER
+            else ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="specagent-cpu-prepare",
+            )
+        )
         self._specagent_async_save_this_step = False
         self._specagent_save_executor: ThreadPoolExecutor | None = (
             None if role == KVConnectorRole.SCHEDULER
@@ -1094,9 +1108,17 @@ class LMCacheConnectorV1Impl:
             The number of elements in kv_caches and layer_names should be
             the same.
         """
+        detailed_nvtx = bool(
+            os.environ.get("SPECAGENT_DETAILED_RETRIEVE_NVTX")
+        )
+        detail_record = (
+            record_function_or_nullcontext if detailed_nvtx else nullcontext
+        )
         self.current_layer = 0
-        self._specagent_join_prefetch_future()
-        self._specagent_join_save_futures()
+        with detail_record("lmcache adapter detail: join_prefetch_future"):
+            self._specagent_join_prefetch_future()
+        with detail_record("lmcache adapter detail: join_save_futures"):
+            self._specagent_join_save_futures()
 
         gpu_connector = getattr(
             getattr(self, "lmcache_engine", None), "gpu_connector", None
@@ -1105,7 +1127,8 @@ class LMCacheConnectorV1Impl:
             gpu_connector, "specagent_reap_completed_staging", None
         )
         if callable(reap_completed_staging):
-            reap_completed_staging()
+            with detail_record("lmcache adapter detail: reap_staging"):
+                reap_completed_staging()
 
         if len(self.kv_caches) == 0:
             logger.warning(
@@ -1274,6 +1297,11 @@ class LMCacheConnectorV1Impl:
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             if use_specagent_sparse_mask:
+                segment_plan_context = detail_record(
+                    "lmcache adapter detail: sparse_segment_plan "
+                    f"req={request.req_id} tokens={len(tokens)}"
+                )
+                segment_plan_context.__enter__()
                 clipped_ranges = []
                 for start, end in sa_fetch_token_ranges.get(request.req_id, []):
                     start = max(0, int(start))
@@ -1333,6 +1361,7 @@ class LMCacheConnectorV1Impl:
                 fetch_tokens = sum(
                     end - start for start, end in effective_chunk_segments
                 )
+                segment_plan_context.__exit__(None, None, None)
                 if sa_verbose:
                     logger.info(
                         "[SpecAgent][FETCH-MASK] req=%s fetch_reason=%s "
@@ -1360,35 +1389,124 @@ class LMCacheConnectorV1Impl:
                             lmcache_cached_tokens,
                         )
                     continue
-                saved_chunk_store = _specagent_cpu_saved_chunk_store()
-                prefix_hash_by_chunk_end: dict[int, int] = {}
-                hash_tokens_tuple = tuple(int(t) for t in tokens)
 
-                def chunk_prefix_hash(chunk_end: int) -> int:
-                    cached = prefix_hash_by_chunk_end.get(chunk_end)
-                    if cached is None:
-                        cached = hash(hash_tokens_tuple[:chunk_end])
-                        prefix_hash_by_chunk_end[chunk_end] = cached
-                    return cached
+                shared_chunk_plans = None
+                cpu_prepare_future: Any = None
+                if self.use_layerwise:
+                    with detail_record(
+                        "lmcache adapter detail: shared_sparse_chunk_plan "
+                        f"req={request.req_id} tokens={len(tokens)} "
+                        f"segments={len(effective_chunk_segments)}"
+                    ):
+                        shared_chunk_plans = (
+                            self.lmcache_engine.plan_sparse_layerwise_chunks(
+                                tokens,
+                                effective_chunk_segments,
+                                request.request_configs,
+                            )
+                        )
+                    cpu_prepare_executor = (
+                        self._specagent_cpu_prepare_executor
+                    )
+                    if (
+                        sa_full_plan_fetch
+                        and shared_chunk_plans
+                        and cpu_prepare_executor is not None
+                        and not _specagent_env_true(
+                            "SPECAGENT_DISABLE_ASYNC_CPU_PREPARE"
+                        )
+                    ):
+                        with detail_record(
+                            "lmcache adapter detail: submit_cpu_prepare "
+                            f"req={request.req_id} "
+                            f"segments={len(shared_chunk_plans)}"
+                        ):
+                            if _specagent_env_true(
+                                "SPECAGENT_PROGRESSIVE_CPU_PREPARE"
+                            ):
+                                builtins._specagent_progressive_batches = (
+                                    getattr(
+                                        builtins,
+                                        "_specagent_progressive_batches",
+                                        0,
+                                    )
+                                    + 1
+                                )
+                                progressive_batch = (
+                                    SpecAgentProgressiveLayerwiseBatch(
+                                        len(shared_chunk_plans)
+                                    )
+                                )
+                                cpu_prepare_executor.submit(
+                                    self.lmcache_engine
+                                    .prepare_sparse_layerwise_plans_progressive,
+                                    shared_chunk_plans,
+                                    progressive_batch,
+                                )
+                                cpu_prepare_future = progressive_batch
+                            else:
+                                cpu_prepare_future = cpu_prepare_executor.submit(
+                                    self.lmcache_engine
+                                    .prepare_sparse_layerwise_plans,
+                                    shared_chunk_plans,
+                                )
+
+                # The storage lookup below is the authoritative proof: it
+                # derives LMCache's chained keys and requires every requested
+                # layer/chunk to exist. Keep the old Python tuple-prefix
+                # ledger scan only as an opt-in diagnostic. It duplicates the
+                # lookup and is O(N^2) for long contexts.
+                verify_legacy_save_proof = _specagent_env_true(
+                    "SPECAGENT_VERIFY_LEGACY_SAVE_PROOF"
+                )
+                saved_chunk_store = None
+                prefix_hash_by_chunk_end: dict[int, int] = {}
+                hash_tokens_tuple: tuple[int, ...] = ()
+                if verify_legacy_save_proof:
+                    saved_chunk_store = _specagent_cpu_saved_chunk_store()
+                    with detail_record(
+                        "lmcache adapter detail: proof_tokens_tuple "
+                        f"req={request.req_id} tokens={len(tokens)}"
+                    ):
+                        hash_tokens_tuple = tuple(int(t) for t in tokens)
 
                 for seg_i, (seg_start, seg_end) in enumerate(
                     effective_chunk_segments
                 ):
                     never_saved_chunks = []
-                    for chunk_end in range(
-                        seg_start + self._lmcache_chunk_size,
-                        seg_end + 1,
-                        self._lmcache_chunk_size,
-                    ):
-                        token_hash = chunk_prefix_hash(chunk_end)
-                        if (chunk_end, token_hash) not in saved_chunk_store:
-                            never_saved_chunks.append(
-                                (
-                                    chunk_end - self._lmcache_chunk_size,
-                                    chunk_end,
+                    if verify_legacy_save_proof:
+                        assert saved_chunk_store is not None
+                        with detail_record(
+                            "lmcache adapter detail: saved_proof_scan "
+                            f"req={request.req_id} seg={seg_start}-{seg_end}"
+                        ):
+                            for chunk_end in range(
+                                seg_start + self._lmcache_chunk_size,
+                                seg_end + 1,
+                                self._lmcache_chunk_size,
+                            ):
+                                token_hash = prefix_hash_by_chunk_end.get(
+                                    chunk_end
                                 )
-                            )
-                    if never_saved_chunks:
+                                if token_hash is None:
+                                    token_hash = hash(
+                                        hash_tokens_tuple[:chunk_end]
+                                    )
+                                    prefix_hash_by_chunk_end[chunk_end] = (
+                                        token_hash
+                                    )
+                                if (
+                                    (chunk_end, token_hash)
+                                    not in saved_chunk_store
+                                ):
+                                    never_saved_chunks.append(
+                                        (
+                                            chunk_end
+                                            - self._lmcache_chunk_size,
+                                            chunk_end,
+                                        )
+                                    )
+                    if verify_legacy_save_proof and never_saved_chunks:
                         raise RuntimeError(
                             "[SpecAgent][FETCH-UNAVAILABLE] req=%s "
                             "fetch_reason=%s segment=[%d,%d) "
@@ -1404,8 +1522,12 @@ class LMCacheConnectorV1Impl:
                                 never_saved_chunks,
                             )
                         )
-                    seg_token_mask = torch.ones(seg_end, dtype=torch.bool)
-                    seg_token_mask[:seg_start] = False
+                    seg_token_mask = None
+                    if not self.use_layerwise:
+                        seg_token_mask = torch.ones(
+                            seg_end, dtype=torch.bool
+                        )
+                        seg_token_mask[:seg_start] = False
                     num_expected_tokens = seg_end - seg_start
                     expected_mib = (
                         num_expected_tokens
@@ -1474,10 +1596,19 @@ class LMCacheConnectorV1Impl:
                                     specagent_write_token_mask
                                 ),
                                 specagent_expected_tokens=num_expected_tokens,
+                                specagent_prefix_tokens=seg_start,
+                                specagent_chunk_plan=(
+                                    shared_chunk_plans[seg_i]
+                                    if shared_chunk_plans is not None else None
+                                ),
                                 specagent_cpu_prefetch_ahead_layers=(
                                     sa_cpu_prefetch_ahead_layers
                                 ),
                                 specagent_full_plan_fetch=sa_full_plan_fetch,
+                                specagent_prepared_plan_future=(
+                                    cpu_prepare_future
+                                ),
+                                specagent_prepared_segment_index=seg_i,
                             )
                         # The first generator step performs the expensive
                         # token/chunk lookup and submits CPU get work.  Let
@@ -1515,6 +1646,7 @@ class LMCacheConnectorV1Impl:
                             "dst_blocks": sa_fetch_paged_blocks,
                         })
                     else:
+                        assert seg_token_mask is not None
                         sa_retrieve_mask = seg_token_mask
                         if specagent_write_token_mask is not None:
                             # Non-layerwise retrieve() has no separate write
@@ -2413,6 +2545,15 @@ class LMCacheConnectorV1Impl:
             (group_id + 1) * group_size - 1,
             self.num_layers - 1,
         )
+        if (
+            attention_done_event is not None
+            and requested_layer < group_end_layer
+        ):
+            # A grouped scratch slot is not reusable until the last attention
+            # in the group has consumed it.  Earlier layers therefore cannot
+            # advance the parity-ring producer; avoiding their no-op requests
+            # also removes one Python callback from every non-boundary layer.
+            return
         next_group_end_layer = min(
             (group_id + 2) * group_size - 1,
             self.num_layers - 1,
@@ -2602,7 +2743,7 @@ class LMCacheConnectorV1Impl:
                     elif hasattr(final_ret, "item"):
                         final_tokens = int(final_ret.item())
                     else:
-                        final_tokens = 0
+                        final_tokens = int(final_ret)
                     expected_tokens = int(meta.get("expected_tokens") or 0)
                     if final_tokens < expected_tokens:
                         raise RuntimeError(
@@ -2684,6 +2825,8 @@ class LMCacheConnectorV1Impl:
                     final_ret.sum().item()
                     if final_ret is not None and hasattr(final_ret, "sum") else 0
                 )
+                if final_ret is not None and not hasattr(final_ret, "sum"):
+                    num_retrieved_tokens = int(final_ret)
                 if _specagent_env_true("SPECAGENT_BW_PROFILE"):
                     logger.info("Retrieved %d tokens", num_retrieved_tokens)
                 continue
@@ -3591,6 +3734,10 @@ class LMCacheConnectorV1Impl:
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
             self._specagent_prefetch_executor = None
+        cpu_prepare_executor = self._specagent_cpu_prepare_executor
+        if cpu_prepare_executor is not None:
+            cpu_prepare_executor.shutdown(wait=False, cancel_futures=True)
+            self._specagent_cpu_prepare_executor = None
         self._manager.stop_services()
 
     ###################

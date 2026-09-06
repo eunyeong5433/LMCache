@@ -3,6 +3,7 @@
 from collections import defaultdict
 from collections.abc import Iterable
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -25,6 +26,7 @@ import builtins
 import gc
 import multiprocessing
 import os
+import threading
 import time
 
 # Third Party
@@ -68,6 +70,203 @@ from lmcache.v1.token_database import (
 logger = init_logger(__name__)
 
 _SPECAGENT_LIVE_PROBE_LOG_LIMIT = 20
+
+
+@dataclass
+class SpecAgentPreparedLayerwiseSegment:
+    """CPU-only sparse retrieval plan whose MemoryObj refs are leased."""
+
+    starts: list[int]
+    ends: list[int]
+    keys_by_chunk: list[list[CacheEngineKey]]
+    location: str
+    memory_objs_by_layer: list[list[MemoryObj]]
+
+
+class SpecAgentPreparedLayerwiseBatch:
+    """Own prepared segment leases until each consumer claims them.
+
+    ``batched_get_blocking`` increments MemoryObj reference counts.  A segment
+    transfers those references to ``retrieve_layer`` exactly once via
+    :meth:`claim`; any unclaimed segment is released by the batch owner.
+    """
+
+    def __init__(
+        self, segments: list[SpecAgentPreparedLayerwiseSegment]
+    ) -> None:
+        self._segments: list[Optional[SpecAgentPreparedLayerwiseSegment]] = (
+            list(segments)
+        )
+        self._lock = threading.Lock()
+
+    def claim(self, index: int) -> SpecAgentPreparedLayerwiseSegment:
+        with self._lock:
+            segment = self._segments[index]
+            if segment is None:
+                raise RuntimeError(
+                    f"SpecAgent prepared segment {index} was already claimed"
+                )
+            self._segments[index] = None
+            return segment
+
+    def release_unclaimed(self) -> None:
+        with self._lock:
+            segments = [seg for seg in self._segments if seg is not None]
+            self._segments = [None] * len(self._segments)
+        for segment in segments:
+            for mem_objs_layer in segment.memory_objs_by_layer:
+                for mem_obj in mem_objs_layer:
+                    mem_obj.ref_count_down()
+
+    def __del__(self) -> None:
+        try:
+            self.release_unclaimed()
+        except Exception:
+            # Destructors must remain best-effort during interpreter teardown.
+            pass
+
+
+class SpecAgentProgressiveLayerwiseSegment:
+    """Layerwise plan whose MemoryObj leases are published incrementally."""
+
+    def __init__(
+        self,
+        *,
+        starts: list[int],
+        ends: list[int],
+        keys_by_chunk: list[list[CacheEngineKey]],
+        location: str,
+        num_layers: int,
+    ) -> None:
+        self.starts = starts
+        self.ends = ends
+        self.keys_by_chunk = keys_by_chunk
+        self.location = location
+        self._layers: list[Optional[list[MemoryObj]]] = [None] * num_layers
+        self._condition = threading.Condition()
+        self._error: Optional[BaseException] = None
+        self._released = False
+
+    def publish(self, layer_id: int, memory_objs: list[MemoryObj]) -> None:
+        release_now = False
+        with self._condition:
+            if self._released:
+                release_now = True
+            else:
+                self._layers[layer_id] = memory_objs
+                self._condition.notify_all()
+        if release_now:
+            for mem_obj in memory_objs:
+                mem_obj.ref_count_down()
+
+    def fail(self, error: BaseException) -> None:
+        with self._condition:
+            self._error = error
+            self._condition.notify_all()
+
+    def take_layer(self, layer_id: int) -> list[MemoryObj]:
+        with self._condition:
+            self._condition.wait_for(
+                lambda: (
+                    self._layers[layer_id] is not None
+                    or self._error is not None
+                    or self._released
+                )
+            )
+            if self._error is not None:
+                raise self._error
+            if self._released:
+                raise RuntimeError("SpecAgent progressive plan was released")
+            memory_objs = self._layers[layer_id]
+            assert memory_objs is not None
+            self._layers[layer_id] = None
+            return memory_objs
+
+    def release_pending(self) -> None:
+        with self._condition:
+            self._released = True
+            pending = [row for row in self._layers if row is not None]
+            self._layers = [None] * len(self._layers)
+            self._condition.notify_all()
+        for row in pending:
+            for mem_obj in row:
+                mem_obj.ref_count_down()
+
+    def __del__(self) -> None:
+        try:
+            self.release_pending()
+        except Exception:
+            pass
+
+
+class SpecAgentProgressiveLayerwiseBatch:
+    """Shared handle published before all layer MemoryObjs are resolved."""
+
+    def __init__(self, num_segments: int) -> None:
+        self._segments: Optional[
+            list[Optional[SpecAgentProgressiveLayerwiseSegment]]
+        ] = None
+        self._num_segments = num_segments
+        self._condition = threading.Condition()
+        self._error: Optional[BaseException] = None
+
+    def publish_segments(
+        self, segments: list[SpecAgentProgressiveLayerwiseSegment]
+    ) -> None:
+        if len(segments) != self._num_segments:
+            raise ValueError("progressive segment count mismatch")
+        with self._condition:
+            self._segments = list(segments)
+            self._condition.notify_all()
+
+    def publish_unavailable(self) -> None:
+        with self._condition:
+            self._segments = []
+            self._condition.notify_all()
+
+    def fail(self, error: BaseException) -> None:
+        with self._condition:
+            self._error = error
+            segments = list(self._segments or [])
+            self._condition.notify_all()
+        for segment in segments:
+            if segment is not None:
+                segment.fail(error)
+
+    def claim(
+        self, index: int
+    ) -> Optional[SpecAgentProgressiveLayerwiseSegment]:
+        with self._condition:
+            self._condition.wait_for(
+                lambda: self._segments is not None or self._error is not None
+            )
+            if self._error is not None:
+                raise self._error
+            assert self._segments is not None
+            if not self._segments:
+                return None
+            segment = self._segments[index]
+            if segment is None:
+                raise RuntimeError(
+                    f"SpecAgent progressive segment {index} was already claimed"
+                )
+            self._segments[index] = None
+            return segment
+
+    def release_unclaimed(self) -> None:
+        with self._condition:
+            segments = list(self._segments or [])
+            if self._segments is not None:
+                self._segments = [None] * len(self._segments)
+        for segment in segments:
+            if segment is not None:
+                segment.release_pending()
+
+    def __del__(self) -> None:
+        try:
+            self.release_unclaimed()
+        except Exception:
+            pass
 
 try:
     # vLLM exposes NVTX ranges only when profiling asks for them.  Keep a
@@ -1402,6 +1601,250 @@ class LMCacheEngine:
             )
         return ret_mask
 
+    def plan_sparse_layerwise_chunks(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        segments: Iterable[tuple[int, int]],
+        request_configs: Optional[dict] = None,
+    ) -> list[list[tuple[int, int, CacheEngineKey]]]:
+        """Build cache keys for multiple sparse retrieval segments once.
+
+        Args:
+            tokens: Complete token prefix containing every segment.
+            segments: Sorted, non-overlapping ``[start, end)`` token ranges.
+            request_configs: Optional request-specific cache-key inputs.
+        Returns:
+            One chunk plan per input segment. Each plan contains the same
+            ``(start, end, key)`` tuples that an independent prefix-masked
+            ``process_tokens`` call would produce.
+
+        Raises:
+            ValueError: If a segment is invalid, overlapping, or outside the
+                supplied token prefix.
+
+        Notes:
+            Prefix hashes are chained, so independently planning sparse
+            segments repeats all earlier hashing. This method performs one
+            linear prefix scan and partitions the resulting chunk keys.
+        """
+        normalized_segments = [(int(start), int(end)) for start, end in segments]
+        previous_end = 0
+        for index, (start, end) in enumerate(normalized_segments):
+            if start < 0 or start >= end or end > len(tokens):
+                raise ValueError(
+                    f"invalid sparse retrieval segment [{start}, {end})"
+                )
+            if index > 0 and start < previous_end:
+                raise ValueError("sparse retrieval segments must not overlap")
+            previous_end = end
+        if not normalized_segments:
+            return []
+
+        plans: list[list[tuple[int, int, CacheEngineKey]]] = [
+            [] for _ in normalized_segments
+        ]
+        segment_index = 0
+        max_end = normalized_segments[-1][1]
+        for start, end, key in self.token_database.process_tokens(
+            tokens=tokens[:max_end],
+            request_configs=request_configs,
+        ):
+            assert isinstance(key, CacheEngineKey)
+            while (
+                segment_index < len(normalized_segments)
+                and start >= normalized_segments[segment_index][1]
+            ):
+                segment_index += 1
+            if segment_index >= len(normalized_segments):
+                break
+            segment_start, segment_end = normalized_segments[segment_index]
+            if start >= segment_start and end <= segment_end:
+                plans[segment_index].append((start, end, key))
+        return plans
+
+    def bulk_validate_sparse_layerwise_plan(
+        self,
+        plans: list[list[tuple[int, int, CacheEngineKey]]],
+    ) -> Optional[
+        tuple[list[int], list[int], list[list[CacheEngineKey]], str]
+    ]:
+        """Validate a complete sparse layerwise plan with one storage lookup.
+
+        Args:
+            plans: Segment-partitioned base cache keys from
+                :meth:`plan_sparse_layerwise_chunks`.
+
+        Returns:
+            Chunk starts, ends, per-chunk layer keys, and the single backing
+            location when every layer key is present in one backend. Returns
+            ``None`` for partial or multi-backend plans so callers can use the
+            legacy chunk-by-chunk fallback.
+        """
+        starts: list[int] = []
+        ends: list[int] = []
+        keys_by_chunk: list[list[CacheEngineKey]] = []
+        flat_keys: list[CacheEngineKey] = []
+        for plan in plans:
+            for start, end, key in plan:
+                layer_keys = key.split_layers(self.num_layers)
+                starts.append(int(start))
+                ends.append(int(end))
+                keys_by_chunk.append(layer_keys)
+                flat_keys.extend(layer_keys)
+        if not flat_keys:
+            return None
+        hit_layers, block_mapping = self.storage_manager.batched_contains(
+            flat_keys,
+            getattr(self, "retrieve_locations", None),
+        )
+        if hit_layers != len(flat_keys) or len(block_mapping) != 1:
+            return None
+        return (
+            starts,
+            ends,
+            keys_by_chunk,
+            next(iter(block_mapping.keys())),
+        )
+
+    def prepare_sparse_layerwise_plans(
+        self,
+        plans: list[list[tuple[int, int, CacheEngineKey]]],
+    ) -> Optional[SpecAgentPreparedLayerwiseBatch]:
+        """Resolve a sparse plan entirely on CPU for later GPU consumption.
+
+        The worker performs the single membership query and resolves all
+        per-layer MemoryObjs.  It deliberately does not create CUDA events,
+        touch streams, or enqueue copies, so it is safe to run in a regular
+        Python executor while the model thread finishes request setup.
+        """
+        validated = self.bulk_validate_sparse_layerwise_plan(plans)
+        if validated is None:
+            return None
+        starts, ends, keys_by_chunk, location = validated
+        backend = self.storage_manager.storage_backends.get(location)
+        if backend is None or not hasattr(backend, "batched_get_blocking"):
+            return None
+
+        keys_layer_major = [
+            list(row) for row in zip(*keys_by_chunk, strict=False)
+        ]
+        resolved_layers: list[list[MemoryObj]] = []
+        try:
+            for layer_id, keys_layer in enumerate(keys_layer_major):
+                raw_layer = backend.batched_get_blocking(keys_layer)
+                acquired = [obj for obj in raw_layer if obj is not None]
+                if len(acquired) != len(keys_layer):
+                    # Include successful gets from this partial layer in the
+                    # rollback; each one already owns a reference.
+                    for mem_obj in acquired:
+                        mem_obj.ref_count_down()
+                    raise RuntimeError(
+                        "[SpecAgent][ASYNC-PREPARE] CPU MemoryObj missing "
+                        f"at layer={layer_id}: evicted between contains and "
+                        "resolve"
+                    )
+                resolved_layers.append(acquired)
+        except Exception:
+            for prior_layer in resolved_layers:
+                for mem_obj in prior_layer:
+                    mem_obj.ref_count_down()
+            raise
+
+        prepared_segments: list[SpecAgentPreparedLayerwiseSegment] = []
+        offset = 0
+        for plan in plans:
+            next_offset = offset + len(plan)
+            prepared_segments.append(
+                SpecAgentPreparedLayerwiseSegment(
+                    starts=starts[offset:next_offset],
+                    ends=ends[offset:next_offset],
+                    keys_by_chunk=keys_by_chunk[offset:next_offset],
+                    location=location,
+                    memory_objs_by_layer=[
+                        layer[offset:next_offset] for layer in resolved_layers
+                    ],
+                )
+            )
+            offset = next_offset
+        return SpecAgentPreparedLayerwiseBatch(prepared_segments)
+
+    def prepare_sparse_layerwise_plans_progressive(
+        self,
+        plans: list[list[tuple[int, int, CacheEngineKey]]],
+        batch: SpecAgentProgressiveLayerwiseBatch,
+    ) -> None:
+        """Resolve and publish CPU MemoryObjs one layer at a time.
+
+        Metadata becomes claimable immediately after the bulk membership
+        lookup.  Layer 0 is then exposed as soon as it is resolved while the
+        same CPU worker continues filling later layers, allowing that Python
+        work to overlap model execution.
+        """
+        segments: list[SpecAgentProgressiveLayerwiseSegment] = []
+        try:
+            validated = self.bulk_validate_sparse_layerwise_plan(plans)
+            if validated is None:
+                batch.publish_unavailable()
+                return
+            starts, ends, keys_by_chunk, location = validated
+            backend = self.storage_manager.storage_backends.get(location)
+            if backend is None or not hasattr(backend, "batched_get_blocking"):
+                batch.publish_unavailable()
+                return
+
+            offset = 0
+            for plan in plans:
+                next_offset = offset + len(plan)
+                segments.append(
+                    SpecAgentProgressiveLayerwiseSegment(
+                        starts=starts[offset:next_offset],
+                        ends=ends[offset:next_offset],
+                        keys_by_chunk=keys_by_chunk[offset:next_offset],
+                        location=location,
+                        num_layers=self.num_layers,
+                    )
+                )
+                offset = next_offset
+            batch.publish_segments(segments)
+
+            keys_layer_major = [
+                list(row) for row in zip(*keys_by_chunk, strict=False)
+            ]
+            for layer_id, keys_layer in enumerate(keys_layer_major):
+                raw_layer = backend.batched_get_blocking(keys_layer)
+                acquired = [obj for obj in raw_layer if obj is not None]
+                if len(acquired) != len(keys_layer):
+                    for mem_obj in acquired:
+                        mem_obj.ref_count_down()
+                    raise RuntimeError(
+                        "[SpecAgent][PROGRESSIVE-PREPARE] CPU MemoryObj "
+                        f"missing at layer={layer_id}: evicted between "
+                        "contains and resolve"
+                    )
+                offset = 0
+                for segment, plan in zip(segments, plans, strict=True):
+                    next_offset = offset + len(plan)
+                    segment.publish(
+                        layer_id, acquired[offset:next_offset]
+                    )
+                    offset = next_offset
+                builtins._specagent_progressive_layers_published = (
+                    getattr(
+                        builtins,
+                        "_specagent_progressive_layers_published",
+                        0,
+                    )
+                    + 1
+                )
+        except BaseException as error:
+            # Claimed segments are no longer present in the batch, so notify
+            # every producer-owned segment directly before propagating the
+            # failure to any consumers still waiting to claim.
+            for segment in segments:
+                segment.fail(error)
+            batch.fail(error)
+            raise
+
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def retrieve_layer(
@@ -1432,8 +1875,18 @@ class LMCacheEngine:
             last iteration, it moves the memory objects of the last layer to
             the GPU.
         """
+        detailed_nvtx = bool(
+            os.environ.get("SPECAGENT_DETAILED_RETRIEVE_NVTX")
+        )
+        detail_record = _lmc_record if detailed_nvtx else nullcontext
+
         # Health check: block operation if LMCache is unhealthy
-        if not self.is_healthy():
+        with detail_record(
+            "lmcache retrieve_layer detail: health_check "
+            f"tokens={len(tokens)}"
+        ):
+            healthy = self.is_healthy()
+        if not healthy:
             logger.warning("LMCache is unhealthy, skipping retrieve_layer operation")
             yield torch.zeros(len(tokens), dtype=torch.bool)
             return
@@ -1446,13 +1899,47 @@ class LMCacheEngine:
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
 
-        if mask is not None:
-            num_required_tokens = torch.sum(mask).item()
-        else:
-            num_required_tokens = len(tokens)
-        monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
+        specagent_expected_tokens = kwargs.get("specagent_expected_tokens")
+        specagent_prefix_tokens = kwargs.get("specagent_prefix_tokens")
+        specagent_chunk_plan = kwargs.get("specagent_chunk_plan")
+        specagent_prepared_plan_future = kwargs.get(
+            "specagent_prepared_plan_future"
+        )
+        specagent_prepared_segment_index = int(
+            kwargs.get("specagent_prepared_segment_index", 0)
+        )
+        specagent_fast_path = (
+            specagent_expected_tokens is not None
+            and specagent_prefix_tokens is not None
+        )
 
-        ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+        with detail_record(
+            "lmcache retrieve_layer detail: mask_count "
+            f"req={req_id} tokens={len(tokens)}"
+        ):
+            if specagent_fast_path:
+                num_required_tokens = int(specagent_expected_tokens)
+            elif mask is not None:
+                num_required_tokens = torch.sum(mask).item()
+            else:
+                num_required_tokens = len(tokens)
+        with detail_record(
+            "lmcache retrieve_layer detail: stats_begin "
+            f"req={req_id} required={int(num_required_tokens)}"
+        ):
+            monitor_req_id = self.stats_monitor.on_retrieve_request(
+                num_required_tokens
+            )
+
+        ret_mask = None
+        if not specagent_fast_path:
+            with detail_record(
+                "lmcache retrieve_layer detail: ret_mask_alloc "
+                f"req={req_id} tokens={len(tokens)}"
+            ):
+                ret_mask = torch.zeros(
+                    len(tokens), dtype=torch.bool, device="cpu"
+                )
 
         starts = []
         ends = []
@@ -1463,54 +1950,136 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         location = None
-        specagent_expected_tokens = kwargs.get("specagent_expected_tokens")
         retrieved_tokens_count = 0
+        prepared_segment: Optional[
+            Union[
+                SpecAgentPreparedLayerwiseSegment,
+                SpecAgentProgressiveLayerwiseSegment,
+            ]
+        ] = None
         with _lmc_record(
             "lmcache retrieve_layer: token_lookup "
             f"req={req_id} tokens={len(tokens)} required={int(num_required_tokens)}"
         ):
-            token_iter = iter(self.token_database.process_tokens(
-                tokens=tokens,
-                mask=mask,
-                request_configs=request_configs,
-            ))
-            while True:
-                # Keep the aggregate token_lookup range above, but avoid three
-                # NVTX push/pop pairs per cache chunk.  At 140 chunks those
-                # profiling calls alone inflated a 4.4 ms lookup to 133 ms in
-                # Nsight and produced artificial 200 ms forward outliers.
-                try:
-                    start, end, key = next(token_iter)
-                except StopIteration:
-                    break
-                assert isinstance(key, CacheEngineKey)
-
-                keys_multi_layer = key.split_layers(self.num_layers)
-
-                hit_layers, block_mapping = self.storage_manager.batched_contains(
-                    keys_multi_layer,
-                    self.retrieve_locations,
-                )
-                if hit_layers == self.num_layers and len(block_mapping) == 1:
-                    current_location = next(iter(block_mapping.keys()))
-                    if location is None:
-                        location = current_location
+            if specagent_prepared_plan_future is not None:
+                with _lmc_record(
+                    "lmcache retrieve_layer: await_cpu_prepare "
+                    f"req={req_id} seg={specagent_prepared_segment_index}"
+                ):
+                    if isinstance(
+                        specagent_prepared_plan_future,
+                        SpecAgentProgressiveLayerwiseBatch,
+                    ):
+                        prepared_batch = specagent_prepared_plan_future
                     else:
-                        # TODO(Jiayi): Support multi-location retrieval in the future
-                        assert current_location == location, (
-                            "All retrieved keys should be from the same location "
-                            "when use layerwise retrieval."
-                            "Please support multi-location retrieval in the future."
+                        prepared_batch = specagent_prepared_plan_future.result()
+                if prepared_batch is not None:
+                    prepared_segment = prepared_batch.claim(
+                        specagent_prepared_segment_index
+                    )
+            if specagent_chunk_plan is not None:
+                token_results = specagent_chunk_plan
+            else:
+                token_results = self.token_database.process_tokens(
+                    tokens=tokens,
+                    mask=mask,
+                    request_configs=request_configs,
+                    mask_num_falses=(
+                        int(specagent_prefix_tokens)
+                        if specagent_fast_path else None
+                    ),
+                )
+            if detailed_nvtx:
+                # Diagnostic-only eager materialization separates prefix hash
+                # generation from backend membership checks.  The normal path
+                # below remains lazy and preserves its early stop on a miss.
+                with detail_record(
+                    "lmcache retrieve_layer detail: token_plan_materialize "
+                    f"req={req_id} tokens={len(tokens)}"
+                ):
+                    token_iter = iter(list(token_results))
+            else:
+                token_iter = iter(token_results)
+
+            contains_context = detail_record(
+                "lmcache retrieve_layer detail: storage_contains_scan "
+                f"req={req_id} required={int(num_required_tokens)}"
+            )
+            with contains_context:
+                bulk_plan = None
+                if prepared_segment is not None:
+                    starts = prepared_segment.starts
+                    ends = prepared_segment.ends
+                    keys = prepared_segment.keys_by_chunk
+                    location = prepared_segment.location
+                    retrieved_tokens_count = sum(
+                        end - start
+                        for start, end in zip(starts, ends, strict=True)
+                    )
+                    # Non-None sentinel prevents the synchronous membership
+                    # scan; the worker already validated the entire batch.
+                    bulk_plan = (starts, ends, keys, location)
+                elif specagent_chunk_plan is not None:
+                    with detail_record(
+                        "lmcache retrieve_layer detail: bulk_contains "
+                        f"req={req_id} chunks={len(specagent_chunk_plan)}"
+                    ):
+                        bulk_plan = self.bulk_validate_sparse_layerwise_plan(
+                            [specagent_chunk_plan]
                         )
-                else:
-                    break
+                if bulk_plan is not None:
+                    starts, ends, keys, location = bulk_plan
+                    retrieved_tokens_count = sum(
+                        end - start for start, end in zip(
+                            starts, ends, strict=True
+                        )
+                    )
+                while bulk_plan is None:
+                    # Keep the aggregate token_lookup range above, but avoid
+                    # three NVTX push/pop pairs per cache chunk.  At 140
+                    # chunks those profiling calls alone inflated a 4.4 ms
+                    # lookup to 133 ms in Nsight and produced artificial
+                    # 200 ms forward outliers.
+                    try:
+                        start, end, key = next(token_iter)
+                    except StopIteration:
+                        break
+                    assert isinstance(key, CacheEngineKey)
 
-                starts.append(start)
-                ends.append(end)
-                keys.append(keys_multi_layer)
+                    keys_multi_layer = key.split_layers(self.num_layers)
 
-                ret_mask[start:end] = True
-                retrieved_tokens_count += end - start
+                    hit_layers, block_mapping = (
+                        self.storage_manager.batched_contains(
+                            keys_multi_layer,
+                            self.retrieve_locations,
+                        )
+                    )
+                    if (
+                        hit_layers == self.num_layers
+                        and len(block_mapping) == 1
+                    ):
+                        current_location = next(iter(block_mapping.keys()))
+                        if location is None:
+                            location = current_location
+                        else:
+                            # TODO(Jiayi): Support multi-location retrieval
+                            # in the future.
+                            assert current_location == location, (
+                                "All retrieved keys should be from the same "
+                                "location when use layerwise retrieval."
+                                "Please support multi-location retrieval in "
+                                "the future."
+                            )
+                    else:
+                        break
+
+                    starts.append(start)
+                    ends.append(end)
+                    keys.append(keys_multi_layer)
+
+                    if ret_mask is not None:
+                        ret_mask[start:end] = True
+                    retrieved_tokens_count += end - start
 
         if keys:
             # Transpose the keys into layer major format
@@ -1531,10 +2100,14 @@ class LMCacheEngine:
                     "lmcache retrieve_layer: setup get_generator "
                     f"req={req_id} chunks={len(keys)}"
                 ):
-                    get_generator = self.storage_manager.layerwise_batched_get(
-                        keys_layer_major,
-                        location=location,
-                    )
+                    get_generator = None
+                    if prepared_segment is None:
+                        get_generator = (
+                            self.storage_manager.layerwise_batched_get(
+                                keys_layer_major,
+                                location=location,
+                            )
+                        )
 
                 with _lmc_record(
                     "lmcache retrieve_layer: setup init_gpu_consumer "
@@ -1548,8 +2121,24 @@ class LMCacheEngine:
                     next(mem_obj_consumer)
 
             to_count_down = []
-            full_plan_objs = None
-            if kwargs.get("specagent_full_plan_fetch"):
+            progressive_segment = (
+                prepared_segment
+                if isinstance(
+                    prepared_segment, SpecAgentProgressiveLayerwiseSegment
+                )
+                else None
+            )
+            full_plan_objs = (
+                prepared_segment.memory_objs_by_layer
+                if isinstance(
+                    prepared_segment, SpecAgentPreparedLayerwiseSegment
+                )
+                else None
+            )
+            if full_plan_objs is not None:
+                for mem_objs_layer in full_plan_objs:
+                    to_count_down.extend(mem_objs_layer)
+            elif kwargs.get("specagent_full_plan_fetch"):
                 resolve_location = location or "LocalCPUBackend"
                 backend = self.storage_manager.storage_backends.get(
                     resolve_location
@@ -1583,21 +2172,46 @@ class LMCacheEngine:
                                 )
                         to_count_down.extend(mem_objs_layer)
 
-            if full_plan_objs is not None:
-                for layer_id in range(self.num_layers):
-                    if layer_id == 0:
-                        if specagent_expected_tokens is not None:
-                            yield retrieved_tokens_count
+            if full_plan_objs is not None or progressive_segment is not None:
+                progressive_complete = False
+                try:
+                    for layer_id in range(self.num_layers):
+                        if layer_id == 0:
+                            if specagent_expected_tokens is not None:
+                                yield retrieved_tokens_count
+                            else:
+                                assert ret_mask is not None
+                                yield torch.sum(ret_mask)
                         else:
-                            yield torch.sum(ret_mask)
-                    else:
-                        yield None
-                    with _lmc_record(
-                        "lmcache retrieve_layer: gpu_send "
-                        f"req={req_id} layer={layer_id} chunks={len(keys)}"
-                    ):
-                        mem_obj_consumer.send(full_plan_objs[layer_id])
+                            yield None
+                        if progressive_segment is not None:
+                            with _lmc_record(
+                                "lmcache retrieve_layer: wait_progressive_layer "
+                                f"req={req_id} layer={layer_id} "
+                                f"chunks={len(keys)}"
+                            ):
+                                mem_objs_layer = (
+                                    progressive_segment.take_layer(layer_id)
+                                )
+                            to_count_down.extend(mem_objs_layer)
+                        else:
+                            assert full_plan_objs is not None
+                            mem_objs_layer = full_plan_objs[layer_id]
+                        with _lmc_record(
+                            "lmcache retrieve_layer: gpu_send "
+                            f"req={req_id} layer={layer_id} chunks={len(keys)}"
+                        ):
+                            mem_obj_consumer.send(mem_objs_layer)
+                    progressive_complete = True
+                finally:
+                    if progressive_segment is not None:
+                        progressive_segment.release_pending()
+                        if not progressive_complete:
+                            for mem_obj in to_count_down:
+                                mem_obj.ref_count_down()
+                            to_count_down.clear()
             else:
+                assert get_generator is not None
                 cpu_prefetch_ahead = max(
                     0,
                     int(
@@ -1652,6 +2266,7 @@ class LMCacheEngine:
                         if specagent_expected_tokens is not None:
                             yield retrieved_tokens_count
                         else:
+                            assert ret_mask is not None
                             yield torch.sum(ret_mask)
                     else:
                         yield None
@@ -1686,7 +2301,7 @@ class LMCacheEngine:
                         self.num_layers,
                         cpu_prefetch_ahead,
                         len(keys),
-                        int(torch.sum(ret_mask).item()),
+                        retrieved_tokens_count,
                         prefetch_ms_total,
                         result_ms_total,
                         result_ms_max,
@@ -1700,10 +2315,15 @@ class LMCacheEngine:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
             for layer_id in range(self.num_layers):
-                yield None
+                if layer_id == 0 and specagent_expected_tokens is not None:
+                    yield 0
+                else:
+                    yield None
 
-            yield None
-            retrieved_tokens = torch.sum(ret_mask)
+            yield 0 if specagent_expected_tokens is not None else None
+            retrieved_tokens = retrieved_tokens_count
+            if ret_mask is not None:
+                retrieved_tokens = torch.sum(ret_mask)
             self.stats_monitor.on_retrieve_finished(monitor_req_id,
                                                     retrieved_tokens)
             if not self._is_passive():
@@ -1711,7 +2331,7 @@ class LMCacheEngine:
                     "[req_id=%s] Retrieved %d out of %d out of total %d tokens",
                     req_id,
                     retrieved_tokens,
-                    torch.sum(mask),
+                    num_required_tokens,
                     len(tokens),
                 )
             return
@@ -1721,15 +2341,17 @@ class LMCacheEngine:
         # synchronize the last layer
         next(mem_obj_consumer)
 
-        # Unpin any disk-loaded staging objects now that the device-side sync
-        # has been enqueued (mem_obj_consumer advanced past its sync point).
-        # Without this, pin_count stays at 1 forever and the CPU staging pool
-        # fills up, causing the next retrieve to deadlock inside allocate().
-        for mem_obj in to_count_down:
-            if mem_obj.is_pinned:
-                mem_obj.unpin()
+        # Do not unpin based on the object's ambient pin state.  Layerwise
+        # batched_get owns the references released above, but it does not
+        # acquire a pin.  A visible pin commonly belongs to the scheduler's
+        # lookup(pin=True) and must be released exactly once by
+        # lookup_unpin(req_id).  Treating is_pinned as ownership caused every
+        # retrieved LocalCPU key to be unpinned here and then again at the
+        # request boundary.
 
-        retrieved_tokens = torch.sum(ret_mask)
+        retrieved_tokens = retrieved_tokens_count
+        if ret_mask is not None:
+            retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
         if not self._is_passive():
             logger.info(
@@ -1740,7 +2362,7 @@ class LMCacheEngine:
                 len(tokens),
             )
 
-        yield ret_mask
+        yield retrieved_tokens if specagent_fast_path else ret_mask
 
     @_lmcache_nvtx_annotate
     def lookup(

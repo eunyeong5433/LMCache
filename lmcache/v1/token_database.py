@@ -12,13 +12,14 @@ TODO(baoloongmao): Move this to vllm_v1_adapter to decouple from vLLM
 """
 
 # Standard
+from contextlib import nullcontext
 from typing import Any, Iterable, List, Optional, Tuple, Union
 import abc
 import os
 
 # Third Party
-from transformers import AutoTokenizer
 import torch
+from transformers import AutoTokenizer
 
 # First Party
 from lmcache.logging import init_logger
@@ -27,6 +28,17 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
 
 logger = init_logger(__name__)
+
+try:
+    # vLLM emits these ranges only while profiling is enabled.  The extra
+    # ranges below are also guarded by SPECAGENT_DETAILED_RETRIEVE_NVTX so
+    # ordinary LMCache runs retain the generator's original hot path.
+    from vllm.v1.utils import record_function_or_nullcontext as _tdb_record
+except Exception:  # pragma: no cover - vLLM may be absent in LMCache tests.
+
+    def _tdb_record(_name: str):
+        return nullcontext()
+
 
 NONE_HASH = 0
 
@@ -176,6 +188,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
         request_configs: Optional[dict] = None,
+        mask_num_falses: Optional[int] = None,
     ) -> Iterable[ProcessTokensResult]:
         """Process the tokens and return the corresponding cache engine keys.
 
@@ -195,6 +208,11 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             If False, the hash value will be returned instead.
 
         :param Optional[dict] request_configs: The configs of the request.
+
+        :param Optional[int] mask_num_falses: Known number of leading False
+            entries in ``mask``. When provided, implementations may avoid
+            reducing the mask again. The value must describe the same prefix
+            represented by ``mask``.
 
         :returns: A iterable of tuples with three elements. The first element
             is the start index of the tokens for the key. The second element
@@ -349,6 +367,7 @@ class ChunkedTokenDatabase(TokenDatabase):
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
         request_configs: Optional[dict] = None,
+        mask_num_falses: Optional[int] = None,
     ) -> Iterable[ProcessTokensResult]:
         """Process the tokens/hashes and return the corresponding cache engine keys.
 
@@ -369,6 +388,10 @@ class ChunkedTokenDatabase(TokenDatabase):
 
         :param Optional[dict] request_configs: The configs of the request.
 
+        :param Optional[int] mask_num_falses: Known number of leading False
+            entries in ``mask``. Supplying it avoids a tensor reduction in
+            callers that already know the prefix boundary.
+
         :returns: A iterable of tuples with three elements. The first element
             is the start index of the tokens for the key. The second element
             is the end index of the tokens for the key. The third element is
@@ -377,8 +400,23 @@ class ChunkedTokenDatabase(TokenDatabase):
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
-        if mask is not None:
-            num_falses = mask.numel() - mask.long().sum().item()
+        detailed_nvtx = bool(
+            os.environ.get("SPECAGENT_DETAILED_RETRIEVE_NVTX")
+        )
+        detail_record = _tdb_record if detailed_nvtx else nullcontext
+
+        if mask_num_falses is not None:
+            num_falses = int(mask_num_falses)
+            if num_falses < 0 or (
+                mask is not None and num_falses > mask.numel()
+            ):
+                raise ValueError("mask_num_falses is outside the mask bounds")
+        elif mask is not None:
+            with detail_record(
+                "lmcache token_db: mask_count "
+                f"tokens={mask.numel()}"
+            ):
+                num_falses = mask.numel() - mask.long().sum().item()
         else:
             num_falses = 0
 
@@ -389,10 +427,23 @@ class ChunkedTokenDatabase(TokenDatabase):
 
         if tokens is not None:
             if isinstance(tokens, torch.Tensor):
-                tokens = tokens.detach().cpu().tolist()
+                with detail_record(
+                    "lmcache token_db: tensor_to_list "
+                    f"tokens={len(tokens)}"
+                ):
+                    tokens = tokens.detach().cpu().tolist()
             total_len = len(tokens)
             token_chunks = self._chunk_tokens(tokens)
             prefix_hashes = self._prefix_hash(token_chunks)
+            if detailed_nvtx:
+                # Materializing hashes is diagnostic-only.  It gives Nsight a
+                # single low-overhead range for prefix scanning instead of a
+                # range per chunk, which previously distorted the hot path.
+                with detail_record(
+                    "lmcache token_db: prefix_hash_scan "
+                    f"tokens={total_len} chunk={self.chunk_size}"
+                ):
+                    prefix_hashes = iter(list(prefix_hashes))
             for chunk_id, hash_val in enumerate(prefix_hashes):
                 start_idx = chunk_id * self.chunk_size
                 end_idx = min(start_idx + self.chunk_size, total_len)
@@ -476,6 +527,7 @@ class SegmentTokenDatabase(TokenDatabase):
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
         request_configs: Optional[dict] = None,
+        mask_num_falses: Optional[int] = None,
     ) -> Iterable[ProcessTokensResult]:
         """Process the tokens and return the corresponding cache engine keys.
 
@@ -496,6 +548,10 @@ class SegmentTokenDatabase(TokenDatabase):
 
         :param Optional[dict] request_configs: The configs of the request.
 
+        :param Optional[int] mask_num_falses: Known number of leading False
+            entries in ``mask``. Supplying it avoids a tensor reduction in
+            callers that already know the prefix boundary.
+
         :returns: A iterable of tuples with three elements. The first element
             is the start index of the tokens for the key. The second element
             is the end index of the tokens for the key. The third element is
@@ -509,7 +565,13 @@ class SegmentTokenDatabase(TokenDatabase):
             else:
                 tokens = tokens.to(device="cpu", dtype=torch.long)
 
-            if mask is not None:
+            if mask_num_falses is not None:
+                num_falses = int(mask_num_falses)
+                if num_falses < 0 or num_falses > len(tokens):
+                    raise ValueError(
+                        "mask_num_falses is outside the token bounds"
+                    )
+            elif mask is not None:
                 num_falses = mask.numel() - mask.long().sum().item()
             else:
                 num_falses = 0
