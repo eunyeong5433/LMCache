@@ -55,6 +55,9 @@ issues = "https://github.com/LMCache/LMCache"
 
 [tool.setuptools_scm]
 version_file = "lmcache/_version.py"
+# Experiment checkpoint tags are not package versions. Keep them intact and
+# derive the package version from release tags only (compatible with SCM >=8).
+git_describe_command = "git describe --dirty --tags --long --match 'v[0-9]*'"
 # do not include +gREV local version, required for Test PyPI upload
 local_scheme = "no-local-version"
 
