@@ -5,6 +5,7 @@
 #include "mem_kernels.cuh"
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <cstdlib>
 #ifdef USE_ROCM
   #include <hip/hip_fp8.h>
 #else
@@ -1142,7 +1143,10 @@ void lmcache_memcpy_batch_async(
       direction == TransferDirection::H2D
           ? cudaMemcpySrcAccessOrderAny
           : cudaMemcpySrcAccessOrderStream;
-  attrs.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+  attrs.flags = std::getenv(
+                    "SPECAGENT_DISABLE_CUDA_MEMCPY_PREFER_OVERLAP")
+                    ? 0
+                    : cudaMemcpyFlagPreferOverlapWithCompute;
   size_t attrs_idx = 0;
   size_t fail_idx = SIZE_MAX;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();

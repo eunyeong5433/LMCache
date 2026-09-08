@@ -2121,6 +2121,17 @@ class LMCacheEngine:
                     next(mem_obj_consumer)
 
             to_count_down = []
+            deferred_source_owner = kwargs.get(
+                "specagent_deferred_source_owner"
+            )
+            if isinstance(deferred_source_owner, dict):
+                deferred_source_owner.setdefault("memory_objs", [])
+
+            def hold_source_objs(memory_objs: list[Any]) -> None:
+                if isinstance(deferred_source_owner, dict):
+                    deferred_source_owner["memory_objs"].extend(memory_objs)
+                else:
+                    to_count_down.extend(memory_objs)
             progressive_segment = (
                 prepared_segment
                 if isinstance(
@@ -2137,7 +2148,7 @@ class LMCacheEngine:
             )
             if full_plan_objs is not None:
                 for mem_objs_layer in full_plan_objs:
-                    to_count_down.extend(mem_objs_layer)
+                    hold_source_objs(mem_objs_layer)
             elif kwargs.get("specagent_full_plan_fetch"):
                 resolve_location = location or "LocalCPUBackend"
                 backend = self.storage_manager.storage_backends.get(
@@ -2193,7 +2204,7 @@ class LMCacheEngine:
                                 mem_objs_layer = (
                                     progressive_segment.take_layer(layer_id)
                                 )
-                            to_count_down.extend(mem_objs_layer)
+                            hold_source_objs(mem_objs_layer)
                         else:
                             assert full_plan_objs is not None
                             mem_objs_layer = full_plan_objs[layer_id]
@@ -2289,7 +2300,7 @@ class LMCacheEngine:
                     send_ms = (time.perf_counter() - send_t0) * 1000.0
                     send_ms_total += send_ms
                     send_ms_max = max(send_ms_max, send_ms)
-                    to_count_down.extend(mem_objs_layer)
+                    hold_source_objs(mem_objs_layer)
 
                 if cpu_prefetch_profile:
                     logger.info(

@@ -1564,6 +1564,14 @@ class LMCacheConnectorV1Impl:
                                 "SPECAGENT_DISABLE_FUSED_LAYER_SUBMIT"
                             )
                         )
+                        deferred_source_owner = (
+                            {}
+                            if defer_layer_submit
+                            and os.environ.get(
+                                "SPECAGENT_TRANSFER_FULL_PLAN_OWNERSHIP"
+                            )
+                            else None
+                        )
                         if os.environ.get("SPECAGENT_FUSED_TRANSFER_DEBUG"):
                             logger.warning(
                                 "[SpecAgent][FUSED-ADMISSION] req=%s "
@@ -1609,6 +1617,9 @@ class LMCacheConnectorV1Impl:
                                     cpu_prepare_future
                                 ),
                                 specagent_prepared_segment_index=seg_i,
+                                specagent_deferred_source_owner=(
+                                    deferred_source_owner
+                                ),
                             )
                         # The first generator step performs the expensive
                         # token/chunk lookup and submits CPU get work.  Let

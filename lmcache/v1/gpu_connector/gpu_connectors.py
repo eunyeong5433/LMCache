@@ -1446,6 +1446,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     _specagent_release_memory_obj_leases(
                         pending_plan.get("source_lease_objs") or []
                     )
+                    source_owner = pending_plan.get("source_owner")
+                    if isinstance(source_owner, dict):
+                        _specagent_release_memory_obj_leases(
+                            source_owner.pop("memory_objs", [])
+                        )
                     release_obj = pending_plan.get("release_obj")
                     if release_obj is not None:
                         release_tokens = int(release_obj.tensor.shape[0])
@@ -2134,6 +2139,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         )
         debug_count = 0
         bw_profile = bool(os.environ.get("SPECAGENT_BW_PROFILE"))
+        deferred_source_owner = kwargs.get(
+            "specagent_deferred_source_owner"
+        )
         bw_profile_records = []
         specagent_layer_events = kwargs.get("specagent_layer_events")
         event_synchronized_load = isinstance(specagent_layer_events, list)
@@ -2275,7 +2283,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         # the raw CPU tensor views to a deferred plan; release
                         # it only after the plan's ready event completes.
                         source_lease_objs = (
-                            _specagent_acquire_memory_obj_leases(
+                            []
+                            if isinstance(deferred_source_owner, dict)
+                            else _specagent_acquire_memory_obj_leases(
                                 list(memory_objs_layer)
                             )
                         )
@@ -2289,6 +2299,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             "slot_mapping": transfer_slot_mapping,
                             "layer_events": specagent_layer_events,
                             "source_lease_objs": source_lease_objs,
+                            "source_owner": (
+                                deferred_source_owner
+                                if layer_id == self.num_layers - 1
+                                else None
+                            ),
                             "release_obj": (
                                 tmp_gpu_buffer_obj
                                 if layer_id == self.num_layers - 1
