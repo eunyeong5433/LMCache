@@ -1775,11 +1775,52 @@ class LMCacheConnectorV1Impl:
                     )
                     self._invalid_block_ids.update(missing_blocks)
 
+        graph_runtime = None
+        if os.environ.get("SPECAGENT_TRANSFORMER_GRAPH") == "1":
+            from vllm.v1.specagent_graph.runtime import get_runtime
+            candidate = get_runtime()
+            if (candidate is not None
+                    and candidate.eligible(forward_context, metadata)
+                    and self._specagent_has_layerwise_fetch()
+                    and self._specagent_layerwise_meta
+                    and all(isinstance(m, dict) and m.get("defer_layer_submit")
+                            for m in self._specagent_layerwise_meta)):
+                graph_runtime = candidate
+        if graph_runtime is not None:
+            # Collect descriptors layer-major, without enqueuing any producer.
+            # Full-plan owners remain held until the replay completion event.
+            graph_collect_start = time.perf_counter()
+            gpu_connector.specagent_reap_completed_plans()
+            self._specagent_advance_retrievers_until(
+                self.num_layers - 1, collect_only=True)
+            if graph_runtime.prepare_plan_descriptors(
+                gpu_connector.specagent_peek_graph_plans()
+            ):
+                plans = gpu_connector.specagent_take_graph_plans()
+                sa_extra["specagent_group_fetch_plan"] = (
+                    plans, gpu_connector.specagent_retire_graph_plans)
+                self.current_layer = self.num_layers
+                for retriever in self.layerwise_retrievers:
+                    for _ in retriever:
+                        pass
+                self.layerwise_retrievers = []
+                sa_extra["specagent_graph_collect_ms"] = (
+                    time.perf_counter() - graph_collect_start
+                ) * 1000
+            else:
+                # Descriptors remain owned by the ordinary producer. Rewind
+                # its submit cursor; collection itself launched no fetch.
+                self._specagent_prefetch_scan_layer = 0
+                graph_runtime = None
+                logger.info("[SpecAgent][TRANSFORMER-GRAPH-FALLBACK] unsupported fetch plan")
+
         profile_cascade_only = bool(
             self._specagent_has_layerwise_fetch()
             and _specagent_env_true("SPECAGENT_PROFILE_CASCADE_ONLY")
         )
-        if profile_cascade_only:
+        if graph_runtime is not None:
+            pass
+        elif profile_cascade_only:
             # Performance-only ablation: preserve the exact scratch-cascade
             # attention path while removing its layer producer and all transfer
             # dependencies.  Scratch contents are intentionally unspecified;
@@ -1918,6 +1959,13 @@ class LMCacheConnectorV1Impl:
         Args:
             layer_name: the name of that layer
         """
+        if os.environ.get("SPECAGENT_TRANSFORMER_GRAPH_CHECK") == "1":
+            from vllm.forward_context import get_forward_context
+            reference = (get_forward_context().additional_kwargs or {}).get(
+                "specagent_graph_reference")
+            if reference is not None:
+                reference.fetch_reference(_specagent_layer_index(layer_name))
+                return
         requested_layer = _specagent_layer_index(layer_name)
         if requested_layer is None:
             requested_layer = self.current_layer
@@ -2109,6 +2157,7 @@ class LMCacheConnectorV1Impl:
         self,
         target_layer: int,
         stream_wait_event: object | None = None,
+        collect_only: bool = False,
     ) -> None:
         if target_layer < 0:
             return
@@ -2205,7 +2254,7 @@ class LMCacheConnectorV1Impl:
                     with self._specagent_prefetch_cond:
                         self._specagent_prefetch_cond.notify_all()
                     validate_result(meta, ret_token_mask)
-            if callable(flush_deferred):
+            if callable(flush_deferred) and not collect_only:
                 did_flush = flush_deferred(
                     layer_id,
                     scratch_free_event=stream_wait_event,
@@ -2214,7 +2263,7 @@ class LMCacheConnectorV1Impl:
                     # One wait in the load stream orders this and every later
                     # fused scatter in the same advance call.
                     stream_wait_event = None
-            if not self._specagent_events_ready(layer_id):
+            if not collect_only and not self._specagent_events_ready(layer_id):
                 # Do not skip an incomplete layer.  This is only expected for
                 # a non-deferred compatibility retriever that yielded without
                 # publishing its event.
@@ -2548,6 +2597,10 @@ class LMCacheConnectorV1Impl:
         attention_done_event: object | None = None,
     ) -> None:
         """Advance the SpecAgent layerwise producer ahead of the consumer."""
+        if os.environ.get("SPECAGENT_TRANSFORMER_GRAPH_CHECK") == "1":
+            from vllm.forward_context import get_forward_context
+            if (get_forward_context().additional_kwargs or {}).get("specagent_graph_reference"):
+                return
         if (
             not self.layerwise_retrievers
             or not self._specagent_has_layerwise_fetch()

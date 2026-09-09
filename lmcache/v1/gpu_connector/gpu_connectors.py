@@ -1455,11 +1455,67 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     _specagent_record_cuda_event(self.load_stream)
                 )
 
-    def specagent_flush_deferred_layer(
-        self,
-        layer_id: int,
-        scratch_free_event: object | None = None,
-    ) -> bool:
+    def specagent_graph_plan_supported(self, token_capacity: int) -> bool:
+        """Check descriptor bounds before transferring ownership to a graph."""
+        first = self._specagent_deferred_layer_fetches.get(0, [])
+        signature = [(p["slot_mapping"].data_ptr(), p["slot_mapping"].numel())
+                     for p in first]
+        if not first or sum(size for _, size in signature) > token_capacity:
+            return False
+        for layer_id in range(self.num_layers):
+            plans = self._specagent_deferred_layer_fetches.get(layer_id, [])
+            if [(p["slot_mapping"].data_ptr(), p["slot_mapping"].numel())
+                for p in plans] != signature:
+                return False
+            if sum(len(p["copy_srcs"]) for p in plans) > 256:
+                return False
+            for plan in plans:
+                offsets = plan.get("direct_token_offsets")
+                if offsets is None or len(offsets) != len(plan["copy_srcs"]):
+                    return False
+                target = plan["target_kv_cache"]
+                if (target.ndim != 5 or target.shape[0] != 2
+                        or target.shape[1] * target.shape[2] > token_capacity):
+                    return False
+                for source, offset in zip(plan["copy_srcs"], offsets, strict=True):
+                    if (source.device.type != "cpu" or source.dtype != torch.bfloat16
+                            or not source.is_contiguous() or source.ndim != 3
+                            or tuple(source.shape[1:]) != (2, 1024)
+                            or not 0 < source.shape[0] <= 256 or offset < 0
+                            or offset + source.shape[0] > plan["slot_mapping"].numel()):
+                        return False
+        return True
+
+    def specagent_take_graph_plans(self) -> list[list[dict]]:
+        """Transfer all prepared layer plans to a graph consumer.
+
+        No fetch is submitted. The consumer must call specagent_retire_graph_plans
+        with an event ordered after its last source read, including on failure.
+        """
+        plans = [self._specagent_deferred_layer_fetches.pop(i, [])
+                 for i in range(self.num_layers)]
+        if not all(plans):
+            raise RuntimeError("Incomplete SpecAgent transformer graph fetch plan")
+        return plans
+
+    def specagent_peek_graph_plans(self) -> list[list[dict]]:
+        """Borrow collected plans for validation without transferring ownership."""
+        return [self._specagent_deferred_layer_fetches.get(i, [])
+                for i in range(self.num_layers)]
+
+    def specagent_retire_graph_plans(
+        self, completion: torch.cuda.Event, plans_by_layer: list[list[dict]]
+    ) -> None:
+        """Retain CPU source leases and staging until graph completion."""
+        pending_plans = []
+        for layer_id, plans in enumerate(plans_by_layer):
+            for plan in plans:
+                plan["layer_events"][layer_id] = completion
+            pending_plans.extend(plans)
+        self._specagent_pending_deferred_plans.append((completion, pending_plans))
+
+    def specagent_reap_completed_plans(self) -> None:
+        """Release completed fetch leases, including consecutive graph steps."""
         still_pending: list[tuple[torch.cuda.Event, list[dict]]] = []
         for event, pending_plans in self._specagent_pending_deferred_plans:
             if event.query():
@@ -1485,6 +1541,13 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             else:
                 still_pending.append((event, pending_plans))
         self._specagent_pending_deferred_plans = still_pending
+
+    def specagent_flush_deferred_layer(
+        self,
+        layer_id: int,
+        scratch_free_event: object | None = None,
+    ) -> bool:
+        self.specagent_reap_completed_plans()
         plans = self._specagent_deferred_layer_fetches.pop(
             int(layer_id), None
         )
@@ -1611,6 +1674,37 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 )
             )
         )
+        if int(layer_id) == 0 and os.environ.get("SPECAGENT_FETCH_SOURCE_RUN_STATS"):
+            # Calibration only: count physically coalescible source/destination
+            # runs without changing ownership, transfer order or scratch use.
+            copies = runs = payload_bytes = 0
+            for plan in plans:
+                previous_source_end = previous_destination_end = None
+                offsets = plan.get("direct_token_offsets")
+                for source_idx, source in enumerate(plan["copy_srcs"]):
+                    source_ptr = int(source.data_ptr())
+                    size = int(source.numel() * source.element_size())
+                    destination = (
+                        int(offsets[source_idx])
+                        * int(source.stride(0) * source.element_size())
+                        if offsets is not None
+                        else int(plan["copy_dsts"][source_idx].data_ptr())
+                    )
+                    if (
+                        source_ptr != previous_source_end
+                        or destination != previous_destination_end
+                    ):
+                        runs += 1
+                    previous_source_end = source_ptr + size
+                    previous_destination_end = destination + size
+                    copies += 1
+                    payload_bytes += size
+            logger.error(
+                "[SpecAgent][FETCH-SOURCE-RUNS] layer=0 plans=%d "
+                "copies=%d coalescible_runs=%d bytes=%d path=%s",
+                len(plans), copies, runs, payload_bytes,
+                "direct" if use_direct else "native_copy" if use_native else "fallback",
+            )
         if use_direct:
             direct_submit(
                 [list(plan["copy_srcs"]) for plan in plans],
