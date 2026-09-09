@@ -2220,6 +2220,7 @@ class LMCacheConnectorV1Impl:
                 # publishing its event.
                 break
             self._specagent_prefetch_scan_layer = layer_id + 1
+
         with self._specagent_prefetch_cond:
             self._specagent_prefetch_cond.notify_all()
 
@@ -2367,7 +2368,23 @@ class LMCacheConnectorV1Impl:
             isinstance(meta, dict) and meta.get("defer_layer_submit")
             for meta in self._specagent_layerwise_meta
         )
-        if all_deferred:
+        native_producer = bool(
+            all_deferred
+            and os.environ.get("SPECAGENT_NATIVE_LAYER_PRODUCER")
+        )
+        if native_producer:
+            gpu_connector = getattr(
+                self.lmcache_engine, "gpu_connector", None
+            )
+            prepare_native = getattr(
+                gpu_connector, "specagent_prepare_native_layers", None
+            )
+            if callable(prepare_native):
+                prepare_native(
+                    int(self._specagent_prefetch_scan_layer),
+                    int(target_layer),
+                )
+        if all_deferred and not native_producer:
             # torch.cuda.Event.record() from this background executor can
             # intermittently stop forever immediately after
             # cudaStreamIsCapturing when CUDA graphs are enabled.  The producer
@@ -3279,7 +3296,10 @@ class LMCacheConnectorV1Impl:
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
         timing = _specagent_timing_enabled()
-        t0 = time.perf_counter() if timing else 0.0
+        verify_sync_active = bool(
+            getattr(builtins, "_specagent_verify_sync_active", False)
+        )
+        t0 = time.perf_counter() if timing or verify_sync_active else 0.0
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
@@ -3328,6 +3348,9 @@ class LMCacheConnectorV1Impl:
                 # entire turn-end CPU save (external hit 0-43% vs vanilla 95%).
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            if verify_sync_active:
+                builtins._specagent_verify_sync_wait_for_save_ms = elapsed_ms
             if timing:
                 logger.info(
                     "[SpecAgent][LMCACHE-TIMING] wait_for_save "
@@ -3335,7 +3358,7 @@ class LMCacheConnectorV1Impl:
                     "elapsed_ms=%.3f",
                     len(connector_metadata.requests),
                     finalized,
-                    (time.perf_counter() - t0) * 1000.0,
+                    elapsed_ms,
                 )
             self._specagent_async_save_this_step = False
             return

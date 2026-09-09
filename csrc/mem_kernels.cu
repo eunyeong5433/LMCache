@@ -1181,3 +1181,269 @@ void specagent_multi_scatter(
         true);
   }
 }
+
+void specagent_submit_layer_async(
+    const std::vector<uintptr_t>& dests,
+    const std::vector<uintptr_t>& srcs,
+    const std::vector<size_t>& nbytes,
+    const std::vector<torch::Tensor>& transfer_tensors,
+    const std::vector<torch::Tensor>& target_kv_caches,
+    const std::vector<torch::Tensor>& slot_mappings,
+    const GPUKVFormat gpu_kv_format,
+    uintptr_t stream_ptr,
+    uintptr_t scratch_free_event_ptr,
+    uintptr_t ready_event_ptr) {
+  const size_t copy_count = dests.size();
+  TORCH_CHECK(srcs.size() == copy_count, "srcs size must match dests");
+  TORCH_CHECK(nbytes.size() == copy_count, "nbytes size must match dests");
+  TORCH_CHECK(target_kv_caches.size() == transfer_tensors.size(),
+              "target_kv_caches size must match transfer_tensors");
+  TORCH_CHECK(slot_mappings.size() == transfer_tensors.size(),
+              "slot_mappings size must match transfer_tensors");
+  TORCH_CHECK(!target_kv_caches.empty(),
+              "at least one scratch target is required");
+  TORCH_CHECK(stream_ptr != 0, "CUDA stream pointer must be initialized");
+  TORCH_CHECK(ready_event_ptr != 0, "ready event must be initialized");
+
+  const auto device_index = target_kv_caches.front().get_device();
+  const at::cuda::OptionalCUDAGuard device_guard(
+      device_of(target_kv_caches.front()));
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  c10::cuda::CUDAStream external_stream =
+      c10::cuda::getStreamFromExternal(stream, device_index);
+  c10::cuda::CUDAStreamGuard stream_guard(external_stream);
+
+  if (copy_count != 0) {
+#if CUDART_VERSION >= 12080
+    std::vector<void*> dst_ptrs(copy_count);
+    std::vector<void*> src_ptrs(copy_count);
+    std::vector<size_t> sizes(nbytes);
+    for (size_t i = 0; i < copy_count; ++i) {
+      TORCH_CHECK(nbytes[i] > 0, "zero-sized copies are not supported");
+      dst_ptrs[i] = reinterpret_cast<void*>(dests[i]);
+      src_ptrs[i] = reinterpret_cast<void*>(srcs[i]);
+    }
+    cudaMemcpyAttributes attrs{};
+    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+    attrs.flags = std::getenv(
+                      "SPECAGENT_DISABLE_CUDA_MEMCPY_PREFER_OVERLAP")
+                      ? 0
+                      : cudaMemcpyFlagPreferOverlapWithCompute;
+    size_t attrs_idx = 0;
+    size_t fail_idx = SIZE_MAX;
+    CHECK_CUDA_CALL(cudaMemcpyBatchAsync(
+        dst_ptrs.data(), src_ptrs.data(), sizes.data(), copy_count, &attrs,
+        &attrs_idx, 1, &fail_idx, stream));
+#else
+    TORCH_CHECK(false,
+                "specagent_submit_layer_async requires CUDA runtime 12.8+");
+#endif
+  }
+
+  if (scratch_free_event_ptr != 0) {
+    CHECK_CUDA_CALL(cudaStreamWaitEvent(
+        stream, reinterpret_cast<cudaEvent_t>(scratch_free_event_ptr), 0));
+  }
+  specagent_multi_scatter(transfer_tensors, target_kv_caches, slot_mappings,
+                          gpu_kv_format);
+  CHECK_CUDA_CALL(cudaEventRecord(
+      reinterpret_cast<cudaEvent_t>(ready_event_ptr), stream));
+}
+
+namespace {
+
+constexpr int kSpecAgentMaxDirectSegments = 256;
+
+struct SpecAgentDirectSegments {
+  const int64_t* srcs[kSpecAgentMaxDirectSegments];
+  // Low 16 bits: destination token offset. High 16 bits: source token count.
+  uint32_t offset_and_length[kSpecAgentMaxDirectSegments];
+};
+
+template <GPUKVFormat format>
+__global__ void specagent_direct_host_scatter_kernel(
+    SpecAgentDirectSegments segments, int64_t* __restrict__ target,
+    const int64_t* __restrict__ slot_mapping, const int target_block_stride,
+    const int target_value_offset, const int source_stride,
+    const int source_value_offset, const int num_heads,
+    const int head_size_in_64bit, const int block_size) {
+  const int segment = blockIdx.y;
+  const uint32_t packed = segments.offset_and_length[segment];
+  const int destination_offset = static_cast<int>(packed & 0xffffU);
+  const int source_length = static_cast<int>(packed >> 16);
+  const int source_token = blockIdx.x;
+  if (source_token >= source_length) {
+    return;
+  }
+
+  const int destination_token = destination_offset + source_token;
+  const int64_t slot = slot_mapping[destination_token];
+  if (slot < 0) {
+    return;
+  }
+  const int64_t block = slot / block_size;
+  const int64_t block_offset = slot % block_size;
+  const int scalars_per_token = num_heads * head_size_in_64bit;
+  const int64_t* source = segments.srcs[segment];
+
+  for (int i = threadIdx.x; i < scalars_per_token; i += blockDim.x) {
+    const int source_key = source_token * source_stride + i;
+    const int head = i / head_size_in_64bit;
+    const int head_offset = i % head_size_in_64bit;
+    int64_t target_key;
+    if constexpr (format == GPUKVFormat::NL_X_TWO_NB_NH_BS_HS ||
+                  format == GPUKVFormat::NL_X_NB_TWO_NH_BS_HS) {
+      target_key = block * target_block_stride +
+                   head * block_size * head_size_in_64bit +
+                   block_offset * head_size_in_64bit + head_offset;
+    } else {
+      target_key = block * target_block_stride +
+                   block_offset * scalars_per_token + i;
+    }
+    target[target_key] = source[source_key];
+    target[target_key + target_value_offset] =
+        source[source_key + source_value_offset];
+  }
+}
+
+template <GPUKVFormat format>
+void launch_specagent_direct_host_scatter(
+    const SpecAgentDirectSegments& segments, int segment_count,
+    int max_segment_length, torch::Tensor& target,
+    torch::Tensor& slot_mapping, int target_block_stride,
+    int target_value_offset, int source_stride, int source_value_offset,
+    int num_heads, int head_size_in_64bit, int block_size,
+    cudaStream_t stream) {
+  dim3 grid(max_segment_length, segment_count);
+  dim3 block(std::min(num_heads * head_size_in_64bit, 128));
+  specagent_direct_host_scatter_kernel<format><<<grid, block, 0, stream>>>(
+      segments, static_cast<int64_t*>(target.data_ptr()),
+      static_cast<const int64_t*>(slot_mapping.data_ptr()),
+      target_block_stride, target_value_offset, source_stride,
+      source_value_offset, num_heads, head_size_in_64bit, block_size);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+}  // namespace
+
+void specagent_submit_layer_direct_async(
+    const std::vector<std::vector<torch::Tensor>>& sources_by_plan,
+    const std::vector<std::vector<int>>& token_offsets_by_plan,
+    const std::vector<torch::Tensor>& target_kv_caches,
+    const std::vector<torch::Tensor>& slot_mappings,
+    const GPUKVFormat gpu_kv_format,
+    uintptr_t stream_ptr,
+    uintptr_t scratch_free_event_ptr,
+    uintptr_t ready_event_ptr) {
+  const size_t plan_count = sources_by_plan.size();
+  TORCH_CHECK(token_offsets_by_plan.size() == plan_count,
+              "token offset plan count must match source plan count");
+  TORCH_CHECK(target_kv_caches.size() == plan_count,
+              "target plan count must match source plan count");
+  TORCH_CHECK(slot_mappings.size() == plan_count,
+              "mapping plan count must match source plan count");
+  TORCH_CHECK(plan_count > 0, "at least one direct plan is required");
+  TORCH_CHECK(stream_ptr != 0, "CUDA stream pointer must be initialized");
+  TORCH_CHECK(ready_event_ptr != 0, "ready event must be initialized");
+  TORCH_CHECK(!lmc::is_mla(gpu_kv_format),
+              "direct host scatter does not support MLA");
+
+  const auto device_index = target_kv_caches.front().get_device();
+  const at::cuda::OptionalCUDAGuard device_guard(
+      device_of(target_kv_caches.front()));
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  c10::cuda::CUDAStream external_stream =
+      c10::cuda::getStreamFromExternal(stream, device_index);
+  c10::cuda::CUDAStreamGuard stream_guard(external_stream);
+  if (scratch_free_event_ptr != 0) {
+    CHECK_CUDA_CALL(cudaStreamWaitEvent(
+        stream, reinterpret_cast<cudaEvent_t>(scratch_free_event_ptr), 0));
+  }
+
+  for (size_t plan = 0; plan < plan_count; ++plan) {
+    const auto& sources = sources_by_plan[plan];
+    const auto& offsets = token_offsets_by_plan[plan];
+    auto target = target_kv_caches[plan];
+    auto mapping = slot_mappings[plan];
+    TORCH_CHECK(!sources.empty(), "direct plan has no source segments");
+    TORCH_CHECK(sources.size() == offsets.size(),
+                "source and offset counts must match");
+    TORCH_CHECK(sources.size() <= kSpecAgentMaxDirectSegments,
+                "direct plan exceeds segment limit");
+    TORCH_CHECK(target.is_cuda() && mapping.is_cuda(),
+                "target and mapping must be CUDA tensors");
+    TORCH_CHECK(target.element_size() == 2,
+                "direct host scatter currently requires 16-bit KV");
+
+    const int entries_per_xword = 8 / target.element_size();
+    const bool hnd = lmc::is_hnd(gpu_kv_format);
+    const int block_size = target.size(hnd ? 3 : 2);
+    const int num_heads = target.size(hnd ? 2 : 3);
+    const int head_size_in_64bit =
+        target.size(4) / entries_per_xword;
+    const int target_block_stride =
+        target.stride(gpu_kv_format ==
+                              GPUKVFormat::NL_X_NB_TWO_NH_BS_HS
+                          ? 0
+                          : 1) /
+        entries_per_xword;
+    const int target_value_offset =
+        target.stride(gpu_kv_format ==
+                              GPUKVFormat::NL_X_NB_TWO_NH_BS_HS
+                          ? 1
+                          : 0) /
+        entries_per_xword;
+    const int source_stride = sources.front().stride(0) / entries_per_xword;
+    const int source_value_offset =
+        sources.front().stride(1) / entries_per_xword;
+
+    SpecAgentDirectSegments segments{};
+    int max_segment_length = 0;
+    for (size_t segment = 0; segment < sources.size(); ++segment) {
+      const auto& source = sources[segment];
+      TORCH_CHECK(source.is_cpu() && source.is_contiguous(),
+                  "direct sources must be contiguous CPU tensors");
+      TORCH_CHECK(source.dim() == 3 && source.size(1) == 2,
+                  "direct sources must have token-major KV layout");
+      TORCH_CHECK(source.stride(0) / entries_per_xword == source_stride &&
+                      source.stride(1) / entries_per_xword ==
+                          source_value_offset,
+                  "direct source strides must match");
+      const int token_offset = offsets[segment];
+      const int token_count = source.size(0);
+      TORCH_CHECK(token_offset >= 0 && token_offset <= 65535 &&
+                      token_count > 0 && token_count <= 65535 &&
+                      token_offset + token_count <= mapping.size(0),
+                  "direct source token range is invalid");
+      segments.srcs[segment] = get_kernel_ptr<const int64_t,
+                                               const torch::Tensor>(source);
+      segments.offset_and_length[segment] =
+          static_cast<uint32_t>(token_offset) |
+          (static_cast<uint32_t>(token_count) << 16);
+      max_segment_length = std::max(max_segment_length, token_count);
+    }
+
+#define LAUNCH_DIRECT(FORMAT)                                                \
+  launch_specagent_direct_host_scatter<FORMAT>(                             \
+      segments, sources.size(), max_segment_length, target, mapping,         \
+      target_block_stride, target_value_offset, source_stride,               \
+      source_value_offset, num_heads, head_size_in_64bit, block_size,        \
+      stream);                                                               \
+  break;
+    switch (gpu_kv_format) {
+      case GPUKVFormat::NL_X_TWO_NB_BS_NH_HS:
+        LAUNCH_DIRECT(GPUKVFormat::NL_X_TWO_NB_BS_NH_HS)
+      case GPUKVFormat::NL_X_NB_TWO_BS_NH_HS:
+        LAUNCH_DIRECT(GPUKVFormat::NL_X_NB_TWO_BS_NH_HS)
+      case GPUKVFormat::NL_X_TWO_NB_NH_BS_HS:
+        LAUNCH_DIRECT(GPUKVFormat::NL_X_TWO_NB_NH_BS_HS)
+      case GPUKVFormat::NL_X_NB_TWO_NH_BS_HS:
+        LAUNCH_DIRECT(GPUKVFormat::NL_X_NB_TWO_NH_BS_HS)
+      default:
+        TORCH_CHECK(false, "unsupported format for direct host scatter");
+    }
+#undef LAUNCH_DIRECT
+  }
+  CHECK_CUDA_CALL(cudaEventRecord(
+      reinterpret_cast<cudaEvent_t>(ready_event_ptr), stream));
+}

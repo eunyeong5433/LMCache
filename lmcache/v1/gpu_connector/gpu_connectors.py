@@ -1295,6 +1295,14 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             ]
         ] = []
         self._specagent_fused_debug_checked_layers: set[int] = set()
+        # Native producer ready events are initialized once on the model
+        # thread and retained per layer.  A later request may add a retriever
+        # after the global layer scan has advanced, so consuming the event on
+        # first use leaves that request without a background-safe event.  CUDA
+        # stream waits bind to the latest record visible when the wait is
+        # submitted; re-recording this persistent handle is safe and pending
+        # source leases are conservatively kept until its latest record ends.
+        self._specagent_native_ready_events: dict[int, torch.cuda.Event] = {}
 
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
 
@@ -1431,6 +1439,22 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             )
         )
 
+    def specagent_prepare_native_layers(
+        self,
+        first_layer: int,
+        last_layer: int,
+    ) -> None:
+        """Initialize native-producer events on the model thread."""
+        if not os.environ.get("SPECAGENT_NATIVE_LAYER_PRODUCER"):
+            return
+        first = max(0, int(first_layer))
+        last = min(int(last_layer), self.num_layers - 1)
+        for layer_id in range(first, last + 1):
+            if layer_id not in self._specagent_native_ready_events:
+                self._specagent_native_ready_events[layer_id] = (
+                    _specagent_record_cuda_event(self.load_stream)
+                )
+
     def specagent_flush_deferred_layer(
         self,
         layer_id: int,
@@ -1526,14 +1550,179 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         f"transfer_tokens={transfer_tokens}"
                     )
 
-        with torch.cuda.stream(self.load_stream):
-            copy_dsts = [
-                dst for plan in plans for dst in plan["copy_dsts"]
-            ]
-            copy_srcs = [
-                src for plan in plans for src in plan["copy_srcs"]
-            ]
-            profile_bw = bool(os.environ.get("SPECAGENT_BW_PROFILE"))
+        native_ready = self._specagent_native_ready_events.get(int(layer_id))
+        native_submit = getattr(
+            lmc_ops, "specagent_submit_layer_async", None
+        )
+        direct_submit = getattr(
+            lmc_ops, "specagent_submit_layer_direct_async", None
+        )
+        copy_dsts = [
+            dst for plan in plans for dst in plan["copy_dsts"]
+        ]
+        copy_srcs = [
+            src for plan in plans for src in plan["copy_srcs"]
+        ]
+        direct_plans = all(
+            plan.get("direct_token_offsets") is not None for plan in plans
+        )
+        use_direct = bool(
+            native_ready is not None
+            and callable(direct_submit)
+            and os.environ.get("SPECAGENT_DIRECT_HOST_SCATTER")
+            and not os.environ.get("SPECAGENT_BW_PROFILE")
+            and not self.use_mla
+            and direct_plans
+            and all(
+                0 < len(plan["copy_srcs"]) <= 256
+                and len(plan["direct_token_offsets"])
+                    == len(plan["copy_srcs"])
+                and all(
+                    src.device.type == "cpu"
+                    and src.is_contiguous()
+                    for src in plan["copy_srcs"]
+                )
+                for plan in plans
+            )
+        )
+        if direct_plans and not use_direct:
+            raise RuntimeError(
+                "direct host scatter plan became ineligible after omitting "
+                "the temporary GPU buffer: "
+                f"ready={native_ready is not None} "
+                f"submit={callable(direct_submit)} "
+                f"direct_env={bool(os.environ.get('SPECAGENT_DIRECT_HOST_SCATTER'))} "
+                f"bw_profile={bool(os.environ.get('SPECAGENT_BW_PROFILE'))} "
+                f"use_mla={self.use_mla} "
+                f"segments={[len(plan['copy_srcs']) for plan in plans]} "
+                f"offsets={[len(plan['direct_token_offsets']) for plan in plans]}"
+            )
+        use_native = bool(
+            not use_direct
+            and native_ready is not None
+            and callable(native_submit)
+            and os.environ.get("SPECAGENT_NATIVE_LAYER_PRODUCER")
+            and not os.environ.get("SPECAGENT_BW_PROFILE")
+            and all(
+                _can_raw_h2d_copy(dst, src)
+                for plan in plans
+                for dst, src in zip(
+                    plan["copy_dsts"], plan["copy_srcs"], strict=False
+                )
+            )
+        )
+        if use_direct:
+            direct_submit(
+                [list(plan["copy_srcs"]) for plan in plans],
+                [list(plan["direct_token_offsets"]) for plan in plans],
+                [plan["target_kv_cache"] for plan in plans],
+                [plan["slot_mapping"] for plan in plans],
+                self.gpu_kv_format,
+                int(self.load_stream.cuda_stream),
+                (
+                    int(scratch_free_event.cuda_event)
+                    if scratch_free_event is not None else 0
+                ),
+                int(native_ready.cuda_event),
+            )
+            ready = native_ready
+            h2d_start = h2d_end = scatter_start = scatter_end = None
+        elif use_native:
+            native_submit(
+                [int(dst.data_ptr()) for dst in copy_dsts],
+                [int(src.data_ptr()) for src in copy_srcs],
+                [
+                    int(src.numel() * src.element_size())
+                    for src in copy_srcs
+                ],
+                [plan["transfer_tensor"] for plan in plans],
+                [plan["target_kv_cache"] for plan in plans],
+                [plan["slot_mapping"] for plan in plans],
+                self.gpu_kv_format,
+                int(self.load_stream.cuda_stream),
+                (
+                    int(scratch_free_event.cuda_event)
+                    if scratch_free_event is not None else 0
+                ),
+                int(native_ready.cuda_event),
+            )
+            ready = native_ready
+            h2d_start = h2d_end = scatter_start = scatter_end = None
+        else:
+            # An initialized event that could not use the native path must not
+            # leak into the next request for this layer.
+            with torch.cuda.stream(self.load_stream):
+                copy_dsts = [
+                    dst for plan in plans for dst in plan["copy_dsts"]
+                ]
+                copy_srcs = [
+                    src for plan in plans for src in plan["copy_srcs"]
+                ]
+                profile_bw = bool(os.environ.get("SPECAGENT_BW_PROFILE"))
+                h2d_bytes = sum(
+                    int(src.numel() * src.element_size()) for src in copy_srcs
+                )
+                scatter_bytes = sum(
+                    int(plan["transfer_tensor"].numel())
+                    * int(plan["transfer_tensor"].element_size())
+                    for plan in plans
+                )
+                h2d_start = (
+                    _specagent_record_cuda_event(
+                        self.load_stream, enable_timing=True
+                    )
+                    if profile_bw else None
+                )
+                if copy_dsts:
+                    if all(
+                        _can_raw_h2d_copy(dst, src)
+                        for dst, src in zip(
+                            copy_dsts, copy_srcs, strict=False
+                        )
+                    ):
+                        _raw_h2d_copy_batch_async(copy_dsts, copy_srcs)
+                    else:
+                        # Preserve the existing correctness fallback for
+                        # unusual storage backends or tensor layouts.
+                        for plan in plans:
+                            torch._foreach_copy_(
+                                plan["copy_dsts"],
+                                plan["copy_srcs"],
+                                non_blocking=True,
+                            )
+                h2d_end = (
+                    _specagent_record_cuda_event(
+                        self.load_stream, enable_timing=True
+                    )
+                    if profile_bw else None
+                )
+
+                # H2D targets only the existing per-retriever temporary
+                # buffers, so it can run while the current layer reads
+                # scratch. Delay only writes into the parity scratch ring.
+                if scratch_free_event is not None:
+                    self.load_stream.wait_event(scratch_free_event)
+                scatter_start = (
+                    _specagent_record_cuda_event(
+                        self.load_stream, enable_timing=True
+                    )
+                    if profile_bw else None
+                )
+                lmc_ops.specagent_multi_scatter(
+                    [plan["transfer_tensor"] for plan in plans],
+                    [plan["target_kv_cache"] for plan in plans],
+                    [plan["slot_mapping"] for plan in plans],
+                    self.gpu_kv_format,
+                )
+                scatter_end = (
+                    _specagent_record_cuda_event(
+                        self.load_stream, enable_timing=True
+                    )
+                    if profile_bw else None
+                )
+                ready = _specagent_record_cuda_event(self.load_stream)
+
+        if not use_native and not use_direct:
             h2d_bytes = sum(
                 int(src.numel() * src.element_size()) for src in copy_srcs
             )
@@ -1542,60 +1731,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 * int(plan["transfer_tensor"].element_size())
                 for plan in plans
             )
-            h2d_start = (
-                _specagent_record_cuda_event(
-                    self.load_stream, enable_timing=True
-                )
-                if profile_bw else None
-            )
-            if copy_dsts:
-                if all(
-                    _can_raw_h2d_copy(dst, src)
-                    for dst, src in zip(
-                        copy_dsts, copy_srcs, strict=False
-                    )
-                ):
-                    _raw_h2d_copy_batch_async(copy_dsts, copy_srcs)
-                else:
-                    # Preserve the existing correctness fallback for unusual
-                    # storage backends or tensor layouts.
-                    for plan in plans:
-                        torch._foreach_copy_(
-                            plan["copy_dsts"],
-                            plan["copy_srcs"],
-                            non_blocking=True,
-                        )
-            h2d_end = (
-                _specagent_record_cuda_event(
-                    self.load_stream, enable_timing=True
-                )
-                if profile_bw else None
-            )
-
-            # H2D targets only the existing per-retriever temporary buffers,
-            # so it can run while the current layer reads scratch.  Delay only
-            # the writes into the two-slot scratch ring.
-            if scratch_free_event is not None:
-                self.load_stream.wait_event(scratch_free_event)
-            scatter_start = (
-                _specagent_record_cuda_event(
-                    self.load_stream, enable_timing=True
-                )
-                if profile_bw else None
-            )
-            lmc_ops.specagent_multi_scatter(
-                [plan["transfer_tensor"] for plan in plans],
-                [plan["target_kv_cache"] for plan in plans],
-                [plan["slot_mapping"] for plan in plans],
-                self.gpu_kv_format,
-            )
-            scatter_end = (
-                _specagent_record_cuda_event(
-                    self.load_stream, enable_timing=True
-                )
-                if profile_bw else None
-            )
-            ready = _specagent_record_cuda_event(self.load_stream)
 
         if (
             h2d_start is not None
@@ -1620,10 +1755,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         self._specagent_pending_deferred_plans.append((ready, plans))
 
         # Debug-only, exact payload validation.  Full-model recomputation is
-        # not bit-identical for this path, so validate the two operations that
-        # the fused submit changes instead: pinned CPU -> temporary GPU tensor,
-        # then temporary tensor -> paged scratch KV.  Synchronization and
-        # device-to-host copies are intentionally confined to this opt-in path.
+        # not bit-identical for this path, so validate the fetched CPU payload
+        # against paged scratch KV. Synchronization and device-to-host copies
+        # are intentionally confined to this opt-in path.
         if os.environ.get("SPECAGENT_FUSED_TRANSFER_DEBUG"):
             layer_filter_raw = os.environ.get(
                 "SPECAGENT_FUSED_TRANSFER_DEBUG_LAYERS", "0,1,45"
@@ -1645,28 +1779,52 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 for plan_idx, plan in enumerate(plans):
                     h2d_mismatch = 0
                     h2d_max = 0.0
-                    for dst, src in zip(
-                        plan["copy_dsts"],
-                        plan["copy_srcs"],
-                        strict=True,
-                    ):
-                        actual = dst.detach().cpu()
-                        expected = src.detach().cpu()
-                        h2d_mismatch += int(
-                            torch.count_nonzero(actual != expected).item()
-                        )
-                        if actual.numel():
-                            h2d_max = max(
-                                h2d_max,
-                                float(
-                                    (
-                                        actual.float()
-                                        - expected.float()
-                                    ).abs().max().item()
-                                ),
-                            )
-
                     transfer = plan["transfer_tensor"]
+                    if use_direct:
+                        first_source = plan["copy_srcs"][0]
+                        expected_cpu = torch.zeros(
+                            (
+                                int(plan["slot_mapping"].numel()),
+                                *tuple(first_source.shape[1:]),
+                            ),
+                            dtype=first_source.dtype,
+                            device="cpu",
+                        )
+                        for offset, src in zip(
+                            plan["direct_token_offsets"],
+                            plan["copy_srcs"],
+                            strict=True,
+                        ):
+                            expected_cpu[
+                                offset : offset + int(src.shape[0])
+                            ].copy_(src)
+                        transfer = expected_cpu.to(
+                            device=plan["target_kv_cache"].device
+                        )
+                    else:
+                        for dst, src in zip(
+                            plan["copy_dsts"],
+                            plan["copy_srcs"],
+                            strict=True,
+                        ):
+                            actual = dst.detach().cpu()
+                            expected = src.detach().cpu()
+                            h2d_mismatch += int(
+                                torch.count_nonzero(
+                                    actual != expected
+                                ).item()
+                            )
+                            if actual.numel():
+                                h2d_max = max(
+                                    h2d_max,
+                                    float(
+                                        (
+                                            actual.float()
+                                            - expected.float()
+                                        ).abs().max().item()
+                                    ),
+                                )
+
                     target = plan["target_kv_cache"]
                     mapping = plan["slot_mapping"].to(
                         device=transfer.device, dtype=torch.long
@@ -1729,7 +1887,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         "scatter_mismatch=%d scatter_max=%.6g",
                         layer_id,
                         plan_idx,
-                        len(plan["copy_dsts"]),
+                        len(plan["copy_srcs"]),
                         checked_tokens,
                         h2d_mismatch,
                         h2d_max,
@@ -1867,14 +2025,19 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             layout_hints=layout_hints,
         )
 
-    def _lazy_initialize_buffer(self, kv_caches):
+    def _lazy_initialize_buffer(
+        self,
+        kv_caches,
+        *,
+        allocate_staging: bool = True,
+    ):
         """
         Lazily initialize the GPU buffer allocator if it is not initialized yet.
         Currently, we use the `kv_caches` (kv cache pointer) to determine
         the gpu buffer size in gpu connector.
         Also, the first request might be a bit slower due to buffer creation.
         """
-        if self.use_gpu and self.gpu_buffer_allocator is None:
+        if self.use_gpu and not hasattr(self, "block_size"):
             logger.info("Lazily initializing GPU buffer.")
             # NOTE (Jiayi): We use the first layer to determine the gpu buffer size.
             # NOTE (Jiayi): Using the exact number of tokens in the first layer
@@ -1908,9 +2071,15 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 _per_tok = self.elements_per_layer // self.tokens_per_layer
                 _eff_elems = max(
                     self.elements_per_layer, _min_tok * _per_tok)
-            gpu_buffer_size = _eff_elems * self.element_size
+            self._specagent_gpu_buffer_size = _eff_elems * self.element_size
+
+        if (
+            self.use_gpu
+            and allocate_staging
+            and self.gpu_buffer_allocator is None
+        ):
             self.gpu_buffer_allocator = GPUMemoryAllocator(
-                gpu_buffer_size, device=self.device
+                self._specagent_gpu_buffer_size, device=self.device
             )
 
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -1987,8 +2156,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             kwargs.get("specagent_defer_store_tmp_buffer_free", True)
         )
 
-        self._lazy_initialize_buffer(kvcaches)
-
         slot_mapping_chunks = []
         write_mask_chunks = []
         for start, end in zip(starts, ends, strict=False):
@@ -2061,8 +2228,35 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         num_tokens = len(slot_mapping_full)
 
+        specagent_layer_events = kwargs.get("specagent_layer_events")
+        event_synchronized_load = isinstance(specagent_layer_events, list)
+        defer_layer_submit = bool(
+            kwargs.get("specagent_defer_layer_submit")
+            and self.use_gpu
+            and event_synchronized_load
+        )
+        direct_without_tmp = bool(
+            defer_layer_submit
+            and os.environ.get("SPECAGENT_DIRECT_HOST_SCATTER")
+            and not os.environ.get("SPECAGENT_BW_PROFILE")
+            and not self.use_mla
+            and callable(
+                getattr(lmc_ops, "specagent_submit_layer_direct_async", None)
+            )
+            and 0 < (
+                len(copy_plan) if copy_plan is not None
+                else len(slot_mapping_chunks)
+            ) <= 256
+        )
+        # Direct mapped-host scatter needs layout metadata, but not the legacy
+        # preallocated GPU staging pool.  A later store or fallback load can
+        # still allocate that pool lazily through the default call.
+        self._lazy_initialize_buffer(
+            kvcaches, allocate_staging=not direct_without_tmp
+        )
+
         tmp_gpu_buffer_obj: Optional[MemoryObj] = None
-        if self.use_gpu:
+        if self.use_gpu and not direct_without_tmp:
             buffer_shape = self.get_shape(num_tokens)
             assert self.gpu_buffer_allocator is not None
             self._specagent_release_completed_store_buffers()
@@ -2109,12 +2303,31 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             )
             self._specagent_claim_pending_fetch_reservation(num_tokens)
             assert tmp_gpu_buffer_obj.tensor is not None
+        elif direct_without_tmp:
+            # The scheduler reserved the legacy staging capacity before the
+            # connector knew this request would read host KV directly. Consume
+            # that pending reservation even though no physical GPU staging
+            # allocation is needed.
+            self._specagent_claim_pending_fetch_reservation(num_tokens)
 
         # foreach-alt: precompute layer-invariant dst views into the tmp buffer
         # once (chunk lengths from slot_mapping_chunks). Removes per-chunk Python
         # (zip/bounds/assert/slice/offset) from the per-layer hot loop.
         _fa_dsts: Optional[list] = None
-        if self.use_gpu:
+        _direct_offsets: Optional[list[int]] = None
+        if direct_without_tmp:
+            if copy_plan is not None:
+                _direct_offsets = [
+                    int(dst_start)
+                    for _, _, _, dst_start, _ in copy_plan
+                ]
+            else:
+                _direct_offsets = []
+                _fa_off = 0
+                for _smc in slot_mapping_chunks:
+                    _direct_offsets.append(_fa_off)
+                    _fa_off += len(_smc)
+        elif self.use_gpu:
             _fa_dsts = []
             if copy_plan is not None:
                 for _, _, _, dst_start, dst_end in copy_plan:
@@ -2143,13 +2356,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             "specagent_deferred_source_owner"
         )
         bw_profile_records = []
-        specagent_layer_events = kwargs.get("specagent_layer_events")
-        event_synchronized_load = isinstance(specagent_layer_events, list)
-        defer_layer_submit = bool(
-            kwargs.get("specagent_defer_layer_submit")
-            and self.use_gpu
-            and event_synchronized_load
-        )
         if os.environ.get("SPECAGENT_FUSED_TRANSFER_DEBUG"):
             logger.error(
                 "[SpecAgent][FUSED-CONNECTOR] requested=%s use_gpu=%s "
@@ -2223,7 +2429,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                                     _fa_srcs.append(src[src_start:src_end])
                         else:
                             _fa_srcs = [mo.tensor for mo in memory_objs_layer]
-                    _fa_n = min(len(_fa_dsts), len(_fa_srcs))
+                    if _direct_offsets is not None:
+                        _fa_n = min(len(_direct_offsets), len(_fa_srcs))
+                    else:
+                        _fa_n = min(len(_fa_dsts), len(_fa_srcs))
                     if _fa_n and not defer_layer_submit:
                         with _lmc_record(
                             "lmcache gpu_send: h2d_copy "
@@ -2274,7 +2483,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 if _hb:
                     _hb_c1 = _hbt.perf_counter(); _hb_copy += _hb_c1 - _hb_t0
                 if self.use_gpu:
-                    transfer_tensor = tmp_gpu_buffer_obj.tensor
+                    transfer_tensor = (
+                        None if direct_without_tmp
+                        else tmp_gpu_buffer_obj.tensor
+                    )
                     transfer_slot_mapping = slot_mapping_full
                     if defer_layer_submit:
                         # cache_engine releases the reference obtained from
@@ -2292,9 +2504,18 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         self._specagent_deferred_layer_fetches.setdefault(
                             int(layer_id), []
                         ).append({
-                            "copy_dsts": list(_fa_dsts[:_fa_n]),
+                            "copy_dsts": (
+                                [] if _fa_dsts is None
+                                else list(_fa_dsts[:_fa_n])
+                            ),
                             "copy_srcs": list(_fa_srcs[:_fa_n]),
-                            "transfer_tensor": transfer_tensor,
+                            "transfer_tensor": (
+                                None if direct_without_tmp else transfer_tensor
+                            ),
+                            "direct_token_offsets": (
+                                list(_direct_offsets[:_fa_n])
+                                if _direct_offsets is not None else None
+                            ),
                             "target_kv_cache": kvcaches[layer_id],
                             "slot_mapping": transfer_slot_mapping,
                             "layer_events": specagent_layer_events,
@@ -2311,6 +2532,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             ),
                         })
                     else:
+                        assert transfer_tensor is not None
                         with _lmc_record(
                             "lmcache gpu_send: xfer_to_kvcache "
                             f"layer={layer_id} tokens={num_tokens}"

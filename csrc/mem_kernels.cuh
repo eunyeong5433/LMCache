@@ -146,6 +146,35 @@ void specagent_multi_scatter(
     const std::vector<torch::Tensor>& slot_mappings,
     const GPUKVFormat gpu_kv_format);
 
+// Enqueue one complete SpecAgent layer transfer on an explicitly supplied
+// stream.  This entry point is safe to call from the background producer: it
+// avoids PyTorch's stream/event recording path there and keeps the Python
+// model thread out of the per-layer CUDA submission critical path.
+void specagent_submit_layer_async(
+    const std::vector<uintptr_t>& dests,
+    const std::vector<uintptr_t>& srcs,
+    const std::vector<size_t>& nbytes,
+    const std::vector<torch::Tensor>& transfer_tensors,
+    const std::vector<torch::Tensor>& target_kv_caches,
+    const std::vector<torch::Tensor>& slot_mappings,
+    const GPUKVFormat gpu_kv_format,
+    uintptr_t stream_ptr,
+    uintptr_t scratch_free_event_ptr,
+    uintptr_t ready_event_ptr);
+
+// Read token-major KV segments directly from mapped host memory and scatter
+// them into one paged scratch layer. All segments for a plan are handled by a
+// single CUDA kernel launch.
+void specagent_submit_layer_direct_async(
+    const std::vector<std::vector<torch::Tensor>>& sources_by_plan,
+    const std::vector<std::vector<int>>& token_offsets_by_plan,
+    const std::vector<torch::Tensor>& target_kv_caches,
+    const std::vector<torch::Tensor>& slot_mappings,
+    const GPUKVFormat gpu_kv_format,
+    uintptr_t stream_ptr,
+    uintptr_t scratch_free_event_ptr,
+    uintptr_t ready_event_ptr);
+
 // deprecated / unused except in unit tests
 void load_and_reshape_flash(torch::Tensor& key_value, torch::Tensor& key_cache,
                             torch::Tensor& value_cache,

@@ -56,6 +56,20 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("lmcache_memcpy_async_batch", &lmcache_memcpy_async_batch);
   m.def("lmcache_memcpy_batch_async", &lmcache_memcpy_batch_async);
   m.def("specagent_multi_scatter", &specagent_multi_scatter);
+  m.def("specagent_submit_layer_async", &specagent_submit_layer_async,
+        py::arg("dests"), py::arg("srcs"), py::arg("nbytes"),
+        py::arg("transfer_tensors"), py::arg("target_kv_caches"),
+        py::arg("slot_mappings"), py::arg("gpu_kv_format"),
+        py::arg("stream_ptr"), py::arg("scratch_free_event_ptr") = 0,
+        py::arg("ready_event_ptr") = 0,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("specagent_submit_layer_direct_async",
+        &specagent_submit_layer_direct_async, py::arg("sources_by_plan"),
+        py::arg("token_offsets_by_plan"), py::arg("target_kv_caches"),
+        py::arg("slot_mappings"), py::arg("gpu_kv_format"),
+        py::arg("stream_ptr"), py::arg("scratch_free_event_ptr") = 0,
+        py::arg("ready_event_ptr") = 0,
+        py::call_guard<py::gil_scoped_release>());
   m.def("encode_fast_new", &encode_cuda_new);
   m.def("decode_fast_new", &decode_cuda_new);
   m.def("decode_fast_prefsum", &decode_cuda_prefsum);
