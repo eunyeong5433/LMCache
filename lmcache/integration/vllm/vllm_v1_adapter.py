@@ -1193,6 +1193,7 @@ class LMCacheConnectorV1Impl:
 
         self.layerwise_retrievers = []
         self._specagent_layerwise_meta = []
+        self._specagent_normal_next_layer: dict[int, int] = {}
         sa_lead = max(1, int(sa_extra.get("layer_prefetch_granularity", 2)))
         self._specagent_prefetch_lead = sa_lead
         self._specagent_layer_group_size = sa_lead
@@ -1388,6 +1389,17 @@ class LMCacheConnectorV1Impl:
                             sa_fetch_reqs.get(request.req_id),
                             lmcache_cached_tokens,
                         )
+                    continue
+
+                if (self.use_layerwise and not use_specagent_buf
+                        and _specagent_env_true("SPECAGENT_PAGED_BULK_RESTORE")):
+                    from lmcache.v1.specagent_paged_bulk import restore_paged_bulk
+
+                    restore_paged_bulk(
+                        self.lmcache_engine, tokens, effective_chunk_segments,
+                        clipped_ranges, target_kvcaches, slot_mapping,
+                        request.request_configs,
+                    )
                     continue
 
                 shared_chunk_plans = None
@@ -1695,6 +1707,20 @@ class LMCacheConnectorV1Impl:
                                     seg_start,
                                     seg_end,
                                 )
+                )
+                continue
+
+            if (self.use_layerwise
+                    and _specagent_env_true("SPECAGENT_PAGED_BULK_RESTORE")):
+                from lmcache.v1.specagent_paged_bulk import restore_paged_bulk
+
+                start = request.load_spec.vllm_cached_tokens
+                aligned_start = start // self._lmcache_chunk_size * self._lmcache_chunk_size
+                restore_paged_bulk(
+                    self.lmcache_engine, tokens[:lmcache_cached_tokens],
+                    [(aligned_start, lmcache_cached_tokens)],
+                    [(start, lmcache_cached_tokens)], target_kvcaches,
+                    slot_mapping[:lmcache_cached_tokens], request.request_configs,
                 )
                 continue
 
@@ -2223,6 +2249,35 @@ class LMCacheConnectorV1Impl:
                     if idx < len(self._specagent_layerwise_meta)
                     else {}
                 )
+                if meta is None:
+                    # Ordinary loads share a batch with SPEC fetches, but have
+                    # no per-layer events. Their two setup advances have loaded
+                    # layer 0. Advance the remaining layers alongside SPEC;
+                    # skipping them also skips the staging-buffer finalizer.
+                    progress = self._specagent_normal_next_layer
+                    next_layer = progress.get(idx, 1)
+                    while next_layer <= layer_id:
+                        try:
+                            next(layerwise_retriever)
+                        except StopIteration as exc:
+                            raise RuntimeError(
+                                "NORMAL KV load ended before its last layer"
+                            ) from exc
+                        next_layer += 1
+                        progress[idx] = next_layer
+                    if layer_id == self.num_layers - 1 and next_layer == self.num_layers:
+                        # Finish the generator's synchronization and explicit
+                        # release, which also publishes current staging usage.
+                        for _ in layerwise_retriever:
+                            pass
+                        progress[idx] = self.num_layers + 1
+                        if os.environ.get("SPECAGENT_STAGING_AUDIT"):
+                            logger.error(
+                                "[SpecAgent][MIXED-NORMAL-FINALIZE] "
+                                "retriever=%d layers=%d finalized=true",
+                                idx, self.num_layers,
+                            )
+                    continue
                 events = (
                     meta.get("layer_events") if isinstance(meta, dict) else None
                 )
@@ -3639,6 +3694,8 @@ class LMCacheConnectorV1Impl:
             req_id=request.req_id,
             specagent_block_size=self._block_size,
             specagent_save_current_layer_only=False,
+            # Publish CPU KV only after all layers finish on the store stream.
+            specagent_defer_layerwise_store_commit=True,
         )
         for _ in storer:
             pass

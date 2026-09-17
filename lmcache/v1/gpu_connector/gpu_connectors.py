@@ -1221,7 +1221,78 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
 
 class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
-    """ """
+    """Layer-keyed CPU storage with layerwise and paged-bulk restore paths."""
+
+    def specagent_restore_paged_bulk(
+        self,
+        layers: list[list[MemoryObj]],
+        starts: list[int],
+        ends: list[int],
+        write_ranges: list[tuple[int, int]],
+        kvcaches: list[torch.Tensor],
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Submit every paged layer in one native call, then wait once.
+
+        CPU storage remains layer-keyed for scratch VERIFY compatibility.
+        No layerwise retrievers or temporary GPU staging buffers are used.
+        """
+        self.initialize_kvcaches_ptr(kvcaches=kvcaches)
+        kvcaches = self.kvcaches
+        assert kvcaches is not None
+        gpu_kv_format = discover_gpu_kv_format(
+            kvcaches, EngineType.VLLM, layout_hints=self.layout_hints
+        )
+        assert_is_vllm_flash_attn_or_flash_infer(gpu_kv_format)
+        if self.use_mla or len(layers) != self.num_layers:
+            raise ValueError("Paged bulk restore requires complete non-MLA layers")
+        if len(starts) != len(ends) or not starts:
+            raise ValueError("Invalid paged bulk chunk ranges")
+        if len(kvcaches) != self.num_layers:
+            raise ValueError("Incomplete paged bulk destination layers")
+        previous_end = 0
+        for start, end in write_ranges:
+            if start < previous_end or start >= end or end > slot_mapping.numel():
+                raise ValueError("Invalid paged bulk write ranges")
+            previous_end = end
+        sources = []
+        offsets = []
+        targets = []
+        mappings = []
+        # Keep the 256-segment native limit local to each submission plan.
+        for layer_id, objects in enumerate(layers):
+            if len(objects) != len(starts):
+                raise ValueError("Incomplete paged bulk source layer")
+            layer_sources = []
+            for obj, start, end in zip(objects, starts, ends, strict=True):
+                source = obj.tensor
+                if (source is None or source.device.type != "cpu"
+                        or not source.is_contiguous() or source.ndim != 3
+                        or source.shape[0] != end - start or source.shape[1] != 2
+                        or source.shape[2] != self.hidden_dim_size
+                        or source.dtype != kvcaches[layer_id].dtype):
+                    raise ValueError("Invalid paged bulk CPU source layout")
+                layer_sources.append(source)
+            for first in range(0, len(starts), 256):
+                sources.append(layer_sources[first:first + 256])
+                offsets.append(starts[first:first + 256])
+                targets.append(kvcaches[layer_id])
+        current = torch.cuda.current_stream(self.device)
+        ready = torch.cuda.Event()
+        try:
+            self.load_stream.wait_stream(current)
+            with torch.cuda.stream(self.load_stream):
+                writable = torch.full_like(slot_mapping, -1)
+                for start, end in write_ranges:
+                    writable[start:end].copy_(slot_mapping[start:end])
+                mappings = [writable] * len(targets)
+                ready.record(self.load_stream)
+                lmc_ops.specagent_submit_layer_direct_async(
+                    sources, offsets, targets, mappings, gpu_kv_format,
+                    int(self.load_stream.cuda_stream), 0, int(ready.cuda_event),
+                )
+        finally:
+            self.load_stream.synchronize()
 
     def __init__(
         self,
@@ -1322,6 +1393,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         scheduler ledger.
         """
         trace_enabled = bool(os.environ.get("LMCACHE_ALLOC_TRACE"))
+        audit_enabled = bool(os.environ.get("SPECAGENT_STAGING_AUDIT"))
         gpu_allocator = self.gpu_buffer_allocator
         allocator = getattr(gpu_allocator, "allocator", None)
         address_manager = getattr(allocator, "address_manager", None)
@@ -1353,9 +1425,17 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             if per_token_bytes and int(size) > 0
         ]
         import builtins as _sa_b
+        previous_tokens = getattr(_sa_b, "_sa_staging_physical_allocated_tokens", None)
         _sa_b._sa_staging_physical_allocated_tokens = allocated_tokens
         _sa_b._sa_staging_physical_pool_tokens = pool_tokens
         _sa_b._sa_staging_physical_free_spans_tokens = free_span_tokens
+        if audit_enabled and (action != "refresh" or previous_tokens != allocated_tokens):
+            logger.error(
+                "[SpecAgent][STAGING-AUDIT] action=%s kind=%s tokens=%d "
+                "allocated=%d previous=%s pool=%d mono=%.6f",
+                action, kind, num_tokens, allocated_tokens, previous_tokens,
+                pool_tokens, time.monotonic(),
+            )
         if not trace_enabled:
             return
         logger.info(
@@ -2016,6 +2096,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         """
         self._specagent_release_completed_store_buffers()
         self.specagent_flush_deferred_layer(-1)
+        # Destruction can return a buffer outside the explicit release path.
+        # Refresh allocator telemetry even on decode steps with no new fetch.
+        self._specagent_log_staging_physical("refresh", "pool", 0)
         pending_profiles = []
         for profile in self._specagent_pending_fused_bw_profiles:
             (
