@@ -2403,6 +2403,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             # TODO(Jiayi): Optimize away this `cat`
             slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
 
+        # The mapping is produced on the caller's stream, including for
+        # deferred/native scatter. Scratch reuse alone does not order this cat.
+        self.load_stream.wait_stream(torch.cuda.current_stream())
+
         num_tokens = len(slot_mapping_full)
 
         specagent_layer_events = kwargs.get("specagent_layer_events")
