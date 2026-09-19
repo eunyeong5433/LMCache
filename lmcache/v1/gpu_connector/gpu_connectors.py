@@ -9,6 +9,7 @@ import time
 from contextlib import nullcontext
 
 # Third Party
+import numpy as np
 import torch
 
 # First Party
@@ -2358,42 +2359,29 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             for chunk_idx, (slot_mapping_chunk, mask_chunk) in enumerate(
                 zip(slot_mapping_chunks, write_mask_chunks, strict=False)
             ):
-                true_positions = torch.nonzero(mask_chunk, as_tuple=False).flatten()
-                if true_positions.numel() == 0:
+                # Find transitions in the CPU mask instead of visiting every
+                # true token in Python. Each chunk keeps its own source offsets.
+                mask_np = mask_chunk.numpy()
+                if mask_np.size == 0:
                     continue
-                positions = [int(pos) for pos in true_positions.tolist()]
-                run_start = positions[0]
-                prev = positions[0]
-                for pos in positions[1:]:
-                    if pos != prev + 1:
-                        run_end = prev + 1
-                        run_len = run_end - run_start
-                        copy_plan.append((
-                            chunk_idx,
-                            run_start,
-                            run_end,
-                            dst_offset,
-                            dst_offset + run_len,
-                        ))
-                        compact_slot_mapping_chunks.append(
-                            slot_mapping_chunk[run_start:run_end]
-                        )
-                        dst_offset += run_len
-                        run_start = pos
-                    prev = pos
-                run_end = prev + 1
-                run_len = run_end - run_start
-                copy_plan.append((
-                    chunk_idx,
-                    run_start,
-                    run_end,
-                    dst_offset,
-                    dst_offset + run_len,
-                ))
-                compact_slot_mapping_chunks.append(
-                    slot_mapping_chunk[run_start:run_end]
-                )
-                dst_offset += run_len
+                if mask_np.all():
+                    edges = [0, len(mask_np)]
+                else:
+                    edges = (np.flatnonzero(mask_np[1:] != mask_np[:-1]) + 1).tolist()
+                    if mask_np[0]:
+                        edges.insert(0, 0)
+                    if mask_np[-1]:
+                        edges.append(len(mask_np))
+                for run_start, run_end in zip(edges[::2], edges[1::2], strict=True):
+                    run_len = run_end - run_start
+                    copy_plan.append((
+                        chunk_idx, run_start, run_end,
+                        dst_offset, dst_offset + run_len,
+                    ))
+                    compact_slot_mapping_chunks.append(
+                        slot_mapping_chunk[run_start:run_end]
+                    )
+                    dst_offset += run_len
             slot_mapping_full = (
                 torch.cat(compact_slot_mapping_chunks, dim=0)
                 if compact_slot_mapping_chunks
