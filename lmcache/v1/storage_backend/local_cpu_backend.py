@@ -145,14 +145,20 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 with _lmc_record(
                     f"lmcache local_cpu: batched_contains_locked keys={len(keys)}"
                 ):
-                    for key in keys:
-                        if key not in self.hot_cache:
-                            return num_hit_chunks
-                        if pin:
-                            self.hot_cache[key].pin()
-                            # vllm lookup sets pin to True
+                    if pin:
+                        for key in keys:
+                            memory_obj = self.hot_cache.get(key)
+                            if memory_obj is None:
+                                return num_hit_chunks
+                            memory_obj.pin()
+                            # Preserve per-hit pinning and request key order.
                             self.keys_in_request.append(key)
-                        num_hit_chunks += 1
+                            num_hit_chunks += 1
+                    else:
+                        for key in keys:
+                            if key not in self.hot_cache:
+                                return num_hit_chunks
+                            num_hit_chunks += 1
             return num_hit_chunks
 
     def touch_cache(self):
