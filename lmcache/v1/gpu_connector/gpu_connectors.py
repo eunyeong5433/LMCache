@@ -69,6 +69,51 @@ def _specagent_release_memory_obj_leases(
         memory_obj.ref_count_down()
 
 
+class _SpecAgentLazySources:
+    """Deferred-plan source list of one layer, materialized only on demand.
+
+    Holds the layer's borrowed native-bulk views and the shared copy plan; the
+    whole-plan owner keeps every view's memory alive. Deliberately not a list:
+    an unconverted consumer fails loudly instead of reading an empty list.
+    """
+
+    specagent_lazy_sources = True
+    __slots__ = ("memory_objs", "copy_plan", "count")
+
+    def __init__(self, memory_objs, copy_plan, count):
+        self.memory_objs = memory_objs
+        self.copy_plan = copy_plan
+        self.count = int(count)
+
+    def __len__(self) -> int:
+        return self.count
+
+    def truncated(self, count: int) -> "_SpecAgentLazySources":
+        return _SpecAgentLazySources(
+            self.memory_objs, self.copy_plan, min(self.count, int(count))
+        )
+
+    def materialize(self) -> list:
+        """Exactly the views the eager producer would have built."""
+        if self.copy_plan is None:
+            return [mo.tensor for mo in self.memory_objs[: self.count]]
+        out = []
+        for chunk_idx, src_start, src_end, _d0, _d1 in self.copy_plan[: self.count]:
+            src = self.memory_objs[chunk_idx].tensor
+            if src_start == 0 and src_end == src.shape[0]:
+                out.append(src)
+            else:
+                out.append(src[src_start:src_end])
+        return out
+
+
+def _specagent_materialize_plan_sources(plans) -> None:
+    for plan in plans or ():
+        srcs = plan.get("copy_srcs")
+        if isinstance(srcs, _SpecAgentLazySources):
+            plan["copy_srcs"] = srcs.materialize()
+
+
 def _specagent_record_cuda_event(
     stream: torch.cuda.Stream,
     *,
@@ -1221,6 +1266,24 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         return torch.Size([2, num_tokens, self.hidden_dim_size])
 
 
+def specagent_direct_source_supported(source: torch.Tensor) -> bool:
+    """Accept packed T2D rows or a zero-copy layer view of native 2LTD CPU KV."""
+    # Same predicate as before; shape/stride are read once per call
+    # (this runs for every source chunk of every layer).
+    if source.ndim != 3 or source.device.type != "cpu":
+        return False
+    rows, pair, width = source.shape
+    s0, s1, s2 = source.stride()
+    if (pair != 2 or source.dtype not in (torch.float16, torch.bfloat16)
+            or s2 != 1):
+        return False
+    return source.is_contiguous() or (
+        s0 == width
+        and s1 >= rows * width
+        and s0 % 8 == 0 and s1 % 8 == 0
+    )
+
+
 class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
     """Layer-keyed CPU storage with layerwise and paged-bulk restore paths."""
 
@@ -1260,7 +1323,22 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         offsets = []
         targets = []
         mappings = []
-        # Keep the 256-segment native limit local to each submission plan.
+        # Native descriptors pack the mapping offset in 16 bits. Preserve
+        # absolute physical slot IDs, but rebase long logical positions onto
+        # mapping views. Split on both descriptor count and offset span.
+        groups = []
+        first = 0
+        while first < len(starts):
+            base = 0 if starts[first] <= 65535 else starts[first]
+            last = first + 1
+            while (
+                last < min(first + 256, len(starts))
+                and starts[last] - base <= 65535
+            ):
+                last += 1
+            groups.append((first, last, base, ends[last - 1]))
+            first = last
+        mapping_ranges = []
         for layer_id, objects in enumerate(layers):
             if len(objects) != len(starts):
                 raise ValueError("Incomplete paged bulk source layer")
@@ -1274,10 +1352,14 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         or source.dtype != kvcaches[layer_id].dtype):
                     raise ValueError("Invalid paged bulk CPU source layout")
                 layer_sources.append(source)
-            for first in range(0, len(starts), 256):
-                sources.append(layer_sources[first:first + 256])
-                offsets.append(starts[first:first + 256])
+            for first, last, base, end in groups:
+                sources.append(layer_sources[first:last])
+                offsets.append(
+                    starts[first:last] if base == 0 else
+                    [start - base for start in starts[first:last]]
+                )
                 targets.append(kvcaches[layer_id])
+                mapping_ranges.append((base, end))
         current = torch.cuda.current_stream(self.device)
         ready = torch.cuda.Event()
         try:
@@ -1286,7 +1368,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 writable = torch.full_like(slot_mapping, -1)
                 for start, end in write_ranges:
                     writable[start:end].copy_(slot_mapping[start:end])
-                mappings = [writable] * len(targets)
+                mappings = [
+                    writable if base == 0 else writable[base:end]
+                    for base, end in mapping_ranges
+                ]
                 ready.record(self.load_stream)
                 lmc_ops.specagent_submit_layer_direct_async(
                     sources, offsets, targets, mappings, gpu_kv_format,
@@ -1545,6 +1630,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             return False
         for layer_id in range(self.num_layers):
             plans = self._specagent_deferred_layer_fetches.get(layer_id, [])
+            _specagent_materialize_plan_sources(plans)
             if [(p["slot_mapping"].data_ptr(), p["slot_mapping"].numel())
                 for p in plans] != signature:
                 return False
@@ -1560,7 +1646,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     return False
                 for source, offset in zip(plan["copy_srcs"], offsets, strict=True):
                     if (source.device.type != "cpu" or source.dtype != torch.bfloat16
-                            or not source.is_contiguous() or source.ndim != 3
+                            or not specagent_direct_source_supported(source) or source.ndim != 3
                             or tuple(source.shape[1:]) != (2, 1024)
                             or not 0 < source.shape[0] <= 256 or offset < 0
                             or offset + source.shape[0] > plan["slot_mapping"].numel()):
@@ -1623,15 +1709,24 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 still_pending.append((event, pending_plans))
         self._specagent_pending_deferred_plans = still_pending
 
+    @torch.inference_mode()
     def specagent_flush_deferred_layer(
         self,
         layer_id: int,
         scratch_free_event: object | None = None,
     ) -> bool:
+        """Submit a deferred layer and publish its CUDA completion event.
+
+        ``scratch_free_event`` orders reuse after its previous consumer.
+        Return False when ``layer_id`` has no pending plans. The producer
+        can run on a thread without the model thread's inference context;
+        copy destinations may still be inference tensors created there.
+        """
         self.specagent_reap_completed_plans()
         plans = self._specagent_deferred_layer_fetches.pop(
             int(layer_id), None
         )
+        _specagent_materialize_plan_sources(plans)
         if plans and os.environ.get("SPECAGENT_FUSED_TRANSFER_DEBUG"):
             logger.error(
                 "[SpecAgent][FUSED-FLUSH] layer=%d plans=%d event=%s "
@@ -1718,12 +1813,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             and not self.use_mla
             and direct_plans
             and all(
-                0 < len(plan["copy_srcs"]) <= 256
+                0 < len(plan["copy_srcs"])
                 and len(plan["direct_token_offsets"])
                     == len(plan["copy_srcs"])
                 and all(
                     src.device.type == "cpu"
-                    and src.is_contiguous()
+                    and specagent_direct_source_supported(src)
                     for src in plan["copy_srcs"]
                 )
                 for plan in plans
@@ -1787,11 +1882,46 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 "direct" if use_direct else "native_copy" if use_native else "fallback",
             )
         if use_direct:
+            # Native scatter takes one stride pair per submission. Native
+            # bulk partial chunks have a different K-to-V stride from full
+            # chunks, so partition only those sources; no tensor repack.
+            direct_sources = []
+            direct_offsets = []
+            direct_targets = []
+            direct_mappings = []
+            for plan in plans:
+                groups = {}
+                for source, offset in zip(plan["copy_srcs"], plan["direct_token_offsets"], strict=True):
+                    sources, offsets = groups.setdefault((source.stride(0), source.stride(1)), ([], []))
+                    sources.append(source)
+                    offsets.append(offset)
+                for sources, offsets in groups.values():
+                    # Native arguments hold 256 sources and 16-bit offsets.
+                    # Rebase each batch onto a view of the original mapping;
+                    # the final ready event still covers every submission.
+                    start = 0
+                    while start < len(sources):
+                        base = offsets[start]
+                        end = start + 1
+                        while (
+                            end < len(sources)
+                            and end - start < 256
+                            and 0 <= offsets[end] - base <= 65535
+                        ):
+                            end += 1
+                        direct_sources.append(sources[start:end])
+                        direct_offsets.append([
+                            offset - base for offset in offsets[start:end]
+                        ])
+                        direct_targets.append(plan["target_kv_cache"])
+                        mapping = plan["slot_mapping"]
+                        direct_mappings.append(mapping[base:] if base else mapping)
+                        start = end
             direct_submit(
-                [list(plan["copy_srcs"]) for plan in plans],
-                [list(plan["direct_token_offsets"]) for plan in plans],
-                [plan["target_kv_cache"] for plan in plans],
-                [plan["slot_mapping"] for plan in plans],
+                direct_sources,
+                direct_offsets,
+                direct_targets,
+                direct_mappings,
                 self.gpu_kv_format,
                 int(self.load_stream.cuda_stream),
                 (
@@ -2415,7 +2545,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             and 0 < (
                 len(copy_plan) if copy_plan is not None
                 else len(slot_mapping_chunks)
-            ) <= 256
+            )
         )
         # Direct mapped-host scatter needs layout metadata, but not the legacy
         # preallocated GPU staging pool.  A later store or fallback load can
@@ -2543,6 +2673,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         _hb = bool(os.environ.get("SPECAGENT_HOST_BREAKDOWN"))
         import time as _hbt
         _hb_copy = _hb_xfer = 0.0
+        # Round-7 lazy layer sources (decided on layer 0, see module helper).
+        _sa_lazy_ok = False
+        _sa_layer0_srcs: Optional[list] = None
+        _sa_layer_deltas: Optional[list[int]] = None
+        _sa_verify_lazy = os.environ.get("SPECAGENT_FASTPATH_VERIFY") == "1"
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
             _hb_t0 = _hbt.perf_counter() if _hb else 0.0
@@ -2555,7 +2690,15 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             prof_start = prof_h2d_end = prof_scatter_end = None
             prof_h2d_bytes = 0
             prof_gpu_copy_bytes = 0
-            with torch.cuda.stream(self.load_stream):
+            # Deferred collection only builds CPU descriptors and tensor views.
+            # The eventual graph/flush owns CUDA submission and source leases.
+            # Entering a CUDA stream here adds work per fragment per layer,
+            # although no GPU operation is issued by this branch.
+            with (
+                nullcontext()
+                if defer_layer_submit
+                else torch.cuda.stream(self.load_stream)
+            ):
                 if bw_profile:
                     prof_start = _specagent_record_cuda_event(
                         self.load_stream, enable_timing=True
@@ -2582,7 +2725,33 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         f"layer={layer_id} chunks={len(memory_objs_layer)} "
                         f"copy_plan={copy_plan is not None}"
                     ):
-                        if copy_plan is not None:
+                        if _sa_lazy_ok and layer_id > 0:
+                            _fa_srcs = _SpecAgentLazySources(
+                                memory_objs_layer
+                                if getattr(memory_objs_layer,
+                                           "specagent_layer_column", False)
+                                else list(memory_objs_layer),
+                                copy_plan,
+                                len(copy_plan) if copy_plan is not None
+                                else len(memory_objs_layer),
+                            )
+                            if _sa_verify_lazy:
+                                _sa_real = _fa_srcs.materialize()
+                                if len(_sa_real) != len(_sa_layer0_srcs) or any(
+                                    int(r.data_ptr()) != int(s0.data_ptr()) + layer_id * d
+                                    or tuple(r.shape) != tuple(s0.shape)
+                                    or tuple(r.stride()) != tuple(s0.stride())
+                                    for r, s0, d in zip(
+                                        _sa_real, _sa_layer0_srcs,
+                                        _sa_layer_deltas, strict=False,
+                                    )
+                                ):
+                                    logger.error(
+                                        "[SpecAgent][FASTPATH-MISMATCH] lazy "
+                                        "layer sources layer=%d", layer_id)
+                                    raise AssertionError(
+                                        "fastpath lazy layer sources mismatch")
+                        elif copy_plan is not None:
                             _fa_srcs = []
                             for (
                                 chunk_idx,
@@ -2602,6 +2771,46 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         _fa_n = min(len(_direct_offsets), len(_fa_srcs))
                     else:
                         _fa_n = min(len(_fa_dsts), len(_fa_srcs))
+                    if (
+                        layer_id == 0
+                        and defer_layer_submit
+                        and direct_without_tmp
+                        and _direct_offsets is not None
+                        and isinstance(deferred_source_owner, dict)
+                        and os.environ.get(
+                            "SPECAGENT_LAZY_LAYER_SOURCES", "1") == "1"
+                        and memory_objs_layer
+                        and _fa_n > 0
+                    ):
+                        # Derivable only for borrowed native-bulk layer views
+                        # whose owner stride is exactly L * (token span).
+                        from lmcache.v1.specagent_bulk_view import (
+                            BorrowedBulkLayerView as _SA_BBLV,
+                        )
+                        _sa_deltas: list[int] = []
+                        _sa_ok = all(
+                            isinstance(mo, _SA_BBLV) for mo in memory_objs_layer
+                        )
+                        if _sa_ok:
+                            for _sa_i in range(_fa_n):
+                                _sa_c = (
+                                    copy_plan[_sa_i][0]
+                                    if copy_plan is not None else _sa_i
+                                )
+                                _sa_view = memory_objs_layer[_sa_c].tensor
+                                _sa_s1 = int(_sa_view.stride(1))
+                                _sa_span = int(_sa_view.shape[0]) * int(
+                                    _sa_view.stride(0))
+                                if (_sa_view.ndim != 3
+                                        or _sa_s1 != self.num_layers * _sa_span):
+                                    _sa_ok = False
+                                    break
+                                _sa_deltas.append(
+                                    _sa_span * int(_sa_view.element_size()))
+                        if _sa_ok:
+                            _sa_lazy_ok = True
+                            _sa_layer_deltas = _sa_deltas
+                            _sa_layer0_srcs = list(_fa_srcs[:_fa_n])
                     if _fa_n and not defer_layer_submit:
                         with _lmc_record(
                             "lmcache gpu_send: h2d_copy "
@@ -2677,7 +2886,15 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                                 [] if _fa_dsts is None
                                 else list(_fa_dsts[:_fa_n])
                             ),
-                            "copy_srcs": list(_fa_srcs[:_fa_n]),
+                            "copy_srcs": (
+                                _fa_srcs.truncated(_fa_n)
+                                if isinstance(_fa_srcs, _SpecAgentLazySources)
+                                else list(_fa_srcs[:_fa_n])
+                            ),
+                            "layer_ptr_delta": (
+                                list(_sa_layer_deltas)
+                                if _sa_lazy_ok and layer_id == 0 else None
+                            ),
                             "transfer_tensor": (
                                 None if direct_without_tmp else transfer_tensor
                             ),
@@ -2982,6 +3199,21 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         defer_layerwise_commit = bool(
             kwargs.get("specagent_defer_layerwise_store_commit", False)
         )
+
+        if (
+            os.environ.get("SPECAGENT_DIRECT_BULK_SAVE") == "1"
+            and not self.use_mla and not current_layer_only
+            and defer_layerwise_commit
+        ):
+            from lmcache.v1.specagent_direct_store import store_paged_layers
+
+            store_paged_layers(memory_objs, starts, ends, self.kvcaches,
+                               slot_mapping, self.store_stream, offset)
+            # Preserve the engine generator protocol. All CPU bytes are ready;
+            # its existing per-layer commit and final proof publication follow.
+            for _ in range(self.num_layers + 1):
+                yield
+            return
 
         self._lazy_initialize_buffer(self.kvcaches)
 

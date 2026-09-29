@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# Standard
+import os
+
 # Third Party
 import torch
 
@@ -88,6 +91,14 @@ def CreateGPUConnector(
                     metadata, use_xpu=use_gpu, device=device
                 )
             return VLLMPagedMemXPUConnectorV2.from_metadata(metadata, use_gpu, device)
+
+        if os.environ.get("SPECAGENT_NATIVE_BULK_SPEC") == "1":
+            if config.use_layerwise or dev_name != "cuda" or config.enable_pd or config.use_gpu_connector_v3:
+                raise ValueError("Native bulk SPEC requires the CUDA V2 bulk connector")
+            from lmcache.v1.gpu_connector.specagent_native_bulk_connector import SpecAgentNativeBulkGPUConnector
+            return SpecAgentNativeBulkGPUConnector.from_metadata(
+                metadata, use_gpu, device, layout_hints=layout_hints,
+            )
 
         if config.use_layerwise:
             if config.enable_blending:

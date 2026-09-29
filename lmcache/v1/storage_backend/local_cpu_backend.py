@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
 import threading
+import os
 import time
 
 # Third Party
@@ -13,7 +14,8 @@ import torch
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.v1.specagent_layer_group import LayerGroup, chunk_key
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
@@ -84,6 +86,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
         self.layerwise = config.use_layerwise
+        self.grouped_layers = self.layerwise and os.environ.get("SPECAGENT_CPU_LAYER_GROUP") == "1"
         self.enable_blending = config.enable_blending
 
         # Store config and metadata for chunk budget calculation
@@ -125,12 +128,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
         return self.__class__.__name__
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+        if getattr(self, "grouped_layers", False):
+            key = chunk_key(key)
         with self.cpu_lock:
-            if key not in self.hot_cache:
+            obj = self.hot_cache.get(key)
+            if obj is None:
                 return False
             if pin:
-                self.hot_cache[key].pin()
-                # vllm lookup sets pin to True
+                obj.pin()
                 self.keys_in_request.append(key)
             return True
 
@@ -139,6 +144,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
         keys: List[CacheEngineKey],
         pin: bool = False,
     ) -> int:
+        if getattr(self, "grouped_layers", False):
+            keys = [chunk_key(key) for key in keys]
         with _lmc_record(f"lmcache local_cpu: batched_contains keys={len(keys)}"):
             num_hit_chunks = 0
             with self.cpu_lock:
@@ -165,7 +172,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # flip the order of the keys in the request
         with self.cpu_lock:
             for key in reversed(self.keys_in_request):
-                self.cache_policy.update_on_hit(key, self.hot_cache)
+                if key in self.hot_cache:
+                    self.cache_policy.update_on_hit(key, self.hot_cache)
             self.keys_in_request = []
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -260,46 +268,54 @@ class LocalCPUBackend(AllocatorBackendInterface):
                             f"on_complete_callback failed for key {key}: {e}"
                         )
 
-    def get_blocking(
-        self,
-        key: CacheEngineKey,
-    ) -> Optional[MemoryObj]:
+    def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         with self.cpu_lock:
-            if key not in self.hot_cache:
-                return None
-            memory_obj = self.hot_cache[key]
-            # ref count up for caller to avoid situation where the memory_obj
-            # is evicted from the local cpu backend before the caller calls
-            # ref count up themselves
-            memory_obj.ref_count_up()
-            return memory_obj
+            return self.acquire_cached_object(key)
 
-    def batched_get_blocking(
-        self,
-        keys: List[CacheEngineKey],
-    ) -> List[Optional[MemoryObj]]:
-        mem_objs: List[Optional[MemoryObj]] = []
+    def batched_get_blocking(self, keys: List[CacheEngineKey]) -> List[Optional[MemoryObj]]:
         with self.cpu_lock:
-            for key in keys:
-                mem_obj = self.hot_cache.get(key)
-                if mem_obj is not None:
-                    mem_obj.ref_count_up()
-                mem_objs.append(mem_obj)
-        return mem_objs
+            return [self.acquire_cached_object(key) for key in keys]
 
-    async def batched_get_non_blocking(
-        self,
-        lookup_id: str,
-        keys: list[CacheEngineKey],
-        transfer_spec: Any = None,
-    ) -> list[MemoryObj]:
-        mem_objs = []
+    def batched_get_layer_groups(
+        self, keys: list[CacheEngineKey], num_layers: int,
+    ) -> Optional[list[list[MemoryObj]]]:
+        """Acquire all chunk layers with one lookup per owner, in layer order.
+
+        Return None without retaining any leases if an owner is absent or
+        incomplete. Successful layer leases remain valid after owner eviction.
+        """
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        resolved: list[list[MemoryObj]] = [[] for _ in range(num_layers)]
         with self.cpu_lock:
-            for key in keys:
-                mem_obj = self.hot_cache[key]
-                mem_obj.ref_count_up()
-                mem_objs.append(mem_obj)
-        return mem_objs
+            try:
+                for key in keys:
+                    owner = self.hot_cache.get(chunk_key(key))
+                    if not isinstance(owner, LayerGroup) or len(owner.layers) != num_layers:
+                        for layer in resolved:
+                            for obj in layer:
+                                obj.ref_count_down()
+                        return None
+                    for index, obj in enumerate(owner.acquire_layers(num_layers)):
+                        resolved[index].append(obj)
+            except BaseException:
+                for layer in resolved:
+                    for obj in layer:
+                        obj.ref_count_down()
+                raise
+        return resolved
+
+    async def batched_get_non_blocking(self, lookup_id: str,
+                                      keys: list[CacheEngineKey],
+                                      transfer_spec: Any = None) -> list[MemoryObj]:
+        with self.cpu_lock:
+            result = [self.acquire_cached_object(key) for key in keys]
+            if any(obj is None for obj in result):
+                for obj in result:
+                    if obj is not None:
+                        obj.ref_count_down()
+                raise KeyError("Missing local CPU layer")
+            return result
 
     async def batched_async_contains(
         self,
@@ -321,22 +337,22 @@ class LocalCPUBackend(AllocatorBackendInterface):
         return num_hit_chunks
 
     def pin(self, key: CacheEngineKey) -> bool:
+        if getattr(self, "grouped_layers", False):
+            key = chunk_key(key)
         with self.cpu_lock:
-            if key not in self.hot_cache:
-                return False
-            memory_obj = self.hot_cache[key]
-            memory_obj.pin()
-            return True
+            obj = self.hot_cache.get(key)
+            return False if obj is None else obj.pin()
 
     def unpin(self, key: CacheEngineKey) -> bool:
+        if getattr(self, "grouped_layers", False):
+            key = chunk_key(key)
         with self.cpu_lock:
-            if key not in self.hot_cache:
-                return False
-            memory_obj = self.hot_cache[key]
-            memory_obj.unpin()
-            return True
+            obj = self.hot_cache.get(key)
+            return False if obj is None else obj.unpin()
 
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
+        if getattr(self, "grouped_layers", False):
+            key = chunk_key(key)
         if force:
             self.cpu_lock.acquire()
         if key not in self.hot_cache:
@@ -360,6 +376,25 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # whether the key is removed from the actual memory because
         # other backends might still (temporarily) hold the memory object.
         return True
+
+    def acquire_cached_object(self, key: CacheEngineKey) -> Optional[MemoryObj]:
+        """Acquire an existing layer or ordinary cache object under cpu_lock.
+
+        Caller holds cpu_lock to serialize eviction and acquisition. A grouped
+        layer read has its own child reference and survives owner eviction.
+        """
+        owner_key = chunk_key(key) if getattr(self, "grouped_layers", False) else key
+        obj = self.hot_cache.get(owner_key)
+        if obj is None:
+            return None
+        if isinstance(obj, LayerGroup):
+            if not isinstance(key, LayerCacheEngineKey):
+                raise TypeError("Grouped KV data must be retrieved with a layer key")
+            if not 0 <= key.layer_id < len(obj.layers):
+                return None
+            return obj.acquire_layer(key.layer_id)
+        obj.ref_count_up()
+        return obj
 
     def _calculate_effective_cpu_size(
         self,
@@ -734,6 +769,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
                         evict_keys_count += len(evict_keys)
                         wait_other_requests = False
                         for evict_key in evict_keys:
+                            if isinstance(self.hot_cache[evict_key], LayerGroup):
+                                self.remove(evict_key, force=False)
+                                self.cache_policy.update_on_force_evict(evict_key)
+                                continue
                             evict_key_all_layer = evict_key.split_layers(batch_size)
 
                             # TODO(Jiayi): batched allocate is not supported through

@@ -36,6 +36,11 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
 from lmcache.usage_context import InitializeUsageContext
+from lmcache.v1.specagent_layer_group import LayerGroup, chunk_key
+from lmcache.v1.specagent_bulk_view import (
+    BorrowedBulkLayerView, acquire_bulk_layer_views, borrow_bulk_layer_views,
+    merge_native_bulk_prefix,
+)
 from lmcache.utils import (
     CacheEngineKey,
     CacheStoreEvent,
@@ -72,6 +77,34 @@ logger = init_logger(__name__)
 _SPECAGENT_LIVE_PROBE_LOG_LIMIT = 20
 
 
+class _LazyLayerKeys:
+    """Per-layer keys of one chunk, split only if a consumer iterates them."""
+
+    __slots__ = ("key", "num_layers", "_split")
+
+    def __init__(self, key, num_layers: int) -> None:
+        self.key = key
+        self.num_layers = int(num_layers)
+        self._split = None
+
+    def layer0(self):
+        return self.key.split_layers(1)[0]
+
+    def _keys(self):
+        if self._split is None:
+            self._split = self.key.split_layers(self.num_layers)
+        return self._split
+
+    def __len__(self) -> int:
+        return self.num_layers
+
+    def __iter__(self):
+        return iter(self._keys())
+
+    def __getitem__(self, index):
+        return self._keys()[index]
+
+
 @dataclass
 class SpecAgentPreparedLayerwiseSegment:
     """CPU-only sparse retrieval plan whose MemoryObj refs are leased."""
@@ -80,7 +113,21 @@ class SpecAgentPreparedLayerwiseSegment:
     ends: list[int]
     keys_by_chunk: list[list[CacheEngineKey]]
     location: str
-    memory_objs_by_layer: list[list[MemoryObj]]
+    memory_objs_by_layer: list[list[MemoryObj | BorrowedBulkLayerView]]
+    source_owners: Optional[list[MemoryObj]] = None
+
+    def release_source_owners(self) -> None:
+        """Release chunk leases still held here, including abandoned claims."""
+        owners = self.source_owners
+        self.source_owners = [] if owners is not None else None
+        for owner in owners or []:
+            owner.ref_count_down()
+
+    def __del__(self) -> None:
+        try:
+            self.release_source_owners()
+        except Exception:
+            pass
 
 
 class SpecAgentPreparedLayerwiseBatch:
@@ -114,9 +161,12 @@ class SpecAgentPreparedLayerwiseBatch:
             segments = [seg for seg in self._segments if seg is not None]
             self._segments = [None] * len(self._segments)
         for segment in segments:
-            for mem_objs_layer in segment.memory_objs_by_layer:
-                for mem_obj in mem_objs_layer:
-                    mem_obj.ref_count_down()
+            if segment.source_owners is not None:
+                segment.release_source_owners()
+            else:
+                for mem_objs_layer in segment.memory_objs_by_layer:
+                    for mem_obj in mem_objs_layer:
+                        mem_obj.ref_count_down()
 
     def __del__(self) -> None:
         try:
@@ -282,6 +332,9 @@ def _specagent_record_actual_cpu_store(
     start: int,
     end: int,
     block_size: int,
+    *,
+    prefix_snapshot: Optional[tuple[int, ...]] = None,
+    prefix_hashes: Optional[dict[int, int]] = None,
 ) -> None:
     if os.environ.get("SPECAGENT_DISABLE_CPU_STORE_PROOF"):
         return
@@ -291,11 +344,23 @@ def _specagent_record_actual_cpu_store(
         chunk_store = set()
         setattr(builtins, "_specagent_cpu_saved_chunks", chunk_store)
 
-    if isinstance(tokens, torch.Tensor):
-        prefix_tokens = [int(t) for t in tokens[:end].detach().cpu().tolist()]
-    else:
-        prefix_tokens = [int(t) for t in tokens[:end]]
-    token_hash = hash(tuple(prefix_tokens))
+    token_hash = (
+        prefix_hashes.get(end)
+        if prefix_snapshot is not None and prefix_hashes is not None else None
+    )
+    prefix_tokens = ()
+    if (token_hash is None or os.environ.get("SPECAGENT_HASH_DEBUG")
+            or os.environ.get("SPECAGENT_LEGACY_PRESTORE_PROOF")):
+        if prefix_snapshot is not None:
+            prefix_tokens = prefix_snapshot[:end]
+        elif isinstance(tokens, torch.Tensor):
+            prefix_tokens = tuple(int(t) for t in tokens[:end].detach().cpu().tolist())
+        else:
+            prefix_tokens = tuple(int(t) for t in tokens[:end])
+    if token_hash is None:
+        token_hash = hash(prefix_tokens)
+    if prefix_hashes is not None:
+        prefix_hashes[end] = token_hash
     chunk_store.add((end, token_hash))
     if (
         os.environ.get("SPECAGENT_TAIL_SAVE_DEBUG")
@@ -332,6 +397,73 @@ def _specagent_record_actual_cpu_store(
             continue
         block_prefix = prefix_tokens[:tok_end]
         block_store.add((tok_end // block_size - 1, hash(tuple(block_prefix))))
+
+
+def _specagent_prepare_cpu_store_proofs(
+    tokens: Union[torch.Tensor, list[int]],
+    ends: list[int],
+) -> tuple[Optional[tuple[int, ...]], dict[int, int], list]:
+    """Compute immutable prefix hashes without publishing storage evidence."""
+    if not ends:
+        return None, {}, []
+    proof_prefix = None
+    if not os.environ.get("SPECAGENT_DISABLE_CPU_STORE_PROOF"):
+        proof_tokens = tokens[:max(ends)]
+        if isinstance(proof_tokens, torch.Tensor):
+            proof_tokens = proof_tokens.detach().cpu().tolist()
+        proof_prefix = tuple(proof_tokens)
+    proof_hashes = {}
+    snapshots = getattr(
+        builtins, "_specagent_cpu_store_hash_snapshots", ()
+    )
+    retained_snapshots = []
+    if proof_prefix is not None:
+        # Cache hash computations only, never save validity.
+        # Coalesce an extending prefix with its ancestors:
+        # repeated stores for one job must not evict the
+        # other active jobs' reusable hash computations.
+        for previous_prefix, previous_hashes in snapshots:
+            common = min(len(previous_prefix), len(proof_prefix))
+            matches = previous_prefix[:common] == proof_prefix[:common]
+            if matches:
+                proof_hashes.update(
+                    (end, value) for end, value in previous_hashes.items()
+                    if end <= common
+                )
+            if not matches or len(previous_prefix) > len(proof_prefix):
+                retained_snapshots.append((previous_prefix, previous_hashes))
+    if proof_prefix is not None:
+        for end in ends:
+            if end not in proof_hashes:
+                proof_hashes[end] = hash(proof_prefix[:end])
+    return proof_prefix, proof_hashes, retained_snapshots
+
+
+def _specagent_publish_cpu_store_proofs(
+    tokens: Union[torch.Tensor, list[int]],
+    starts: list[int],
+    ends: list[int],
+    specagent_block_size: int,
+    *,
+    prepared: Optional[tuple] = None,
+) -> None:
+    """Publish exact prefix proofs only after all layers are stored on CPU."""
+    if not ends:
+        return
+    proof_prefix, proof_hashes, retained_snapshots = (
+        _specagent_prepare_cpu_store_proofs(tokens, ends)
+        if prepared is None else prepared
+    )
+    for start, end in zip(starts, ends, strict=True):
+        _specagent_record_actual_cpu_store(
+            tokens, start, end, specagent_block_size,
+            prefix_snapshot=proof_prefix,
+            prefix_hashes=proof_hashes,
+        )
+    if proof_prefix is not None:
+        builtins._specagent_cpu_store_hash_snapshots = (
+            retained_snapshots[-7:] + [(proof_prefix, proof_hashes)]
+        )
 
 
 def _specagent_record_actual_kv_fingerprint(
@@ -569,6 +701,21 @@ class LMCacheEngine:
         self.event_manager = EventManager()
 
         self.use_layerwise = config.use_layerwise
+        self.native_bulk_spec = os.environ.get("SPECAGENT_NATIVE_BULK_SPEC") == "1"
+        if self.native_bulk_spec and (
+            self.use_layerwise or metadata.use_mla or config.enable_blending
+            or config.enable_async_loading or os.environ.get("SPECAGENT_PROGRESSIVE_CPU_PREPARE")
+        ):
+            raise ValueError("Native bulk SPEC requires synchronous, non-MLA bulk storage and full-plan fetch")
+        self.grouped_layers = (
+            self.use_layerwise and os.environ.get("SPECAGENT_CPU_LAYER_GROUP") == "1"
+        )
+        if getattr(self, "grouped_layers", False) and (
+            metadata.use_mla or config.enable_blending or config.enable_async_loading
+            or os.environ.get("SPECAGENT_DIRECT_BULK_SAVE") != "1"
+            or os.environ.get("SPECAGENT_KV_FINGERPRINT_PRESTORE")
+        ):
+            raise ValueError("Grouped CPU KV requires synchronous T2D direct bulk save")
 
         # TODO: support save_only_first_rank when use layerwise
         # if use_layerwise is True, all ranks will initialize the storage_manager
@@ -714,7 +861,10 @@ class LMCacheEngine:
             request_configs=None,
         ):
             assert isinstance(key, CacheEngineKey)
-            keys_multi_layer = key.split_layers(self.num_layers)
+            keys_multi_layer = (
+                [key] if not self.use_layerwise or getattr(self, "grouped_layers", False)
+                else key.split_layers(self.num_layers)
+            )
             layer_locations = [
                 self.storage_manager.contains(layer_key, self.retrieve_locations)
                 for layer_key in keys_multi_layer
@@ -789,6 +939,8 @@ class LMCacheEngine:
                     lmcache_worker=self.lmcache_worker,
                     async_lookup_server=async_lookup_server,
                 )
+                if (getattr(self, "grouped_layers", False) or self.native_bulk_spec) and set(self.storage_manager.storage_backends) != {"LocalCPUBackend"}:
+                    raise ValueError("Grouped/native SPEC CPU KV supports only a local CPU backend")
                 # SpecAgent's scheduler runs in this same EngineCore process.
                 # Expose the live CPU-cache probe only after this engine owns a
                 # real storage manager.  Registering from __init__ is too early
@@ -1031,8 +1183,38 @@ class LMCacheEngine:
         if not memory_objs:
             return
 
-        with store_stats.profile_from_gpu():
-            self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
+        prepared_proofs = (
+            _specagent_prepare_cpu_store_proofs(tokens, ends)
+            if getattr(self, "native_bulk_spec", False) and tokens is not None
+            else None
+        )
+
+        merge_source = None
+        merge_prefix = int(kwargs.get("specagent_tail_merge_prefix_tokens", 0) or 0)
+        chunk_size = int(getattr(self.token_database, "chunk_size", 0) or 0)
+        merge_start = merge_prefix // chunk_size * chunk_size if chunk_size else -1
+        if (getattr(self, "native_bulk_spec", False) and merge_prefix > merge_start
+                and merge_start in starts):
+            source_plan = list(self.token_database.process_tokens(
+                tokens=tokens[:merge_prefix], request_configs=request_configs,
+            ))
+            if not source_plan or source_plan[-1][:2] != (merge_start, merge_prefix):
+                raise RuntimeError("Native bulk partial prefix source is not covered")
+            source_objects = self.storage_manager.batched_get(
+                [source_plan[-1][2]], "LocalCPUBackend",
+            )
+            merge_source = source_objects[0]
+            if merge_source is None:
+                raise RuntimeError("Native bulk partial CPU prefix was evicted")
+        try:
+            with store_stats.profile_from_gpu():
+                self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
+            if merge_source is not None:
+                target = memory_objs[starts.index(merge_start)]
+                merge_native_bulk_prefix(merge_source, target, merge_prefix - merge_start)
+        finally:
+            if merge_source is not None:
+                merge_source.ref_count_down()
 
         with store_stats.profile_put():
             transfer_spec = kwargs.get("transfer_spec", None)
@@ -1043,6 +1225,14 @@ class LMCacheEngine:
                 memory_objs,
                 transfer_spec=transfer_spec,
                 location=self.store_location,
+            )
+
+        if getattr(self, "native_bulk_spec", False) or os.environ.get("SPECAGENT_BULK_CPU_PROOF") == "1":
+            if tokens is None:
+                raise ValueError("SpecAgent CPU proof requires exact token IDs")
+            _specagent_publish_cpu_store_proofs(
+                tokens, starts, ends, int(kwargs.get("specagent_block_size", 16)),
+                prepared=prepared_proofs,
             )
 
         self.stats_monitor.on_store_finished(
@@ -1132,6 +1322,13 @@ class LMCacheEngine:
                 yield
             return
 
+        grouped_layers = getattr(self, "grouped_layers", False)
+        if grouped_layers and (
+            kwargs.get("specagent_save_current_layer_only", False)
+            or not kwargs.get("specagent_defer_layerwise_store_commit", False)
+        ):
+            raise ValueError("Grouped CPU KV requires all-layer completion before publication")
+        group_keys = []
         starts = []
         ends = []
         keys = []
@@ -1209,7 +1406,7 @@ class LMCacheEngine:
             # scratch attention consume zero/stale KV for those layers.
             if all(
                 self.storage_manager.contains(key_layer, self.retrieve_locations)
-                for key_layer in keys_multi_layer
+                for key_layer in ([key] if grouped_layers else keys_multi_layer)
             ):
                 continue
 
@@ -1232,6 +1429,7 @@ class LMCacheEngine:
                 )
                 break
 
+            group_keys.append(key)
             starts.append(start)
             ends.append(end)
             keys.append(keys_multi_layer)
@@ -1355,11 +1553,10 @@ class LMCacheEngine:
                     f"req={req_id} layer={layer_id} "
                     f"chunks={len(keys[layer_id])}"
                 ):
-                    self.storage_manager.batched_put(
-                        keys[layer_id],
-                        memory_objs[layer_id],
-                        location=self.store_location,
-                    )
+                    if not grouped_layers:
+                        self.storage_manager.batched_put(
+                            keys[layer_id], memory_objs[layer_id], location=self.store_location,
+                        )
                 with _lmc_record(
                     "lmcache store_layer: fingerprint "
                     f"req={req_id} layer={layer_id} "
@@ -1383,17 +1580,25 @@ class LMCacheEngine:
                             key,
                         )
                 if layer_id == self.num_layers - 1:
+                    if grouped_layers:
+                        # Every layer has completed D2H and any sparse tail merge.
+                        # One owner consumes the initial reference of each child;
+                        # layer readers acquire independent references on demand.
+                        groups = [LayerGroup(list(objects)) for objects in zip(*memory_objs, strict=True)]
+                        self.storage_manager.batched_put(
+                            group_keys, groups, location=self.store_location,
+                        )
                     with _lmc_record(
                         "lmcache store_layer: cpu_store_proof "
                         f"req={req_id} layer={layer_id} "
                         f"chunks={len(keys[layer_id])}"
                     ):
-                        for start, end, memory_obj in zip(
-                            starts, ends, memory_objs[layer_id], strict=False
-                        ):
-                            _specagent_record_actual_cpu_store(
-                                tokens, start, end, specagent_block_size
-                            )
+                        # All chunks share the same immutable token prefix.
+                        # Convert it once after the final layer completes; proof
+                        # keys and their publication point remain unchanged.
+                        _specagent_publish_cpu_store_proofs(
+                            tokens, starts, ends, specagent_block_size
+                        )
 
             for layer_id in range(self.num_layers):
                 with _lmc_record(
@@ -1601,11 +1806,95 @@ class LMCacheEngine:
             )
         return ret_mask
 
+    def _specagent_memo_chunk_keys(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        max_end: int,
+        request_configs: Optional[dict],
+        memo_id: str,
+    ) -> list[tuple[int, int, CacheEngineKey]]:
+        """process_tokens(tokens[:max_end]) with a per-request hash-chain memo.
+
+        Memo entry: (kind, token prefix, full-chunk hashes, keys, configs).
+        Only full chunks are memoized; the reused prefix is the longest
+        chunk-aligned prefix identical to the previous call of this request.
+        """
+        import numpy as np
+        from collections import OrderedDict
+
+        db = self.token_database
+        chunk = int(db.chunk_size)
+        memo = getattr(self, "_specagent_prefix_hash_memo", None)
+        if memo is None:
+            memo = self._specagent_prefix_hash_memo = OrderedDict()
+        cached = memo.get(memo_id)
+        if isinstance(tokens, torch.Tensor):
+            kind = "np"
+            seq = tokens[:max_end].detach().cpu().numpy().astype(np.int32, copy=False)
+        else:
+            kind = "list"
+            seq = list(tokens[:max_end])
+        total = len(seq)
+        reuse = 0
+        hashes: list[int] = []
+        keys: list[CacheEngineKey] = []
+        if cached is not None and cached[0] == kind:
+            _, old, old_hashes, old_keys, old_configs = cached
+            n = min(len(old), total, len(old_hashes) * chunk)
+            n -= n % chunk
+            if kind == "np":
+                diff = np.flatnonzero(old[:n] != seq[:n])
+                same = int(diff[0]) if diff.size else n
+            elif old[:n] == seq[:n]:
+                same = n
+            else:
+                same = 0
+                while same < n and old[same:same + chunk] == seq[same:same + chunk]:
+                    same += chunk
+            reuse = same // chunk
+            hashes = old_hashes[:reuse]
+            if old_configs == request_configs:
+                keys = old_keys[:reuse]
+        prefix = hashes[-1] if hashes else db._get_init_hash()
+        save_unfull = (
+            db.config.save_unfull_chunk if db.config is not None else True
+        )
+        end = total if save_unfull else total - total % chunk
+        out: list[tuple[int, int, CacheEngineKey]] = []
+        full_hashes = list(hashes)
+        full_keys = list(keys)
+        for chunk_id in range(0, (end + chunk - 1) // chunk):
+            start = chunk_id * chunk
+            stop = min(start + chunk, total)
+            if chunk_id < reuse:
+                hash_val = hashes[chunk_id]
+                key = keys[chunk_id] if chunk_id < len(keys) else None
+            else:
+                piece = seq[start:stop]
+                hash_val = db._hash_tokens(
+                    tuple(piece.tolist()) if kind == "np" else tuple(piece), prefix,
+                )
+                key = None
+            if key is None:
+                key = db._make_key_by_hash(hash_val, request_configs)
+            if stop - start == chunk and chunk_id >= reuse:
+                full_hashes.append(hash_val)
+            if stop - start == chunk and chunk_id >= len(keys):
+                full_keys.append(key)
+            prefix = hash_val
+            out.append((start, stop, key))
+        memo[memo_id] = (kind, seq, full_hashes, full_keys[: len(full_hashes)], request_configs)
+        memo.move_to_end(memo_id)
+        while len(memo) > 96:
+            memo.popitem(last=False)
+        return out
+
     def plan_sparse_layerwise_chunks(
         self,
         tokens: Union[torch.Tensor, list[int]],
         segments: Iterable[tuple[int, int]],
         request_configs: Optional[dict] = None,
+        memo_id: Optional[str] = None,
     ) -> list[list[tuple[int, int, CacheEngineKey]]]:
         """Build cache keys for multiple sparse retrieval segments once.
 
@@ -1645,10 +1934,29 @@ class LMCacheEngine:
         ]
         segment_index = 0
         max_end = normalized_segments[-1][1]
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens[:max_end],
-            request_configs=request_configs,
-        ):
+        use_memo = (
+            memo_id is not None
+            and os.environ.get("SPECAGENT_PREFIX_HASH_MEMO", "1") == "1"
+            and hasattr(self.token_database, "_prefix_hash")
+            and type(self.token_database).__name__ == "ChunkedTokenDatabase"
+        )
+        if use_memo:
+            chunk_results = self._specagent_memo_chunk_keys(
+                tokens, max_end, request_configs, memo_id,
+            )
+            if os.environ.get("SPECAGENT_FASTPATH_VERIFY") == "1":
+                reference = list(self.token_database.process_tokens(
+                    tokens=tokens[:max_end], request_configs=request_configs,
+                ))
+                if reference != chunk_results:
+                    logger.error("[SpecAgent][FASTPATH-MISMATCH] prefix hash memo")
+                    raise AssertionError("fastpath prefix hash memo mismatch")
+        else:
+            chunk_results = self.token_database.process_tokens(
+                tokens=tokens[:max_end],
+                request_configs=request_configs,
+            )
+        for start, end, key in chunk_results:
             assert isinstance(key, CacheEngineKey)
             while (
                 segment_index < len(normalized_segments)
@@ -1684,13 +1992,23 @@ class LMCacheEngine:
         ends: list[int] = []
         keys_by_chunk: list[list[CacheEngineKey]] = []
         flat_keys: list[CacheEngineKey] = []
+        native = bool(getattr(self, "native_bulk_spec", False))
         for plan in plans:
             for start, end, key in plan:
-                layer_keys = key.split_layers(self.num_layers)
+                layer_keys = (
+                    _LazyLayerKeys(key, self.num_layers) if native
+                    else key.split_layers(self.num_layers)
+                )
                 starts.append(int(start))
                 ends.append(int(end))
                 keys_by_chunk.append(layer_keys)
-                flat_keys.extend(layer_keys)
+                # A grouped owner is published only after every layer is
+                # complete; repeating its membership check per layer adds no
+                # validity evidence.
+                if getattr(self, "grouped_layers", False) or getattr(self, "native_bulk_spec", False):
+                    flat_keys.append(key)
+                else:
+                    flat_keys.extend(layer_keys)
         if not flat_keys:
             return None
         hit_layers, block_mapping = self.storage_manager.batched_contains(
@@ -1725,31 +2043,69 @@ class LMCacheEngine:
         if backend is None or not hasattr(backend, "batched_get_blocking"):
             return None
 
-        keys_layer_major = [
-            list(row) for row in zip(*keys_by_chunk, strict=False)
-        ]
-        resolved_layers: list[list[MemoryObj]] = []
-        try:
-            for layer_id, keys_layer in enumerate(keys_layer_major):
-                raw_layer = backend.batched_get_blocking(keys_layer)
-                acquired = [obj for obj in raw_layer if obj is not None]
-                if len(acquired) != len(keys_layer):
-                    # Include successful gets from this partial layer in the
-                    # rollback; each one already owns a reference.
-                    for mem_obj in acquired:
-                        mem_obj.ref_count_down()
-                    raise RuntimeError(
-                        "[SpecAgent][ASYNC-PREPARE] CPU MemoryObj missing "
-                        f"at layer={layer_id}: evicted between contains and "
-                        "resolve"
+        source_owners: Optional[list[MemoryObj]] = None
+        if getattr(self, "native_bulk_spec", False):
+            owner_keys = [
+                chunk_key(keys.layer0() if isinstance(keys, _LazyLayerKeys) else keys[0])
+                for keys in keys_by_chunk
+            ]
+            if os.environ.get("SPECAGENT_FASTPATH_VERIFY") == "1":
+                reference_keys = [
+                    chunk_key(
+                        keys.key.split_layers(self.num_layers)[0]
+                        if isinstance(keys, _LazyLayerKeys) else keys[0]
                     )
-                resolved_layers.append(acquired)
-        except Exception:
-            for prior_layer in resolved_layers:
-                for mem_obj in prior_layer:
-                    mem_obj.ref_count_down()
-            raise
-
+                    for keys in keys_by_chunk
+                ]
+                if reference_keys != owner_keys:
+                    logger.error("[SpecAgent][FASTPATH-MISMATCH] native owner keys")
+                    raise AssertionError("fastpath native owner keys mismatch")
+            owners = backend.batched_get_blocking(owner_keys)
+            acquired = [owner for owner in owners if owner is not None]
+            try:
+                if len(acquired) != len(owners):
+                    raise RuntimeError("Native bulk CPU owner evicted during acquisition")
+                resolved_layers = borrow_bulk_layer_views(acquired, self.num_layers)
+            except BaseException:
+                for owner in acquired:
+                    owner.ref_count_down()
+                raise
+            # Transfer chunk leases through the plan until GPU completion.
+            source_owners = acquired
+        elif getattr(self, "grouped_layers", False):
+            resolved_layers = backend.batched_get_layer_groups(
+                [keys[0] for keys in keys_by_chunk], self.num_layers,
+            )
+            if resolved_layers is None:
+                raise RuntimeError(
+                    "[SpecAgent][ASYNC-PREPARE] CPU layer group disappeared "
+                    "between validation and acquisition"
+                )
+        else:
+            keys_layer_major = [
+                list(row) for row in zip(*keys_by_chunk, strict=False)
+            ]
+            resolved_layers: list[list[MemoryObj]] = []
+            try:
+                for layer_id, keys_layer in enumerate(keys_layer_major):
+                    raw_layer = backend.batched_get_blocking(keys_layer)
+                    acquired = [obj for obj in raw_layer if obj is not None]
+                    if len(acquired) != len(keys_layer):
+                        # Include successful gets from this partial layer in the
+                        # rollback; each one already owns a reference.
+                        for mem_obj in acquired:
+                            mem_obj.ref_count_down()
+                        raise RuntimeError(
+                            "[SpecAgent][ASYNC-PREPARE] CPU MemoryObj missing "
+                            f"at layer={layer_id}: evicted between contains and "
+                            "resolve"
+                        )
+                    resolved_layers.append(acquired)
+            except Exception:
+                for prior_layer in resolved_layers:
+                    for mem_obj in prior_layer:
+                        mem_obj.ref_count_down()
+                raise
         prepared_segments: list[SpecAgentPreparedLayerwiseSegment] = []
         offset = 0
         for plan in plans:
@@ -1763,6 +2119,10 @@ class LMCacheEngine:
                     memory_objs_by_layer=[
                         layer[offset:next_offset] for layer in resolved_layers
                     ],
+                    source_owners=(
+                        source_owners[offset:next_offset]
+                        if source_owners is not None else None
+                    ),
                 )
             )
             offset = next_offset
@@ -1977,6 +2337,17 @@ class LMCacheEngine:
                     prepared_segment = prepared_batch.claim(
                         specagent_prepared_segment_index
                     )
+            if getattr(self, "native_bulk_spec", False) and prepared_segment is None:
+                plan = specagent_chunk_plan
+                if plan is None:
+                    plan = list(self.token_database.process_tokens(
+                        tokens=tokens, mask=mask, request_configs=request_configs,
+                        mask_num_falses=int(specagent_prefix_tokens) if specagent_fast_path else None,
+                    ))
+                prepared = self.prepare_sparse_layerwise_plans([plan])
+                if prepared is None:
+                    raise RuntimeError("Native bulk SPEC CPU prefix is incomplete")
+                prepared_segment = prepared.claim(0)
             if specagent_chunk_plan is not None:
                 token_results = specagent_chunk_plan
             else:
@@ -2034,6 +2405,9 @@ class LMCacheEngine:
                             starts, ends, strict=True
                         )
                     )
+                if bulk_plan is not None and ret_mask is not None:
+                    for start, end in zip(starts, ends, strict=True):
+                        ret_mask[start:end] = True
                 while bulk_plan is None:
                     # Keep the aggregate token_lookup range above, but avoid
                     # three NVTX push/pop pairs per cache chunk.  At 140
@@ -2092,9 +2466,13 @@ class LMCacheEngine:
                     "lmcache retrieve_layer: setup transpose_keys "
                     f"req={req_id} chunks={len(keys)}"
                 ):
-                    keys_layer_major = [
-                        list(row) for row in zip(*keys, strict=False)
-                    ]
+                    # Consumed only without a prepared segment or by the
+                    # non-native full-plan branch; building it eagerly would
+                    # split every lazily kept native chunk key.
+                    keys_layer_major = None
+
+                    def _keys_layer_major():
+                        return [list(row) for row in zip(*keys, strict=False)]
 
                 with _lmc_record(
                     "lmcache retrieve_layer: setup get_generator "
@@ -2104,7 +2482,7 @@ class LMCacheEngine:
                     if prepared_segment is None:
                         get_generator = (
                             self.storage_manager.layerwise_batched_get(
-                                keys_layer_major,
+                                _keys_layer_major(),
                                 location=location,
                             )
                         )
@@ -2147,8 +2525,26 @@ class LMCacheEngine:
                 else None
             )
             if full_plan_objs is not None:
-                for mem_objs_layer in full_plan_objs:
-                    hold_source_objs(mem_objs_layer)
+                native_owners = prepared_segment.source_owners
+                if native_owners is not None and isinstance(deferred_source_owner, dict):
+                    # The whole-plan CUDA owner replaces per-layer leases.
+                    # Borrowed tensor descriptors carry no references.
+                    hold_source_objs(native_owners)
+                    prepared_segment.source_owners = []
+                else:
+                    if native_owners is not None:
+                        # Consumers without a whole-plan owner still receive
+                        # independently leased layer readers.
+                        try:
+                            full_plan_objs = acquire_bulk_layer_views(
+                                native_owners, self.num_layers
+                            )
+                        finally:
+                            for owner in native_owners:
+                                owner.ref_count_down()
+                            prepared_segment.source_owners = []
+                    for mem_objs_layer in full_plan_objs:
+                        hold_source_objs(mem_objs_layer)
             elif kwargs.get("specagent_full_plan_fetch"):
                 resolve_location = location or "LocalCPUBackend"
                 backend = self.storage_manager.storage_backends.get(
@@ -2170,7 +2566,7 @@ class LMCacheEngine:
                     ):
                         full_plan_objs = [
                             backend.batched_get_blocking(keys_layer)
-                            for keys_layer in keys_layer_major
+                            for keys_layer in _keys_layer_major()
                         ]
                     for layer_id, mem_objs_layer in enumerate(full_plan_objs):
                         for chunk_idx, mem_obj in enumerate(mem_objs_layer):
@@ -2446,7 +2842,7 @@ class LMCacheEngine:
 
                     # TODO(Jiayi): Optimize by checking only the existence of the key
                     # of one layer
-                    key_all_layers = key.split_layers(self.num_layers)
+                    key_all_layers = [key] if getattr(self, "grouped_layers", False) else key.split_layers(self.num_layers)
 
                     hit_chunks, block_mapping = self.storage_manager.batched_contains(
                         key_all_layers,  # type: ignore
@@ -2455,7 +2851,7 @@ class LMCacheEngine:
                     )
                     # Only all layers are hit and hit in one location,
                     # we consider this key as a hit
-                    if hit_chunks == self.num_layers and len(block_mapping) == 1:
+                    if hit_chunks == len(key_all_layers) and len(block_mapping) == 1:
                         if pin:
                             assert lookup_id is not None, (
                                 "lookup_id is required when pin is True"
@@ -2465,6 +2861,9 @@ class LMCacheEngine:
                         res = end
                         _ci += 1
                         continue
+                    if pin:
+                        for location, pinned_keys in block_mapping.items():
+                            self.storage_manager.batched_unpin(pinned_keys, [location])
                     # FIRST MISS: log where in the prefix the lookup stops and why,
                     # then return res (LMCache stops at first unavailable chunk).
                     if _dbg:

@@ -1401,8 +1401,15 @@ void specagent_submit_layer_direct_async(
     int max_segment_length = 0;
     for (size_t segment = 0; segment < sources.size(); ++segment) {
       const auto& source = sources[segment];
-      TORCH_CHECK(source.is_cpu() && source.is_contiguous(),
-                  "direct sources must be contiguous CPU tensors");
+      TORCH_CHECK(source.is_cpu() && source.dim() == 3 &&
+                      source.stride(2) == 1 &&
+                      source.size(2) == num_heads * target.size(4) &&
+                      (source.is_contiguous() ||
+                       (source.stride(0) == source.size(2) &&
+                        source.stride(1) >= source.size(0) * source.size(2) &&
+                        source.stride(0) % entries_per_xword == 0 &&
+                        source.stride(1) % entries_per_xword == 0)),
+                  "direct sources require packed or native-bulk CPU KV rows");
       TORCH_CHECK(source.dim() == 3 && source.size(1) == 2,
                   "direct sources must have token-major KV layout");
       TORCH_CHECK(source.stride(0) / entries_per_xword == source_stride &&

@@ -1391,8 +1391,10 @@ class LMCacheConnectorV1Impl:
                         )
                     continue
 
-                if (self.use_layerwise and not use_specagent_buf
-                        and _specagent_env_true("SPECAGENT_PAGED_BULK_RESTORE")):
+                if (not use_specagent_buf and (
+                    getattr(self.lmcache_engine, "native_bulk_spec", False)
+                    or (self.use_layerwise and _specagent_env_true("SPECAGENT_PAGED_BULK_RESTORE"))
+                )):
                     from lmcache.v1.specagent_paged_bulk import restore_paged_bulk
 
                     restore_paged_bulk(
@@ -1402,9 +1404,17 @@ class LMCacheConnectorV1Impl:
                     )
                     continue
 
+                use_layerwise_fetch = self.use_layerwise or (
+                    bool(getattr(self.lmcache_engine, "native_bulk_spec", False))
+                    and use_specagent_buf
+                )
                 shared_chunk_plans = None
+                retrieval_segments = effective_chunk_segments
+                retrieval_token_counts = [
+                    end - start for start, end in effective_chunk_segments
+                ]
                 cpu_prepare_future: Any = None
-                if self.use_layerwise:
+                if use_layerwise_fetch:
                     with detail_record(
                         "lmcache adapter detail: shared_sparse_chunk_plan "
                         f"req={request.req_id} tokens={len(tokens)} "
@@ -1415,8 +1425,32 @@ class LMCacheConnectorV1Impl:
                                 tokens,
                                 effective_chunk_segments,
                                 request.request_configs,
+                                memo_id=str(request.req_id),
                             )
                         )
+                    if (
+                        use_specagent_buf
+                        and not use_paged_restore_target
+                        and sa_full_plan_fetch
+                        and getattr(self.lmcache_engine, "native_bulk_spec", False)
+                        and len(shared_chunk_plans) > 1
+                        and all(shared_chunk_plans)
+                        and not _specagent_env_true("SPECAGENT_VERIFY_LEGACY_SAVE_PROOF")
+                        and not os.environ.get("SPECAGENT_DISABLE_FUSED_LAYER_SUBMIT")
+                        and not _specagent_env_true("SPECAGENT_PROGRESSIVE_CPU_PREPARE")
+                    ):
+                        # Each chunk retains its original absolute boundaries
+                        # and key. One retriever can gather disjoint ranges;
+                        # the enclosing span is only for token/map slicing.
+                        # Do not fetch, count or validate the holes in it.
+                        shared_chunk_plans = [[
+                            chunk for plan in shared_chunk_plans for chunk in plan
+                        ]]
+                        retrieval_segments = [(
+                            effective_chunk_segments[0][0],
+                            effective_chunk_segments[-1][1],
+                        )]
+                        retrieval_token_counts = [sum(retrieval_token_counts)]
                     cpu_prepare_executor = (
                         self._specagent_cpu_prepare_executor
                     )
@@ -1483,7 +1517,7 @@ class LMCacheConnectorV1Impl:
                         hash_tokens_tuple = tuple(int(t) for t in tokens)
 
                 for seg_i, (seg_start, seg_end) in enumerate(
-                    effective_chunk_segments
+                    retrieval_segments
                 ):
                     never_saved_chunks = []
                     if verify_legacy_save_proof:
@@ -1535,12 +1569,12 @@ class LMCacheConnectorV1Impl:
                             )
                         )
                     seg_token_mask = None
-                    if not self.use_layerwise:
+                    if not use_layerwise_fetch:
                         seg_token_mask = torch.ones(
                             seg_end, dtype=torch.bool
                         )
                         seg_token_mask[:seg_start] = False
-                    num_expected_tokens = seg_end - seg_start
+                    num_expected_tokens = retrieval_token_counts[seg_i]
                     expected_mib = (
                         num_expected_tokens
                         * self._specagent_kv_bytes_per_layer_token()
@@ -1558,7 +1592,7 @@ class LMCacheConnectorV1Impl:
                                 specagent_write_token_mask[
                                     write_start:write_end
                                 ] = True
-                    if self.use_layerwise:
+                    if use_layerwise_fetch:
                         # SpecAgent scratch attention may read every fetched
                         # segment in the current layer.  The generic LMCache
                         # path only synchronizes the final retriever, but that
@@ -1992,6 +2026,10 @@ class LMCacheConnectorV1Impl:
             if reference is not None:
                 reference.fetch_reference(_specagent_layer_index(layer_name))
                 return
+        if not self.layerwise_retrievers and not self._specagent_layerwise_meta:
+            # Nothing to wait for: every loop below is empty and no group is
+            # recorded, so the call is a no-op (skip label formatting/contexts).
+            return
         requested_layer = _specagent_layer_index(layer_name)
         if requested_layer is None:
             requested_layer = self.current_layer
@@ -2225,6 +2263,34 @@ class LMCacheConnectorV1Impl:
                 )
 
         gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
+        if (
+            collect_only
+            and target_layer == self.num_layers - 1
+            and getattr(gpu_connector, "use_gpu", False)
+            and len(self._specagent_layerwise_meta) == len(self.layerwise_retrievers)
+            and all(
+                isinstance(meta, dict) and meta.get("defer_layer_submit")
+                for meta in self._specagent_layerwise_meta
+            )
+        ):
+            # A transformer graph needs every descriptor before its first
+            # launch. Deferred generators submit no copies here, so there is
+            # no per-layer consumer to notify or interleave with. Their CPU
+            # source leases and temporary buffers remain owned by the plans;
+            # draining the generators does not release those CUDA consumers.
+            # If graph preparation later declines the plans, the ordinary
+            # producer can still flush these complete per-layer queues.
+            for retriever, meta in zip(
+                self.layerwise_retrievers, self._specagent_layerwise_meta,
+                strict=True,
+            ):
+                for result in retriever:
+                    validate_result(meta, result)
+            self._specagent_prefetch_scan_layer = self.num_layers
+            with self._specagent_prefetch_cond:
+                self._specagent_prefetch_cond.notify_all()
+            return
+
         flush_deferred = getattr(
             gpu_connector, "specagent_flush_deferred_layer", None
         )
@@ -3020,6 +3086,13 @@ class LMCacheConnectorV1Impl:
         kvcaches = list(self.kv_caches.values())
         is_first = True
         layer_idx = _specagent_layer_index(layer_name)
+        direct_bulk_save = (
+            os.environ.get("SPECAGENT_DIRECT_BULK_SAVE") == "1"
+            and not os.environ.get("SPECAGENT_KV_FINGERPRINT_PRESTORE")
+        )
+        if direct_bulk_save and layer_idx != self.num_layers - 1:
+            return
+
         fp_enabled = (
             _specagent_fp_enabled(layer_idx)
             and os.environ.get("SPECAGENT_KV_FINGERPRINT_PRESTORE")
@@ -3317,7 +3390,7 @@ class LMCacheConnectorV1Impl:
                     sync=is_first,
                     req_id=request.req_id,
                     specagent_block_size=self._block_size,
-                    specagent_save_current_layer_only=True,
+                    specagent_save_current_layer_only=not direct_bulk_save,
                     # Enqueue each layer's D2H behind its producer and publish
                     # CPU cache entries only after one final stream completion.
                     # This removes 46 host synchronizations while preserving
@@ -3330,6 +3403,11 @@ class LMCacheConnectorV1Impl:
                 self._layerwise_save_storers[request.req_id] = layerwise_storer
                 if is_first:
                     is_first = False
+
+            if direct_bulk_save:
+                # wait_for_save drains this generator after every KV producer
+                # has been submitted. Never read a later layer from an early hook.
+                continue
 
             if self._specagent_async_save_this_step:
                 self._specagent_submit_save_step(
@@ -3439,10 +3517,14 @@ class LMCacheConnectorV1Impl:
                     request.req_id, None
                 )
                 if layerwise_storer is not None:
-                    try:
-                        next(layerwise_storer)
-                    except StopIteration:
-                        pass
+                    if os.environ.get("SPECAGENT_DIRECT_BULK_SAVE") == "1":
+                        for _ in layerwise_storer:
+                            pass
+                    else:
+                        try:
+                            next(layerwise_storer)
+                        except StopIteration:
+                            pass
                     finalized += 1
                     if request.is_finished_save:
                         self._specagent_finished_save_completed.add(
@@ -3480,6 +3562,15 @@ class LMCacheConnectorV1Impl:
             # unpin the kv caches according to req_id
             self.lmcache_engine.lookup_unpin(request.req_id)
 
+            if (getattr(self.lmcache_engine, "native_bulk_spec", False)
+                    and (request.is_finished_save or request.is_preempt_save)):
+                # get_finished performs these stores synchronously, then
+                # reports completion (or live coverage for a preempt save).
+                # Saving here as well duplicates partial-tail copies/proofs:
+                # skip_leading_tokens is rounded back to a chunk boundary by
+                # that fallback. Keep one owner of the store/ACK lifecycle.
+                continue
+
             save_spec = request.save_spec
             if (
                 save_spec is None or not save_spec.can_save
@@ -3493,7 +3584,8 @@ class LMCacheConnectorV1Impl:
             assert len(slot_mapping) == len(token_ids)
 
             # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = slot_mapping.to(self.device)
+            if not getattr(self.lmcache_engine, "native_bulk_spec", False):
+                slot_mapping = slot_mapping.to(self.device)
 
             skip_leading_tokens = save_spec.skip_leading_tokens
             # shared storage disaggregation will not have a disagg_spec passed in
@@ -3515,7 +3607,9 @@ class LMCacheConnectorV1Impl:
 
             store_mask = torch.ones(len(token_ids), dtype=torch.bool)
             store_mask[:skip_leading_tokens] = False
-            if skip_leading_tokens > 0 and not request.is_finished_save:
+            if (skip_leading_tokens > 0 and not request.is_finished_save
+                    and not (getattr(self.lmcache_engine, "native_bulk_spec", False)
+                             and request.specagent_observation_tail_save)):
                 aligned_token_len = (
                     len(token_ids)
                     // self._lmcache_chunk_size
@@ -3559,6 +3653,8 @@ class LMCacheConnectorV1Impl:
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
                 req_id=request.req_id,
+                specagent_block_size=self._block_size,
+                specagent_tail_merge_prefix_tokens=request.specagent_tail_merge_prefix_tokens,
             )
 
             # Update skip_leading_tokens only on last rank to ensure
@@ -3625,7 +3721,8 @@ class LMCacheConnectorV1Impl:
         if not token_ids:
             return not request.is_preempt_save
 
-        slot_mapping = slot_mapping.to(self.device)
+        if not getattr(self.lmcache_engine, "native_bulk_spec", False):
+            slot_mapping = slot_mapping.to(self.device)
         skip_leading_tokens = (
             save_spec.skip_leading_tokens
             // self._lmcache_chunk_size
@@ -3684,6 +3781,15 @@ class LMCacheConnectorV1Impl:
                 return True
         store_mask = torch.ones(len(token_ids), dtype=torch.bool)
         store_mask[:skip_leading_tokens] = False
+        if getattr(self.lmcache_engine, "native_bulk_spec", False):
+            self.lmcache_engine.store(
+                token_ids, mask=store_mask,
+                kvcaches=list(self.kv_caches.values()), slot_mapping=slot_mapping,
+                offset=0, req_id=request.req_id,
+                specagent_block_size=self._block_size,
+                specagent_tail_merge_prefix_tokens=request.specagent_tail_merge_prefix_tokens,
+            )
+            return True
         storer = self.lmcache_engine.store_layer(
             token_ids,
             mask=store_mask,

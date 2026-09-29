@@ -46,6 +46,23 @@ def restore_paged_bulk(
             cursor = chunk_end
         if cursor != end:
             raise RuntimeError("Bulk restore CPU plan does not cover requested range")
+    if getattr(engine, "native_bulk_spec", False):
+        flat_plan = [chunk for plan in plans for chunk in plan]
+        owners = engine.storage_manager.batched_get(
+            [key for _, _, key in flat_plan], location="LocalCPUBackend",
+        )
+        acquired = [owner for owner in owners if owner is not None]
+        try:
+            if len(owners) != len(flat_plan) or len(acquired) != len(flat_plan):
+                raise RuntimeError("Native sparse restore CPU backup is incomplete")
+            engine.gpu_connector.specagent_restore_native_sparse(
+                acquired, [start for start, _, _ in flat_plan],
+                [end for _, end, _ in flat_plan], write_ranges, kvcaches, slot_mapping,
+            )
+            return sum(end - start for start, end in write_ranges)
+        finally:
+            for owner in acquired:
+                owner.ref_count_down()
     prepared = engine.prepare_sparse_layerwise_plans(plans)
     if prepared is None:
         raise RuntimeError("Bulk restore CPU backup is incomplete or unsupported")
