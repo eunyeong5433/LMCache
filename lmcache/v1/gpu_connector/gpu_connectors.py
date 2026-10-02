@@ -41,6 +41,34 @@ if torch.cuda.is_available():
 logger = init_logger(__name__)
 
 
+def _specagent_fast_slot_setup(starts, ends, offset, slot_mapping):
+    """Chunk lengths and the concatenation of slot_mapping[s-offset:e-offset]
+    over zip(starts, ends), merging adjacent chunks into one slice. Raises the
+    same ValueError as the per-chunk loop for an out-of-range chunk; returns
+    None when a reversed range makes merging unsafe (caller keeps the loop)."""
+    s = np.asarray(starts, dtype=np.int64) - offset
+    e = np.asarray(ends, dtype=np.int64)[: s.size] - offset
+    s = s[: e.size]
+    bad = np.flatnonzero((s < 0) | (e > len(slot_mapping)))
+    if bad.size:
+        i = int(bad[0])
+        raise ValueError(
+            "Invalid layerwise store range after offset adjustment: "
+            f"start={starts[i]} end={ends[i]} offset={offset} "
+            f"slot_mapping_len={len(slot_mapping)}"
+        )
+    if not s.size or not bool(np.all(e >= s)):
+        return None
+    brk = np.flatnonzero(s[1:] != e[:-1]) + 1
+    run_s = np.concatenate(([0], brk)).tolist()
+    run_e = np.concatenate((brk, [s.size])).tolist()
+    full = torch.cat([
+        slot_mapping[int(s[a]):int(e[b - 1])]
+        for a, b in zip(run_s, run_e, strict=True)
+    ], dim=0)
+    return (e - s).tolist(), full
+
+
 def _specagent_acquire_memory_obj_leases(
     memory_objs: list[MemoryObj],
 ) -> list[MemoryObj]:
@@ -2466,7 +2494,22 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         slot_mapping_chunks = []
         write_mask_chunks = []
-        for start, end in zip(starts, ends, strict=False):
+        # SPECAGENT_B2G_FAST_SETUP=1 (no write mask): chunk lengths and the
+        # concatenated mapping without per-chunk Python; adjacent chunks are
+        # merged into one slice. _sa_chunk_lens replaces slot_mapping_chunks.
+        _sa_chunk_lens: Optional[list[int]] = None
+        _sa_fast_full: Optional[torch.Tensor] = None
+        if (write_token_mask_cpu is None and len(starts) > 0
+                and os.environ.get("SPECAGENT_B2G_FAST_SETUP") == "1"):
+            _sa_setup = _specagent_fast_slot_setup(
+                starts, ends, offset, slot_mapping)
+            if _sa_setup is not None:
+                _sa_chunk_lens, _sa_fast_full = _sa_setup
+        for start, end in (
+            () if _sa_chunk_lens is not None and os.environ.get(
+                "SPECAGENT_B2G_FAST_SETUP_CHECK") != "1"
+            else zip(starts, ends, strict=False)
+        ):
             local_start = start - offset
             local_end = end - offset
             if local_start < 0 or local_end > len(slot_mapping):
@@ -2517,6 +2560,14 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 if compact_slot_mapping_chunks
                 else slot_mapping.new_empty((0,))
             )
+        elif _sa_fast_full is not None:
+            slot_mapping_full = _sa_fast_full
+            if os.environ.get("SPECAGENT_B2G_FAST_SETUP_CHECK") == "1":
+                _ref_full = torch.cat(slot_mapping_chunks, dim=0)
+                if (_sa_chunk_lens != [len(c) for c in slot_mapping_chunks]
+                        or not torch.equal(_ref_full, slot_mapping_full)):
+                    logger.error("[SpecAgent][B2G-FAST-SETUP-MISMATCH]")
+                    raise AssertionError("b2g fast setup mismatch")
         else:
             # TODO(Jiayi): Optimize away this `cat`
             slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
@@ -2544,6 +2595,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             )
             and 0 < (
                 len(copy_plan) if copy_plan is not None
+                else len(_sa_chunk_lens) if _sa_chunk_lens is not None
                 else len(slot_mapping_chunks)
             )
         )
@@ -2623,9 +2675,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             else:
                 _direct_offsets = []
                 _fa_off = 0
-                for _smc in slot_mapping_chunks:
+                for _clen in (
+                    _sa_chunk_lens if _sa_chunk_lens is not None
+                    else map(len, slot_mapping_chunks)
+                ):
                     _direct_offsets.append(_fa_off)
-                    _fa_off += len(_smc)
+                    _fa_off += _clen
         elif self.use_gpu:
             _fa_dsts = []
             if copy_plan is not None:
@@ -2633,8 +2688,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     _fa_dsts.append(tmp_gpu_buffer_obj.tensor[dst_start:dst_end])
             else:
                 _fa_off = 0
-                for _smc in slot_mapping_chunks:
-                    _clen = len(_smc)
+                for _clen in (
+                    _sa_chunk_lens if _sa_chunk_lens is not None
+                    else map(len, slot_mapping_chunks)
+                ):
                     _fa_dsts.append(
                         tmp_gpu_buffer_obj.tensor[_fa_off : _fa_off + _clen]
                     )

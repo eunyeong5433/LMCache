@@ -1929,6 +1929,36 @@ class LMCacheEngine:
         if not normalized_segments:
             return []
 
+        # Per-request whole-plan reuse (SPECAGENT_VERIFY_CHUNKPLAN_CACHE=1):
+        # the fetched segments lie in the committed prefix, whose tokens never
+        # change for a request id, so identical (request, segments) yields an
+        # identical plan. CHECK mode recomputes and compares every hit.
+        plan_cache = None
+        cache_key = None
+        if memo_id is not None and os.environ.get(
+            "SPECAGENT_VERIFY_CHUNKPLAN_CACHE"
+        ) == "1":
+            from collections import OrderedDict
+
+            plan_cache = getattr(self, "_specagent_chunk_plan_cache", None)
+            if plan_cache is None:
+                plan_cache = self._specagent_chunk_plan_cache = OrderedDict()
+            cache_key = (memo_id, tuple(normalized_segments), request_configs is None)
+            cached_plans = plan_cache.get(cache_key)
+            if cached_plans is not None and cached_plans[0] == request_configs:
+                plan_cache.move_to_end(cache_key)
+                if os.environ.get("SPECAGENT_VERIFY_PLAN_CACHE_CHECK") == "1":
+                    os.environ["SPECAGENT_VERIFY_CHUNKPLAN_CACHE"] = "0"
+                    try:
+                        fresh = self.plan_sparse_layerwise_chunks(
+                            tokens, normalized_segments, request_configs, memo_id
+                        )
+                    finally:
+                        os.environ["SPECAGENT_VERIFY_CHUNKPLAN_CACHE"] = "1"
+                    if fresh != cached_plans[1]:
+                        raise AssertionError("[SpecAgent] chunk plan cache mismatch")
+                return [list(p) for p in cached_plans[1]]
+
         plans: list[list[tuple[int, int, CacheEngineKey]]] = [
             [] for _ in normalized_segments
         ]
@@ -1968,6 +1998,11 @@ class LMCacheEngine:
             segment_start, segment_end = normalized_segments[segment_index]
             if start >= segment_start and end <= segment_end:
                 plans[segment_index].append((start, end, key))
+        if plan_cache is not None:
+            plan_cache[cache_key] = (request_configs, [list(p) for p in plans])
+            plan_cache.move_to_end(cache_key)
+            while len(plan_cache) > 32:
+                plan_cache.popitem(last=False)
         return plans
 
     def bulk_validate_sparse_layerwise_plan(
@@ -2127,6 +2162,184 @@ class LMCacheEngine:
             )
             offset = next_offset
         return SpecAgentPreparedLayerwiseBatch(prepared_segments)
+
+    def _specagent_prepare_with_plan_cache(
+        self,
+        req_id: str,
+        plan: list[tuple[int, int, CacheEngineKey]],
+    ) -> Optional[SpecAgentPreparedLayerwiseBatch]:
+        """prepare_sparse_layerwise_plans([plan]) with a per-request reuse cache.
+
+        Within one SPEC episode every VERIFY round of a request fetches the
+        same missing chunks, so the membership check, CPU owner acquisition
+        and borrowed layer-view construction are identical. The cache keeps
+        one extra reference on each native owner (so the CPU backend cannot
+        evict or free it: can_evict requires ref_count == 1) and hands each
+        reuse a fresh lease that the normal consumer releases at GPU
+        completion. Only an exact (start, end, key) plan match is reused;
+        any other plan for the request replaces the entry. Entries are
+        bounded by request count and total tokens (LRU) and release their
+        references when dropped.
+
+        Env: SPECAGENT_VERIFY_PLAN_CACHE_MAX_REQS (8),
+        SPECAGENT_VERIFY_PLAN_CACHE_MAX_TOKENS (393216),
+        SPECAGENT_VERIFY_PLAN_CACHE_CHECK=1 compares every hit with a fresh
+        preparation and raises on any difference.
+        """
+        from collections import OrderedDict
+
+        cache = getattr(self, "_specagent_verify_plan_cache", None)
+        if cache is None:
+            cache = self._specagent_verify_plan_cache = OrderedDict()
+        stats = vars(builtins).setdefault(
+            "_specagent_verify_plan_cache_stats",
+            {"hit": 0, "miss": 0, "replace": 0, "evict": 0, "uncacheable": 0},
+        )
+        sig = tuple((int(s), int(e), k) for s, e, k in plan)
+        entry = cache.get(req_id)
+        stats["calls"] = stats.get("calls", 0) + 1
+        if stats["calls"] <= 30:
+            if entry is None:
+                why = "new_req"
+            elif entry["sig"] != sig:
+                old = entry["sig"]
+                first = next((i for i, (a, b) in enumerate(zip(old, sig)) if a != b),
+                             min(len(old), len(sig)))
+                why = (f"sig_diff len {len(old)}->{len(sig)} first_diff={first} "
+                       f"old={old[first][:2] if first < len(old) else None} "
+                       f"new={sig[first][:2] if first < len(sig) else None}")
+            else:
+                why = "hit_candidate"
+            logger.warning("[SpecAgent][VERIFY-PLAN-CACHE-TRACE] req=%s chunks=%d %s",
+                           req_id, len(sig), why)
+        if entry is not None and entry["sig"] == sig and all(
+            owner.is_valid() for owner in entry["owners"]
+        ):
+            for owner in entry["owners"]:
+                owner.ref_count_up()
+            segment = SpecAgentPreparedLayerwiseSegment(
+                starts=entry["starts"],
+                ends=entry["ends"],
+                keys_by_chunk=entry["keys_by_chunk"],
+                location=entry["location"],
+                memory_objs_by_layer=entry["columns"],
+                source_owners=list(entry["owners"]),
+            )
+            cache.move_to_end(req_id)
+            entry["last"] = stats["calls"]
+            stats["hit"] += 1
+            if stats["hit"] % 200 == 0:
+                logger.warning("[SpecAgent][VERIFY-PLAN-CACHE] %s entries=%d", stats, len(cache))
+            if os.environ.get("SPECAGENT_VERIFY_PLAN_CACHE_CHECK") == "1":
+                fresh = self.prepare_sparse_layerwise_plans([plan])
+                try:
+                    if fresh is None:
+                        raise AssertionError("plan cache hit but fresh plan is None")
+                    f = fresh.claim(0)
+                    same = (
+                        f.starts == segment.starts
+                        and f.ends == segment.ends
+                        and f.location == segment.location
+                        and len(f.source_owners or []) == len(segment.source_owners)
+                        and all(a is b for a, b in zip(
+                            f.source_owners or [], segment.source_owners))
+                    )
+                    f.release_source_owners()
+                    if not same:
+                        raise AssertionError("[SpecAgent] verify plan cache mismatch")
+                finally:
+                    if fresh is not None:
+                        fresh.release_unclaimed()
+            return SpecAgentPreparedLayerwiseBatch([segment])
+        if entry is not None:
+            self._specagent_plan_cache_drop(req_id)
+            stats["replace"] += 1
+        stats["miss"] += 1
+        evicted_ids = vars(builtins).setdefault(
+            "_specagent_verify_plan_cache_evicted_ids", set())
+        big = len(sig) * (self.token_database.chunk_size
+                          if getattr(self, "token_database", None) else 0) > 65536
+        why = ("sig" if entry is not None and entry["sig"] != sig
+               else "invalid" if entry is not None
+               else "evicted" if req_id in evicted_ids else "new")
+        evicted_ids.discard(req_id)
+        rk = "why_" + why + ("_big" if big else "")
+        stats[rk] = stats.get(rk, 0) + 1
+        if (os.environ.get("SPECAGENT_VERIFY_PLAN_CACHE_STATS") == "1"
+                and stats["miss"] % 25 == 0):
+            logger.error(
+                "[SpecAgent][VERIFY-PLAN-CACHE-STATS] %s entries=%d tokens=%d",
+                stats, len(cache), sum(v["tokens"] for v in cache.values()))
+        prepared = self.prepare_sparse_layerwise_plans([plan])
+        if prepared is None:
+            return None
+        segment = prepared.claim(0)
+        owners = segment.source_owners
+        if owners is None:
+            stats["uncacheable"] += 1
+            return SpecAgentPreparedLayerwiseBatch([segment])
+        max_reqs = int(os.environ.get("SPECAGENT_VERIFY_PLAN_CACHE_MAX_REQS", "8"))
+        max_tokens = int(
+            os.environ.get("SPECAGENT_VERIFY_PLAN_CACHE_MAX_TOKENS", "393216")
+        )
+        new_tokens = sum(e - s for s, e in zip(segment.starts, segment.ends))
+        if os.environ.get("SPECAGENT_VERIFY_PLAN_CACHE_ADMIT") == "keep":
+            # Keep-resident admission (same caps as LRU): cyclic access by more
+            # large SPEC requests than fit makes LRU evict exactly the entry
+            # needed next. Evict only entries unused for STALE_CALLS calls;
+            # if the new plan still does not fit, serve it uncached.
+            stale_calls = int(os.environ.get(
+                "SPECAGENT_VERIFY_PLAN_CACHE_STALE_CALLS", "24"))
+            now = stats["calls"]
+
+            def _fits() -> bool:
+                return not cache or (
+                    len(cache) + 1 <= max_reqs
+                    and sum(v["tokens"] for v in cache.values()) + new_tokens
+                    <= max_tokens
+                )
+
+            for old_id in [k for k, v in cache.items()
+                           if now - v.get("last", now) > stale_calls]:
+                if _fits():
+                    break
+                self._specagent_plan_cache_drop(old_id)
+                stats["evict_stale"] = stats.get("evict_stale", 0) + 1
+                vars(builtins).setdefault(
+                    "_specagent_verify_plan_cache_evicted_ids", set()).add(old_id)
+            if not _fits():
+                stats["not_admitted"] = stats.get("not_admitted", 0) + 1
+                vars(builtins).setdefault(
+                    "_specagent_verify_plan_cache_evicted_ids", set()).add(req_id)
+                return SpecAgentPreparedLayerwiseBatch([segment])
+        for owner in owners:
+            owner.ref_count_up()
+        cache[req_id] = dict(
+            sig=sig, owners=list(owners), columns=segment.memory_objs_by_layer,
+            starts=segment.starts, ends=segment.ends,
+            keys_by_chunk=segment.keys_by_chunk, location=segment.location,
+            tokens=new_tokens, last=stats["calls"],
+        )
+        while len(cache) > 1 and (
+            len(cache) > max_reqs
+            or sum(v["tokens"] for v in cache.values()) > max_tokens
+        ):
+            oldest = next(iter(cache))
+            self._specagent_plan_cache_drop(oldest)
+            stats["evict"] += 1
+            vars(builtins).setdefault(
+                "_specagent_verify_plan_cache_evicted_ids", set()).add(oldest)
+        return SpecAgentPreparedLayerwiseBatch([segment])
+
+    def _specagent_plan_cache_drop(self, req_id: str) -> None:
+        """Remove a verify plan cache entry and release its owner references."""
+        cache = getattr(self, "_specagent_verify_plan_cache", None)
+        if not cache:
+            return
+        entry = cache.pop(req_id, None)
+        if entry is not None:
+            for owner in entry["owners"]:
+                owner.ref_count_down()
 
     def prepare_sparse_layerwise_plans_progressive(
         self,
@@ -2344,7 +2557,12 @@ class LMCacheEngine:
                         tokens=tokens, mask=mask, request_configs=request_configs,
                         mask_num_falses=int(specagent_prefix_tokens) if specagent_fast_path else None,
                     ))
-                prepared = self.prepare_sparse_layerwise_plans([plan])
+                if os.environ.get("SPECAGENT_VERIFY_PLAN_CACHE") == "1":
+                    prepared = self._specagent_prepare_with_plan_cache(
+                        str(req_id), plan
+                    )
+                else:
+                    prepared = self.prepare_sparse_layerwise_plans([plan])
                 if prepared is None:
                     raise RuntimeError("Native bulk SPEC CPU prefix is incomplete")
                 prepared_segment = prepared.claim(0)

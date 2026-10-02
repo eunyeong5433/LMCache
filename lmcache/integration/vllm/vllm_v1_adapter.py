@@ -1836,6 +1836,8 @@ class LMCacheConnectorV1Impl:
                     self._invalid_block_ids.update(missing_blocks)
 
         graph_runtime = None
+        _sa_plan_rejected = False
+        _sa_graph_candidate = None
         if os.environ.get("SPECAGENT_TRANSFORMER_GRAPH") == "1":
             from vllm.v1.specagent_graph.runtime import get_runtime
             candidate = get_runtime()
@@ -1846,6 +1848,7 @@ class LMCacheConnectorV1Impl:
                     and all(isinstance(m, dict) and m.get("defer_layer_submit")
                             for m in self._specagent_layerwise_meta)):
                 graph_runtime = candidate
+            _sa_graph_candidate = candidate
         if graph_runtime is not None:
             # Collect descriptors layer-major, without enqueuing any producer.
             # Full-plan owners remain held until the replay completion event.
@@ -1873,7 +1876,33 @@ class LMCacheConnectorV1Impl:
                 self._specagent_prefetch_scan_layer = 0
                 graph_runtime = None
                 logger.info("[SpecAgent][TRANSFORMER-GRAPH-FALLBACK] unsupported fetch plan")
+                _sa_plan_rejected = True
 
+        if (os.environ.get("SPECAGENT_TRANSFORMER_GRAPH") == "1"
+                and self._specagent_has_layerwise_fetch()):
+            # Diagnostic only: final graph/eager decision of scratch-fetch steps.
+            counts = getattr(self, "_sa_graph_use_counts", None)
+            if counts is None:
+                counts = self._sa_graph_use_counts = {
+                    "graph": 0, "eager": 0, "runtime_none": 0,
+                    "ineligible": 0, "not_deferred": 0, "plan_rejected": 0}
+            if graph_runtime is not None:
+                counts["graph"] += 1
+            else:
+                counts["eager"] += 1
+                if _sa_plan_rejected:
+                    counts["plan_rejected"] += 1
+                elif _sa_graph_candidate is None:
+                    counts["runtime_none"] += 1
+                elif not _sa_graph_candidate.eligible(forward_context, metadata):
+                    counts["ineligible"] += 1
+                else:
+                    counts["not_deferred"] += 1
+            if (counts["graph"] + counts["eager"]) % 500 == 0:
+                # vLLM logger: LMCache's own logger may be at ERROR level.
+                import logging as _sa_logging
+                _sa_logging.getLogger("vllm").warning(
+                    "[SpecAgent][GRAPH-USE] %s", counts)
         profile_cascade_only = bool(
             self._specagent_has_layerwise_fetch()
             and _specagent_env_true("SPECAGENT_PROFILE_CASCADE_ONLY")

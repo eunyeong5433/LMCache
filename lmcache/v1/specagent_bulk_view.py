@@ -15,6 +15,67 @@ from lmcache.v1.memory_management import (
 EMPTY_VIEW_RAW = torch.empty(0, dtype=torch.uint8)
 
 
+def _validated_owner_tensor(owner: MemoryObj) -> torch.Tensor:
+    """The layout checks of _validated_owner_views, without building views."""
+    tensor = owner.tensor
+    if (
+        not owner.is_valid()
+        or tensor is None
+        or owner.get_memory_format() != MemoryFormat.KV_2LTD
+        or tensor.device.type != "cpu"
+        or tensor.ndim != 4
+        or tensor.shape[0] != 2
+        or not tensor.is_contiguous()
+    ):
+        raise ValueError("Expected a live contiguous CPU 2LTD chunk")
+    return tensor
+
+
+def _borrowed_descriptor(view: torch.Tensor) -> "BorrowedBulkLayerView":
+    return BorrowedBulkLayerView(
+        view,
+        MemoryObjMetadata(
+            shape=view.shape,
+            dtype=view.dtype,
+            address=view.data_ptr(),
+            phy_size=0,
+            ref_count=0,
+            fmt=MemoryFormat.KV_T2D,
+        ),
+    )
+
+
+class _LazyOwnerDescriptors:
+    """SPECAGENT_LAZY_BULK_VIEWS=1: the per-owner descriptor tuple of
+    borrow_bulk_layer_views, built per layer on first access and then reused
+    (same object each time). Layer l is tensor.select(1, l).permute(1, 0, 2),
+    identical to tensor.unbind(1)[l].permute(1, 0, 2)."""
+
+    __slots__ = ("tensor", "items")
+
+    def __init__(self, tensor: torch.Tensor) -> None:
+        self.tensor = tensor
+        self.items: list = [None] * int(tensor.shape[1])
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, layer):
+        if isinstance(layer, slice):
+            return tuple(self[i] for i in range(*layer.indices(len(self))))
+        item = self.items[layer]
+        if item is None:
+            if layer < 0:
+                layer += len(self.items)
+            item = _borrowed_descriptor(self.tensor.select(1, layer).permute(1, 0, 2))
+            self.items[layer] = item
+        return item
+
+    def __iter__(self):
+        for layer in range(len(self.items)):
+            yield self[layer]
+
+
 def _validated_owner_views(owner: MemoryObj) -> tuple[torch.Tensor, ...]:
     tensor = owner.tensor
     if (
@@ -204,6 +265,7 @@ def borrow_bulk_layer_views(
     import os as _os
 
     verify = _os.environ.get("SPECAGENT_FASTPATH_VERIFY") == "1"
+    lazy = _os.environ.get("SPECAGENT_LAZY_BULK_VIEWS") == "1"
     chunks: list[tuple[BorrowedBulkLayerView, ...]] = []
     for owner in owners:
         cached = getattr(owner, "specagent_bulk_borrowed_views", None)
@@ -224,6 +286,25 @@ def borrow_bulk_layer_views(
                     for f, d in zip(fresh, cached[1], strict=True)
                 ):
                     raise AssertionError("fastpath borrowed view cache mismatch")
+            chunks.append(cached[1])
+            continue
+        if lazy:
+            tensor = _validated_owner_tensor(owner)
+            if tensor.shape[1] != num_layers:
+                raise ValueError("Native bulk owner has an incomplete layer count")
+            cached = (None, _LazyOwnerDescriptors(tensor), owner.tensor)
+            if _os.environ.get("SPECAGENT_LAZY_BULK_VIEWS_CHECK") == "1":
+                eager = _validated_owner_views(owner)
+                if len(eager) != len(cached[1]) or any(
+                    f.data_ptr() != d.tensor.data_ptr()
+                    or tuple(f.shape) != tuple(d.tensor.shape)
+                    or tuple(f.stride()) != tuple(d.tensor.stride())
+                    or d.metadata.address != f.data_ptr()
+                    or tuple(d.metadata.shape) != tuple(f.shape)
+                    for f, d in zip(eager, cached[1], strict=True)
+                ):
+                    raise AssertionError("lazy bulk view descriptor mismatch")
+            owner.specagent_bulk_borrowed_views = cached
             chunks.append(cached[1])
             continue
         tensors = _validated_owner_views(owner)

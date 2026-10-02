@@ -37,6 +37,20 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _specagent_note_cpu_pressure(evicted: int, failed: bool) -> None:
+    """SPECAGENT_CPU_PRESSURE_LOG=1: count CPU evictions / failed allocations
+    (LMCache reports these only at debug/warning level)."""
+    import builtins
+    st = vars(builtins).setdefault(
+        "_specagent_cpu_pressure", {"allocs": 0, "evicted": 0, "failed": 0})
+    st["allocs"] += 1
+    st["evicted"] += int(evicted)
+    st["failed"] += int(failed)
+    if (evicted or failed) and (st["evicted"] + st["failed"]) % 200 < max(
+            1, int(evicted) + int(failed)):
+        logger.error("[SpecAgent][CPU-PRESSURE] %s", st)
+
 try:
     # vLLM emits these ranges into Nsight when profiling is enabled.  Keep
     # LMCache importable in standalone contexts where vLLM is absent.
@@ -695,6 +709,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
             )
 
         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
+        if os.environ.get("SPECAGENT_CPU_PRESSURE_LOG") == "1":
+            _specagent_note_cpu_pressure(evict_keys_count, memory_obj is None)
         return memory_obj
 
     @_lmcache_nvtx_annotate
@@ -824,6 +840,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 " attempts of local cpu backend batched_allocate()"
             )
         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
+        if os.environ.get("SPECAGENT_CPU_PRESSURE_LOG") == "1":
+            _specagent_note_cpu_pressure(evict_keys_count, memory_objs is None)
         return memory_objs
 
     def get_full_chunk_size_bytes(self) -> int:

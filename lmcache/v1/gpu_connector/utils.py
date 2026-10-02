@@ -72,7 +72,7 @@ def permute_to_contiguous(tensor: torch.Tensor) -> torch.Tensor:
 
     Returns the tensor unchanged if already contiguous.
     """
-    if tensor.is_contiguous():
+    if tensor.is_contiguous() or _specagent_unified_page_dense(tensor):
         return tensor
 
     strides = tensor.stride()
@@ -97,6 +97,27 @@ def permute_kv_caches_to_contiguous(
     return [permute_to_contiguous(t) for t in kv_caches]
 
 
+def _specagent_unified_page_dense(tensor: torch.Tensor) -> bool:
+    """SpecAgent unified scratch pool view ``[2, P, BS, NH, HS]`` (NHD).
+
+    Pages and everything inside a page are dense; K and V are ``stride(0)``
+    apart (one layer's block count), which is smaller than ``P`` because the
+    page axis spans every layer of one unified KV buffer. All LMCache
+    transfer kernels take the block stride and V offset from strides, so this
+    view needs no copy. Only accepted when SPECAGENT_UNIFIED_SCRATCH_POOL=1.
+    """
+    import os
+
+    if os.environ.get("SPECAGENT_UNIFIED_SCRATCH_POOL") != "1":
+        return False
+    if tensor.dim() != 5 or tensor.size(0) != 2:
+        return False
+    st = tensor.stride()
+    sz = tensor.shape
+    return (st[4] == 1 and st[3] == sz[4] and st[2] == sz[3] * sz[4]
+            and st[1] == sz[2] * sz[3] * sz[4] and st[0] % st[1] == 0)
+
+
 def assert_contiguous(tensor: torch.Tensor) -> None:
     """Assert that a tensor has a contiguous physical layout with zero offset.
 
@@ -107,7 +128,8 @@ def assert_contiguous(tensor: torch.Tensor) -> None:
     assert tensor.storage_offset() == 0, (
         f"expected storage_offset 0, got {tensor.storage_offset()}"
     )
-    assert tensor.is_contiguous(), "tensor is not contiguous"
+    assert tensor.is_contiguous() or _specagent_unified_page_dense(tensor), (
+        "tensor is not contiguous")
 
 
 def any_non_contiguous(kv_caches: dict[str, torch.Tensor] | List[torch.Tensor]) -> bool:
