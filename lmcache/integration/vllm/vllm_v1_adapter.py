@@ -71,6 +71,24 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _specagent_log_pin_copy(meta, layer_idx, num_layers):
+    """Late-pin CHECK: confirm the rebuilt-pin copy ran (first/last layer)."""
+    if not meta.get("pin_rebuild") or layer_idx not in (0, num_layers - 1):
+        return
+    if os.environ.get("SPECAGENT_LATE_PIN_CHECK") != "1":
+        return
+    import logging as _sa_logging
+
+    src = meta.get("src_blocks")
+    dst = meta.get("dst_blocks")
+    _sa_logging.getLogger("vllm").warning(
+        "[SpecAgent][LATE-PIN-COPY] req=%s layer=%d blocks=%d src=%s dst=%s",
+        meta.get("req_id"), layer_idx,
+        int(src.numel()) if hasattr(src, "numel") else -1,
+        src[:4].tolist() if hasattr(src, "tolist") else None,
+        dst[:4].tolist() if hasattr(dst, "tolist") else None)
+
+
 def _specagent_record_cuda_event(
     stream: torch.cuda.Stream,
 ) -> torch.cuda.Event:
@@ -1155,6 +1173,8 @@ class LMCacheConnectorV1Impl:
         sa_cascade_maps = sa_extra.get("specagent_cascade_maps") or {}
         sa_fetch_buf_blocks = sa_extra.get("specagent_fetch_buf_blocks")
         sa_fetch_paged_blocks = sa_extra.get("specagent_fetch_paged_blocks")
+        # Late pin: per-request (scratch page, paged block) pairs to persist.
+        sa_pin_rebuild_pairs = sa_extra.get("specagent_pin_rebuild_pairs") or {}
         # Layerwise stores use deferred commit: each layer only enqueues D2H
         # work on the store stream, and the single synchronization/publication
         # happens in wait_for_save.  Running those cheap enqueue steps through
@@ -1696,11 +1716,24 @@ class LMCacheConnectorV1Impl:
                                     and sa_fetch_buf_blocks is not None
                                     and sa_fetch_paged_blocks is not None
                                 )
+                                or bool(
+                                    use_specagent_buf
+                                    and request.req_id in sa_pin_rebuild_pairs
+                                )
                             ),
+                            "pin_rebuild": request.req_id in sa_pin_rebuild_pairs,
                             "src_kvcaches": target_kvcaches,
                             "dst_kvcaches": kvcaches,
-                            "src_blocks": sa_fetch_buf_blocks,
-                            "dst_blocks": sa_fetch_paged_blocks,
+                            "src_blocks": (
+                                sa_pin_rebuild_pairs[request.req_id][0]
+                                if request.req_id in sa_pin_rebuild_pairs
+                                else sa_fetch_buf_blocks
+                            ),
+                            "dst_blocks": (
+                                sa_pin_rebuild_pairs[request.req_id][1]
+                                if request.req_id in sa_pin_rebuild_pairs
+                                else sa_fetch_paged_blocks
+                            ),
                         })
                     else:
                         assert seg_token_mask is not None
@@ -1841,7 +1874,20 @@ class LMCacheConnectorV1Impl:
         if os.environ.get("SPECAGENT_TRANSFORMER_GRAPH") == "1":
             from vllm.v1.specagent_graph.runtime import get_runtime
             candidate = get_runtime()
+            # Late pin: the rebuilt-pin copy runs in the per-layer eager
+            # path only, so a step carrying one stays out of the graph.
+            if (sa_extra.get("specagent_pin_rebuild_pairs")
+                    and os.environ.get("SPECAGENT_LATE_PIN_CHECK") == "1"):
+                import logging as _sa_logging
+                _sa_logging.getLogger("vllm").warning(
+                    "[SpecAgent][LATE-PIN-EAGER] reqs=%s metas=%d copy_metas=%d",
+                    list(sa_extra["specagent_pin_rebuild_pairs"]),
+                    len(self._specagent_layerwise_meta or []),
+                    sum(1 for m in (self._specagent_layerwise_meta or [])
+                        if isinstance(m, dict) and m.get("pin_rebuild")
+                        and m.get("copy_to_paged")))
             if (candidate is not None
+                    and not sa_extra.get("specagent_pin_rebuild_pairs")
                     and candidate.eligible(forward_context, metadata)
                     and self._specagent_has_layerwise_fetch()
                     and self._specagent_layerwise_meta
@@ -2189,10 +2235,53 @@ class LMCacheConnectorV1Impl:
                     requested_layer,
                 )
 
+        # Late pin: persist this group's rebuilt pin pages from scratch into
+        # their paged blocks. The stream already waits for the group's load;
+        # attention and the next same-parity load are ordered after this.
+        self._specagent_copy_pin_rebuild_group(
+            group_id * group_size if has_specagent_events else requested_layer,
+            group_end_layer,
+        )
+
         if has_specagent_events:
             self._specagent_waited_layer_groups.add(group_id)
 
         return
+
+    def _specagent_copy_pin_rebuild_group(
+        self, start_layer: int, end_layer: int
+    ) -> None:
+        seen: set = set()
+        for meta in self._specagent_layerwise_meta or ():
+            if not (
+                isinstance(meta, dict)
+                and meta.get("pin_rebuild")
+                and meta.get("copy_to_paged")
+            ):
+                continue
+            req_id = meta.get("req_id")
+            if req_id in seen:
+                continue  # one copy per request, not per segment
+            seen.add(req_id)
+            src_blocks = meta.get("src_blocks")
+            dst_blocks = meta.get("dst_blocks")
+            src_kvcaches = meta.get("src_kvcaches")
+            dst_kvcaches = meta.get("dst_kvcaches")
+            if (
+                src_blocks is None
+                or dst_blocks is None
+                or not src_kvcaches
+                or not dst_kvcaches
+            ):
+                continue
+            for layer_idx in range(start_layer, end_layer + 1):
+                current_platform.insert_blocks_to_device(
+                    src_kvcaches[layer_idx],
+                    dst_kvcaches[layer_idx],
+                    src_blocks,
+                    dst_blocks,
+                )
+                _specagent_log_pin_copy(meta, layer_idx, self.num_layers)
 
     def _specagent_kv_bytes_per_layer_token(self) -> int:
         if not self.kv_caches:
@@ -2911,6 +3000,7 @@ class LMCacheConnectorV1Impl:
                     )
                 if (
                     meta.get("copy_to_paged")
+                    and not meta.get("pin_rebuild")
                     and self.current_layer != self.num_layers - 1
                 ):
                     events = meta.get("layer_events")
@@ -2940,6 +3030,7 @@ class LMCacheConnectorV1Impl:
                             src_blocks,
                             dst_blocks,
                         )
+                        _specagent_log_pin_copy(meta, layer_idx, self.num_layers)
                         if isinstance(events, list):
                             copied_event = _specagent_record_cuda_event(
                                 current_stream
@@ -3003,7 +3094,7 @@ class LMCacheConnectorV1Impl:
                             expected_tokens,
                             final_tokens,
                         )
-                    if meta.get("copy_to_paged"):
+                    if meta.get("copy_to_paged") and not meta.get("pin_rebuild"):
                         src_blocks = meta.get("src_blocks")
                         dst_blocks = meta.get("dst_blocks")
                         src_kvcaches = meta.get("src_kvcaches")
@@ -3021,6 +3112,8 @@ class LMCacheConnectorV1Impl:
                                 src_blocks,
                                 dst_blocks,
                             )
+                            _specagent_log_pin_copy(
+                                meta, layer_idx, self.num_layers)
                             events = meta.get("layer_events")
                             if isinstance(events, list):
                                 copied_event = _specagent_record_cuda_event(
