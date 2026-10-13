@@ -264,6 +264,8 @@ def specagent_tracker_update_counts(
 
 # [events, lost tokens] of SpecAgent fetch ranges dropped by the adapter.
 _SPECAGENT_FETCH_CLIP = [0, 0]
+# Steps whose connector metadata was skipped for lack of a RequestTracker.
+_SPECAGENT_TRACKER_MISS = [0]
 
 
 def specagent_fetch_lost_tokens(
@@ -4997,11 +4999,13 @@ class LMCacheConnectorV1Impl:
                 request_tracker = self._request_trackers.get(req_id)
                 if load_spec is None or request_tracker is None:
                     if load_spec is not None:
-                        logger.warning(
+                        _SPECAGENT_TRACKER_MISS[0] += 1
+                        logger.error(
                             "[SpecAgent][LOADSPEC] missing tracker req=%s "
-                            "fetch_reason=%s",
+                            "fetch_reason=%s -- no fetch this step total=%d",
                             req_id,
                             specagent_fetch_reqs.get(req_id),
+                            _SPECAGENT_TRACKER_MISS[0],
                         )
                     continue
                 old_saved_tokens = apply_specagent_scratch_save_floor(
@@ -5184,9 +5188,12 @@ class LMCacheConnectorV1Impl:
                     vllm_cached_tokens = load_spec.vllm_cached_tokens
                 request_tracker = self._request_trackers.get(req.req_id)
                 if request_tracker is None:
-                    logger.warning(
+                    _SPECAGENT_TRACKER_MISS[0] += 1
+                    logger.error(
                         "[SpecAgent][TRACKER-MISS] extra-fetch req without "
-                        "tracker req=%s -- skipped", req.req_id)
+                        "tracker req=%s fetch_reason=%s -- skipped total=%d",
+                        req.req_id, specagent_fetch_reqs.get(req.req_id),
+                        _SPECAGENT_TRACKER_MISS[0])
                     continue
 
                 # Pass all_token_ids for preempted requests to restore
@@ -5279,9 +5286,12 @@ class LMCacheConnectorV1Impl:
                 # 분류된 요청 — tracker 미등록. 엔진을 죽이는 대신 이번
                 # 스텝 메타를 생략(그 턴은 커넥터 저장/로드 없이 진행,
                 # 재계산 경로가 정확성 보장). 배선 근본수정용 단서 로그.
-                logger.warning(
+                _SPECAGENT_TRACKER_MISS[0] += 1
+                logger.error(
                     "[SpecAgent][TRACKER-MISS] cached req without tracker "
-                    "req=%s -- skipping connector meta this step", req_id)
+                    "req=%s fetch_reason=%s -- skipping connector meta this "
+                    "step total=%d", req_id, specagent_fetch_reqs.get(req_id),
+                    _SPECAGENT_TRACKER_MISS[0])
                 continue
             num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
             # TODO: this is a dangerous reference to the request object inside vllm
