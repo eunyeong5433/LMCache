@@ -225,6 +225,43 @@ def _specagent_kv_fp_delta(
     return sum_delta, norm_delta
 
 
+def specagent_tracker_update_counts(
+    is_specagent_fetch: bool,
+    tracker_saved_tokens: int,
+    lmcache_cached_tokens: int,
+    vllm_cached_tokens: int,
+    num_computed_tokens: int,
+) -> tuple[int, int]:
+    """Counts to pass to ``RequestTracker.update`` for a scheduled request.
+
+    On a resume, ``RequestTracker.update`` takes ``lmcache_cached_tokens`` as
+    the tracker's save progress and rebuilds ``token_ids`` up to
+    ``max(lmcache_cached_tokens, vllm_cached_tokens)`` plus the new tokens.
+    A SpecAgent fetch must keep the tracker's own save progress (its forced
+    load is not proof of a save), but its token list must still cover the
+    whole prefix the step treats as computed, CPU-fetched holes included.
+    Rebuilding it from the save progress alone left the tracker 182,784
+    tokens short of a 217,705-token request, so later save and fetch ranges
+    were computed in the wrong coordinates.
+
+    Args:
+        is_specagent_fetch: Whether SpecAgent fetches KV for the request in
+            this step.
+        tracker_saved_tokens: The tracker's ``num_saved_tokens``.
+        lmcache_cached_tokens: LMCache-cached tokens of the step's load spec.
+        vllm_cached_tokens: vLLM-cached tokens of the step's load spec.
+        num_computed_tokens: Tokens the scheduler treats as computed before
+            this step.
+
+    Returns:
+        ``(lmcache_cached_tokens, vllm_cached_tokens)`` for
+        ``RequestTracker.update``.
+    """
+    if not is_specagent_fetch:
+        return lmcache_cached_tokens, vllm_cached_tokens
+    return tracker_saved_tokens, max(vllm_cached_tokens, num_computed_tokens)
+
+
 @dataclass
 class LoadSpec:
     # Number of tokens cached in vLLM
@@ -5346,10 +5383,14 @@ class LMCacheConnectorV1Impl:
             # token_ids correctly for chunk key computation
             all_token_ids = list(request.all_token_ids) if preempted else None
 
-            tracker_lmcache_cached_tokens = (
-                request_tracker.num_saved_tokens
-                if req_id in specagent_fetch_reqs
-                else lmcache_cached_tokens
+            tracker_lmcache_cached_tokens, tracker_vllm_cached_tokens = (
+                specagent_tracker_update_counts(
+                    req_id in specagent_fetch_reqs,
+                    request_tracker.num_saved_tokens,
+                    lmcache_cached_tokens,
+                    vllm_cached_tokens,
+                    num_current_tokens,
+                )
             )
             if req_id in specagent_fetch_reqs and lmcache_cached_tokens:
                 logger.warning(
@@ -5365,7 +5406,7 @@ class LMCacheConnectorV1Impl:
                 new_block_ids,
                 preempted=preempted,
                 lmcache_cached_tokens=tracker_lmcache_cached_tokens,
-                vllm_cached_tokens=vllm_cached_tokens,
+                vllm_cached_tokens=tracker_vllm_cached_tokens,
                 all_token_ids=all_token_ids,
             )
             sync_authoritative_block_ids(
