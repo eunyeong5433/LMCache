@@ -262,8 +262,6 @@ def specagent_tracker_update_counts(
     return tracker_saved_tokens, max(vllm_cached_tokens, num_computed_tokens)
 
 
-# [events, lost tokens] of SpecAgent fetch ranges dropped by the adapter.
-_SPECAGENT_FETCH_CLIP = [0, 0]
 # Steps whose connector metadata was skipped for lack of a RequestTracker.
 _SPECAGENT_TRACKER_MISS = [0]
 
@@ -1412,24 +1410,19 @@ class LMCacheConnectorV1Impl:
                     fetch_prefix_limit,
                 )
                 if lost_fetch_tokens:
-                    _SPECAGENT_FETCH_CLIP[0] += 1
-                    _SPECAGENT_FETCH_CLIP[1] += lost_fetch_tokens
-                    logger.error(
-                        "[SpecAgent][FETCH-CLIP] req=%s fetch_reason=%s "
-                        "lost_tokens=%d ranges_end=%d tokens=%d slots=%d "
-                        "lmcache_cached_tokens=%d prefix_len=%d "
-                        "total_events=%d total_lost_tokens=%d",
-                        request.req_id,
-                        specagent_fetch_reason,
-                        lost_fetch_tokens,
-                        max(int(end) for _, end in
-                            sa_fetch_token_ranges[request.req_id]),
-                        len(tokens),
-                        len(slot_mapping),
-                        lmcache_cached_tokens,
-                        prefix_len,
-                        _SPECAGENT_FETCH_CLIP[0],
-                        _SPECAGENT_FETCH_CLIP[1],
+                    # Holes past the cover limit are neither fetched nor
+                    # recomputed, and the later count check expects only the
+                    # clipped plan, so stop here.
+                    raise RuntimeError(
+                        "[SpecAgent][FETCH-CLIP] "
+                        f"req={request.req_id} "
+                        f"fetch_reason={specagent_fetch_reason} "
+                        f"lost_tokens={lost_fetch_tokens} "
+                        "ranges_end="
+                        f"{max(int(end) for _, end in sa_fetch_token_ranges[request.req_id])} "
+                        f"tokens={len(tokens)} slots={len(slot_mapping)} "
+                        f"lmcache_cached_tokens={lmcache_cached_tokens} "
+                        f"prefix_len={prefix_len}"
                     )
                 for start, end in clipped_ranges:
                     chunk_start = (
