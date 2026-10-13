@@ -262,6 +262,28 @@ def specagent_tracker_update_counts(
     return tracker_saved_tokens, max(vllm_cached_tokens, num_computed_tokens)
 
 
+# [events, lost tokens] of SpecAgent fetch ranges dropped by the adapter.
+_SPECAGENT_FETCH_CLIP = [0, 0]
+
+
+def specagent_fetch_lost_tokens(
+    ranges: list[tuple[int, int]], cover_limit: int
+) -> int:
+    """Tokens of the requested SpecAgent fetch ranges at or past ``cover_limit``.
+
+    The worker builds the ranges inside the request's CPU prefix, so the
+    token list, the slot mapping, the LMCache prefix and the cascade prefix
+    should all cover them. A range past ``cover_limit`` is neither fetched
+    nor recomputed in this step, which is what the short tracker of a
+    resumed fetch request did without any log.
+    """
+    return sum(
+        int(end) - max(int(start), cover_limit)
+        for start, end in ranges
+        if int(end) > max(int(start), cover_limit)
+    )
+
+
 @dataclass
 class LoadSpec:
     # Number of tokens cached in vLLM
@@ -1383,6 +1405,30 @@ class LMCacheConnectorV1Impl:
                 )
                 if prefix_len > 0:
                     fetch_prefix_limit = min(fetch_prefix_limit, prefix_len)
+                lost_fetch_tokens = specagent_fetch_lost_tokens(
+                    sa_fetch_token_ranges.get(request.req_id, []),
+                    fetch_prefix_limit,
+                )
+                if lost_fetch_tokens:
+                    _SPECAGENT_FETCH_CLIP[0] += 1
+                    _SPECAGENT_FETCH_CLIP[1] += lost_fetch_tokens
+                    logger.error(
+                        "[SpecAgent][FETCH-CLIP] req=%s fetch_reason=%s "
+                        "lost_tokens=%d ranges_end=%d tokens=%d slots=%d "
+                        "lmcache_cached_tokens=%d prefix_len=%d "
+                        "total_events=%d total_lost_tokens=%d",
+                        request.req_id,
+                        specagent_fetch_reason,
+                        lost_fetch_tokens,
+                        max(int(end) for _, end in
+                            sa_fetch_token_ranges[request.req_id]),
+                        len(tokens),
+                        len(slot_mapping),
+                        lmcache_cached_tokens,
+                        prefix_len,
+                        _SPECAGENT_FETCH_CLIP[0],
+                        _SPECAGENT_FETCH_CLIP[1],
+                    )
                 for start, end in clipped_ranges:
                     chunk_start = (
                         start // self._lmcache_chunk_size
