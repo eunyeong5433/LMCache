@@ -1735,7 +1735,11 @@ class LMCacheConnectorV1Impl:
                             f"expected_layer_mib={expected_mib:.1f}"
                         ):
                             layerwise_retriever = self.lmcache_engine.retrieve_layer(
-                                tokens[:seg_end],
+                                (tokens if (
+                                    seg_end >= len(tokens)
+                                    and os.environ.get(
+                                        "SPECAGENT_VERIFY_SCHED_FAST") == "1")
+                                 else tokens[:seg_end]),
                                 seg_token_mask,
                                 kvcaches=target_kvcaches,
                                 slot_mapping=slot_mapping[:seg_end],
@@ -4940,7 +4944,13 @@ class LMCacheConnectorV1Impl:
                     )
                 return req_meta
             if aligned_token_len < len(req_meta.token_ids):
-                req_meta.token_ids = req_meta.token_ids[:aligned_token_len]
+                if (os.environ.get("SPECAGENT_VERIFY_SCHED_FAST") == "1"
+                        and isinstance(req_meta.token_ids, list)):
+                    # The meta owns this list (sliced in from_tracker):
+                    # truncate in place, no second O(context) copy.
+                    del req_meta.token_ids[aligned_token_len:]
+                else:
+                    req_meta.token_ids = req_meta.token_ids[:aligned_token_len]
                 req_meta.slot_mapping = req_meta.slot_mapping[:aligned_token_len]
                 if _specagent_env_true("SPECAGENT_SAVE_DEBUG"):
                     logger.warning(
