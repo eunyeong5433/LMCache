@@ -4615,9 +4615,22 @@ class LMCacheConnectorV1Impl:
             req_id: str,
             reason: str,
         ) -> None:
-            authoritative = flatten_block_ids(
-                specagent_current_block_ids.get(req_id)
-            )
+            snapshot = specagent_current_block_ids.get(req_id)
+            if (os.environ.get("SPECAGENT_VERIFY_SCHED_FAST") == "1"
+                    and isinstance(snapshot, (tuple, list))
+                    and len(snapshot) == 1
+                    and isinstance(snapshot[0], list)):
+                # Single KV group: the flattened list is a copy of that
+                # group (O(context) in C, not a Python generator per step).
+                authoritative = list(snapshot[0])
+                if (os.environ.get("SPECAGENT_FASTPATH_VERIFY") == "1"
+                        and authoritative != flatten_block_ids(snapshot)):
+                    logger.error(
+                        "[SpecAgent][FASTPATH-MISMATCH] meta block ids req=%s",
+                        req_id)
+                    raise AssertionError("fastpath meta block ids mismatch")
+            else:
+                authoritative = flatten_block_ids(snapshot)
             if authoritative is None:
                 return
             old = request_tracker.allocated_block_ids
@@ -4765,12 +4778,6 @@ class LMCacheConnectorV1Impl:
                 resident_groups = (
                     specagent_fetch_resident_logical_indices.get(req_id, ())
                 )
-                resident_logical: set[int] = set()
-                for group in resident_groups:
-                    if isinstance(group, (list, tuple, set)):
-                        resident_logical.update(int(i) for i in group)
-                    else:
-                        resident_logical.add(int(group))
                 # Only logical blocks intersecting the single boundary chunk
                 # can satisfy the overlap predicate; iterating the full
                 # cpu_prefix_blocks range (O(context), every fetch req, every
@@ -4781,11 +4788,53 @@ class LMCacheConnectorV1Impl:
                     cpu_prefix_blocks,
                     cdiv(boundary_chunk[1], self._block_size),
                 )
-                for logical_i in range(overlap_lo, overlap_hi):
-                    if logical_i in resident_logical:
-                        continue
-                    overlaps_missing = True
-                    break
+                if os.environ.get("SPECAGENT_VERIFY_SCHED_FAST") == "1":
+                    # Same predicate over the same indices: collect only the
+                    # resident indices inside the boundary chunk (vectorized
+                    # over the O(context) list) instead of a Python set of
+                    # every resident index on every step.
+                    import numpy as _np
+
+                    present: set[int] = set()
+                    for group in resident_groups:
+                        if isinstance(group, (list, tuple, set)):
+                            arr = _np.fromiter(group, dtype=_np.int64,
+                                               count=len(group))
+                            present.update(arr[(arr >= overlap_lo)
+                                               & (arr < overlap_hi)].tolist())
+                        else:
+                            present.add(int(group))
+                    for logical_i in range(overlap_lo, overlap_hi):
+                        if logical_i in present:
+                            continue
+                        overlaps_missing = True
+                        break
+                    if os.environ.get("SPECAGENT_FASTPATH_VERIFY") == "1":
+                        _ref: set[int] = set()
+                        for group in resident_groups:
+                            if isinstance(group, (list, tuple, set)):
+                                _ref.update(int(i) for i in group)
+                            else:
+                                _ref.add(int(group))
+                        _ref_overlaps = any(
+                            i not in _ref for i in range(overlap_lo, overlap_hi))
+                        if _ref_overlaps != overlaps_missing:
+                            logger.error(
+                                "[SpecAgent][FASTPATH-MISMATCH] meta overlap "
+                                "req=%s", req_id)
+                            raise AssertionError("fastpath meta overlap mismatch")
+                else:
+                    resident_logical: set[int] = set()
+                    for group in resident_groups:
+                        if isinstance(group, (list, tuple, set)):
+                            resident_logical.update(int(i) for i in group)
+                        else:
+                            resident_logical.add(int(group))
+                    for logical_i in range(overlap_lo, overlap_hi):
+                        if logical_i in resident_logical:
+                            continue
+                        overlaps_missing = True
+                        break
                 if overlaps_missing:
                     if merge_observation_tail:
                         specagent_scratch_merge_prefix_starts[req_id] = int(
