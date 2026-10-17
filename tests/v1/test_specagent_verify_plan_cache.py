@@ -178,3 +178,81 @@ def test_keep_admission_evicts_stale(engine, monkeypatch):
         consume(eng._specagent_prepare_with_plan_cache("r1", [(0, 256, "a")]))
     consume(eng._specagent_prepare_with_plan_cache("r3", [(0, 256, "c")]))
     assert owners["b"].refs == 1 and owners["c"].refs == 2 and owners["a"].refs == 2
+
+
+class FakeBackend:
+    """Owner lookup under the backend lock: a fresh lease per returned object."""
+
+    def __init__(self, owners):
+        self.owners = owners
+
+    def batched_get_blocking(self, keys):
+        out = []
+        for k in keys:
+            o = self.owners.get(k)
+            if o is not None:
+                o.ref_count_up()
+            out.append(o)
+        return out
+
+
+@pytest.fixture
+def weak_engine(engine, monkeypatch):
+    eng, owners, calls = engine
+    import types
+    eng.storage_manager = types.SimpleNamespace(
+        storage_backends={"cpu": FakeBackend(owners)})
+    eng.num_layers = 1
+    monkeypatch.setattr("lmcache.v1.cache_engine.chunk_key", lambda k: k)
+    monkeypatch.setenv("SPECAGENT_VERIFY_SCHED_FAST", "1")
+    return eng, owners, calls
+
+
+def test_weak_hit_holds_no_reference(weak_engine):
+    eng, owners, calls = weak_engine
+    plan = [(0, 256, "a"), (256, 512, "b")]
+    consume(eng._specagent_prepare_with_weak_plan_cache("r1", plan))
+    assert calls["n"] == 1 and owners["a"].refs == 1  # backend only
+    seg = eng._specagent_prepare_with_weak_plan_cache("r1", plan).claim(0)
+    assert calls["n"] == 1  # reused, re-acquired through the backend
+    assert owners["a"].refs == 2 and seg.source_owners == [owners["a"], owners["b"]]
+    seg.release_source_owners()
+    assert owners["a"].refs == 1
+
+
+def test_weak_subset_plan_hits(weak_engine):
+    eng, owners, calls = weak_engine
+    consume(eng._specagent_prepare_with_weak_plan_cache(
+        "r1", [(0, 256, "a"), (256, 512, "b"), (512, 768, "c")]))
+    seg = consume(eng._specagent_prepare_with_weak_plan_cache(
+        "r1", [(0, 256, "a"), (512, 768, "c")]))
+    assert calls["n"] == 1
+    assert seg.starts == [0, 512] and seg.ends == [256, 768]
+    assert seg.memory_objs_by_layer == [["view", "view"]]
+    assert owners["b"].refs == 1 and owners["a"].refs == 1
+    # a superset (or reordered) plan is a miss
+    consume(eng._specagent_prepare_with_weak_plan_cache(
+        "r1", [(0, 256, "a"), (256, 512, "b"), (512, 768, "c")]))
+    assert calls["n"] == 2
+
+
+def test_weak_restored_chunk_is_a_miss(weak_engine):
+    eng, owners, calls = weak_engine
+    plan = [(0, 256, "a")]
+    consume(eng._specagent_prepare_with_weak_plan_cache("r1", plan))
+    old = owners["a"]
+    owners["a"] = FakeOwner("a")  # evicted and stored again: a new object
+    consume(eng._specagent_prepare_with_weak_plan_cache("r1", plan))
+    assert calls["n"] == 2 and old.refs == 1 and owners["a"].refs == 1
+    del owners["a"]  # evicted
+    consume(eng._specagent_prepare_with_weak_plan_cache("r1", plan))
+    assert calls["n"] == 3
+
+
+def test_weak_check_mode_passes(weak_engine, monkeypatch):
+    eng, owners, calls = weak_engine
+    monkeypatch.setenv("SPECAGENT_VERIFY_PLAN_CACHE_CHECK", "1")
+    plan = [(0, 256, "a")]
+    consume(eng._specagent_prepare_with_weak_plan_cache("r1", plan))
+    consume(eng._specagent_prepare_with_weak_plan_cache("r1", plan))
+    assert calls["n"] == 2 and owners["a"].refs == 1

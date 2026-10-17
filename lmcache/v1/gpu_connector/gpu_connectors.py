@@ -2735,6 +2735,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         _sa_layer0_srcs: Optional[list] = None
         _sa_layer_deltas: Optional[list[int]] = None
         _sa_verify_lazy = os.environ.get("SPECAGENT_FASTPATH_VERIFY") == "1"
+        # Layer-0 sources and layer deltas precomputed with the prepared plan
+        # (cache_engine plan cache): the per-chunk loop below is skipped.
+        _sa_pre = kwargs.get("specagent_layer0_sources")
+        if _sa_pre is not None and (
+                copy_plan is not None or len(_sa_pre[0]) == 0):
+            _sa_pre = None
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
             _hb_t0 = _hbt.perf_counter() if _hb else 0.0
@@ -2808,6 +2814,19 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                                         "layer sources layer=%d", layer_id)
                                     raise AssertionError(
                                         "fastpath lazy layer sources mismatch")
+                        elif (layer_id == 0 and _sa_pre is not None
+                              and len(_sa_pre[0]) == len(memory_objs_layer)):
+                            _fa_srcs = _sa_pre[0]
+                            if _sa_verify_lazy and any(
+                                r is not s for r, s in zip(
+                                    [mo.tensor for mo in memory_objs_layer],
+                                    _fa_srcs, strict=True)
+                            ):
+                                logger.error(
+                                    "[SpecAgent][FASTPATH-MISMATCH] layer-0 "
+                                    "sources")
+                                raise AssertionError(
+                                    "fastpath layer-0 sources mismatch")
                         elif copy_plan is not None:
                             _fa_srcs = []
                             for (
@@ -2845,10 +2864,19 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             BorrowedBulkLayerView as _SA_BBLV,
                         )
                         _sa_deltas: list[int] = []
-                        _sa_ok = all(
-                            isinstance(mo, _SA_BBLV) for mo in memory_objs_layer
+                        _sa_pre_ok = (
+                            _sa_pre is not None and _fa_srcs is _sa_pre[0]
+                            and _sa_pre[1] is not None
+                            and len(_sa_pre[1]) >= _fa_n
                         )
-                        if _sa_ok:
+                        if _sa_pre_ok and not _sa_verify_lazy:
+                            _sa_ok = True
+                            _sa_deltas = list(_sa_pre[1][:_fa_n])
+                        else:
+                            _sa_ok = all(
+                                isinstance(mo, _SA_BBLV) for mo in memory_objs_layer
+                            )
+                        if _sa_ok and not (_sa_pre_ok and not _sa_verify_lazy):
                             for _sa_i in range(_fa_n):
                                 _sa_c = (
                                     copy_plan[_sa_i][0]
@@ -2864,6 +2892,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                                     break
                                 _sa_deltas.append(
                                     _sa_span * int(_sa_view.element_size()))
+                        if (_sa_pre_ok and _sa_verify_lazy
+                                and (not _sa_ok
+                                     or _sa_deltas != list(_sa_pre[1][:_fa_n]))):
+                            logger.error(
+                                "[SpecAgent][FASTPATH-MISMATCH] layer deltas")
+                            raise AssertionError("fastpath layer deltas mismatch")
                         if _sa_ok:
                             _sa_lazy_ok = True
                             _sa_layer_deltas = _sa_deltas

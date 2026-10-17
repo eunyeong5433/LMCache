@@ -361,3 +361,33 @@ def merge_native_bulk_prefix(source: MemoryObj, target: MemoryObj, count: int) -
     ):
         raise ValueError("Native bulk prefix merge shape/coverage mismatch")
     dst[:, :, :count, :].copy_(src)
+
+
+def layer0_sources(column0, num_layers: int):
+    """(layer-0 source tensors, per-source layer pointer deltas in bytes) of
+    a native-bulk layer column, exactly as the GPU connector derives them at
+    layer 0 of a deferred fetch (None when any source is not derivable)."""
+    srcs = []
+    deltas = []
+    for mo in column0:
+        if not isinstance(mo, BorrowedBulkLayerView):
+            return None
+        view = mo.tensor
+        if view.ndim != 3:
+            return None
+        span = int(view.shape[0]) * int(view.stride(0))
+        if int(view.stride(1)) != num_layers * span:
+            return None
+        srcs.append(view)
+        deltas.append(span * int(view.element_size()))
+    return srcs, deltas
+
+
+def subset_layer_columns(columns, idx):
+    """The per-layer columns restricted to chunk positions ``idx`` (same
+    descriptor objects; lazy columns stay lazy)."""
+    if columns and isinstance(columns[0], _BorrowedLayerColumn):
+        first = columns[0]
+        chunks = [first.chunks[first.start + i] for i in idx]
+        return [_BorrowedLayerColumn(chunks, col.layer) for col in columns]
+    return [[col[i] for i in idx] for col in columns]

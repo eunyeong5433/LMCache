@@ -115,6 +115,9 @@ class SpecAgentPreparedLayerwiseSegment:
     location: str
     memory_objs_by_layer: list[list[MemoryObj | BorrowedBulkLayerView]]
     source_owners: Optional[list[MemoryObj]] = None
+    # (layer-0 source tensors, per-source layer byte deltas) precomputed for
+    # the GPU connector's deferred layer-0 collection; None -> derive there.
+    layer0_sources: Optional[tuple] = None
 
     def release_source_owners(self) -> None:
         """Release chunk leases still held here, including abandoned claims."""
@@ -2212,6 +2215,37 @@ class LMCacheEngine:
                 why = "hit_candidate"
             logger.warning("[SpecAgent][VERIFY-PLAN-CACHE-TRACE] req=%s chunks=%d %s",
                            req_id, len(sig), why)
+        if (entry is not None and entry["sig"] != sig and sig
+                and os.environ.get("SPECAGENT_VERIFY_PLAN_CACHE_SUBSET", "1") == "1"
+                and all(owner.is_valid() for owner in entry["owners"])):
+            # A plan that keeps a subset of the cached chunks (same
+            # (start, end, key) each, in order; e.g. after a reclaim claimed
+            # some of its holes) reuses the cached owners and descriptors:
+            # drop the leases of the chunks that left, keep the rest.
+            pos = entry.get("pos")
+            if pos is None:
+                pos = entry["pos"] = {c: i for i, c in enumerate(entry["sig"])}
+            idx = [pos.get(c) for c in sig]
+            if None not in idx and all(a < b for a, b in zip(idx, idx[1:])):
+                from lmcache.v1.specagent_bulk_view import subset_layer_columns
+
+                keep = set(idx)
+                for i, owner in enumerate(entry["owners"]):
+                    if i not in keep:
+                        owner.ref_count_down()
+                entry["owners"] = [entry["owners"][i] for i in idx]
+                entry["columns"] = subset_layer_columns(entry["columns"], idx)
+                entry["starts"] = [entry["starts"][i] for i in idx]
+                entry["ends"] = [entry["ends"][i] for i in idx]
+                entry["keys_by_chunk"] = [entry["keys_by_chunk"][i] for i in idx]
+                l0 = entry.get("layer0")
+                entry["layer0"] = None if l0 is None else (
+                    [l0[0][i] for i in idx], [l0[1][i] for i in idx])
+                entry["tokens"] = sum(
+                    e - s for s, e in zip(entry["starts"], entry["ends"]))
+                entry["sig"] = sig
+                entry["pos"] = None
+                stats["hit_subset"] = stats.get("hit_subset", 0) + 1
         if entry is not None and entry["sig"] == sig and all(
             owner.is_valid() for owner in entry["owners"]
         ):
@@ -2224,6 +2258,7 @@ class LMCacheEngine:
                 location=entry["location"],
                 memory_objs_by_layer=entry["columns"],
                 source_owners=list(entry["owners"]),
+                layer0_sources=entry.get("layer0"),
             )
             cache.move_to_end(req_id)
             entry["last"] = stats["calls"]
@@ -2314,11 +2349,19 @@ class LMCacheEngine:
                 return SpecAgentPreparedLayerwiseBatch([segment])
         for owner in owners:
             owner.ref_count_up()
+        layer0 = None
+        if (os.environ.get("SPECAGENT_VERIFY_SCHED_FAST") == "1"
+                and segment.memory_objs_by_layer):
+            from lmcache.v1.specagent_bulk_view import layer0_sources
+
+            layer0 = layer0_sources(
+                segment.memory_objs_by_layer[0], self.num_layers)
+            segment.layer0_sources = layer0
         cache[req_id] = dict(
             sig=sig, owners=list(owners), columns=segment.memory_objs_by_layer,
             starts=segment.starts, ends=segment.ends,
             keys_by_chunk=segment.keys_by_chunk, location=segment.location,
-            tokens=new_tokens, last=stats["calls"],
+            tokens=new_tokens, last=stats["calls"], layer0=layer0,
         )
         while len(cache) > 1 and (
             len(cache) > max_reqs
@@ -2329,6 +2372,173 @@ class LMCacheEngine:
             stats["evict"] += 1
             vars(builtins).setdefault(
                 "_specagent_verify_plan_cache_evicted_ids", set()).add(oldest)
+        return SpecAgentPreparedLayerwiseBatch([segment])
+
+    def _specagent_prepare_with_weak_plan_cache(
+        self,
+        req_id: str,
+        plan: list[tuple[int, int, CacheEngineKey]],
+    ) -> Optional[SpecAgentPreparedLayerwiseBatch]:
+        """_specagent_prepare_with_plan_cache without pinning
+        (SPECAGENT_VERIFY_SCHED_FAST=1).
+
+        Entries keep no owner reference, so the CPU cache evicts as usual and
+        no token cap is needed (the pinned cache admitted one long-context
+        plan and served the rest uncached). A hit re-acquires the owners
+        through the backend under its lock (batched_get_blocking, the same
+        leases prepare_sparse_layerwise_plans takes) and requires the
+        identical live objects for every chunk; an evicted or re-stored
+        chunk is a miss. The cached borrowed layer columns and layer-0
+        sources are descriptors of those objects. A plan that keeps a subset
+        of the cached chunks (same (start, end, key) each, in order) hits on
+        that subset. Entries: SPECAGENT_VERIFY_PLAN_CACHE_MAX_REQS (16), LRU.
+        SPECAGENT_VERIFY_PLAN_CACHE_CHECK=1 compares every hit with a fresh
+        preparation.
+        """
+        from collections import OrderedDict
+
+        from lmcache.v1.specagent_bulk_view import (
+            layer0_sources,
+            subset_layer_columns,
+        )
+
+        cache = getattr(self, "_specagent_verify_weak_plan_cache", None)
+        if cache is None:
+            cache = self._specagent_verify_weak_plan_cache = OrderedDict()
+        stats = vars(builtins).setdefault(
+            "_specagent_verify_plan_cache_stats",
+            {"hit": 0, "miss": 0, "replace": 0, "evict": 0, "uncacheable": 0},
+        )
+        stats["calls"] = stats.get("calls", 0) + 1
+        stats["weak"] = 1
+        sig = tuple((int(s), int(e), k) for s, e, k in plan)
+        entry = cache.get(req_id)
+        idx: Optional[list[int]] = None
+        if entry is not None and sig:
+            if entry["sig"] == sig:
+                idx = list(range(len(sig)))
+            else:
+                pos = entry.get("pos")
+                if pos is None:
+                    pos = entry["pos"] = {c: i for i, c in enumerate(entry["sig"])}
+                cand = [pos.get(c) for c in sig]
+                if None not in cand and all(
+                    a < b for a, b in zip(cand, cand[1:])
+                ):
+                    idx = cand  # type: ignore[assignment]
+        if idx is not None:
+            assert entry is not None
+            backend = self.storage_manager.storage_backends.get(entry["location"])
+            owners = None
+            if backend is not None and hasattr(backend, "batched_get_blocking"):
+                owners = backend.batched_get_blocking(
+                    [entry["owner_keys"][i] for i in idx])
+            cached_owners = entry["owners"]
+            if owners is not None and all(
+                o is not None and o is cached_owners[i] and o.is_valid()
+                for o, i in zip(owners, idx, strict=True)
+            ):
+                if len(idx) != len(entry["sig"]):
+                    entry["owners"] = [cached_owners[i] for i in idx]
+                    entry["owner_keys"] = [entry["owner_keys"][i] for i in idx]
+                    entry["columns"] = subset_layer_columns(entry["columns"], idx)
+                    entry["starts"] = [entry["starts"][i] for i in idx]
+                    entry["ends"] = [entry["ends"][i] for i in idx]
+                    entry["keys_by_chunk"] = [
+                        entry["keys_by_chunk"][i] for i in idx]
+                    l0 = entry.get("layer0")
+                    entry["layer0"] = None if l0 is None else (
+                        [l0[0][i] for i in idx], [l0[1][i] for i in idx])
+                    entry["sig"] = sig
+                    entry["pos"] = None
+                    stats["hit_subset"] = stats.get("hit_subset", 0) + 1
+                segment = SpecAgentPreparedLayerwiseSegment(
+                    starts=entry["starts"],
+                    ends=entry["ends"],
+                    keys_by_chunk=entry["keys_by_chunk"],
+                    location=entry["location"],
+                    memory_objs_by_layer=entry["columns"],
+                    source_owners=list(owners),
+                    layer0_sources=entry.get("layer0"),
+                )
+                cache.move_to_end(req_id)
+                entry["last"] = stats["calls"]
+                stats["hit"] += 1
+                if os.environ.get("SPECAGENT_VERIFY_PLAN_CACHE_CHECK") == "1":
+                    fresh = self.prepare_sparse_layerwise_plans([plan])
+                    try:
+                        if fresh is None:
+                            raise AssertionError(
+                                "weak plan cache hit but fresh plan is None")
+                        f = fresh.claim(0)
+                        same = (
+                            f.starts == segment.starts
+                            and f.ends == segment.ends
+                            and f.location == segment.location
+                            and len(f.source_owners or []) == len(segment.source_owners)
+                            and all(a is b for a, b in zip(
+                                f.source_owners or [], segment.source_owners))
+                            and len(f.memory_objs_by_layer) == len(segment.memory_objs_by_layer)
+                            and all(
+                                len(fc) == len(sc) and all(
+                                    fm is sm or (
+                                        hasattr(fm, "tensor")
+                                        and fm.tensor.data_ptr()
+                                        == sm.tensor.data_ptr())
+                                    for fm, sm in zip(fc, sc, strict=True))
+                                for fc, sc in zip(
+                                    f.memory_objs_by_layer[:2],
+                                    segment.memory_objs_by_layer[:2], strict=True))
+                        )
+                        f.release_source_owners()
+                        if not same:
+                            raise AssertionError(
+                                "[SpecAgent] weak verify plan cache mismatch")
+                    finally:
+                        if fresh is not None:
+                            fresh.release_unclaimed()
+                return SpecAgentPreparedLayerwiseBatch([segment])
+            if owners:
+                for o in owners:
+                    if o is not None:
+                        o.ref_count_down()
+            stats["why_changed"] = stats.get("why_changed", 0) + 1
+        elif entry is not None:
+            stats["why_sig"] = stats.get("why_sig", 0) + 1
+        else:
+            stats["why_new"] = stats.get("why_new", 0) + 1
+        if entry is not None:
+            cache.pop(req_id, None)
+            stats["replace"] += 1
+        stats["miss"] += 1
+        prepared = self.prepare_sparse_layerwise_plans([plan])
+        if prepared is None:
+            return None
+        segment = prepared.claim(0)
+        owners = segment.source_owners
+        if owners is None:
+            stats["uncacheable"] += 1
+            return SpecAgentPreparedLayerwiseBatch([segment])
+        layer0 = None
+        if segment.memory_objs_by_layer:
+            layer0 = layer0_sources(
+                segment.memory_objs_by_layer[0], self.num_layers)
+            segment.layer0_sources = layer0
+        owner_keys = [
+            chunk_key(keys.layer0() if isinstance(keys, _LazyLayerKeys) else keys[0])
+            for keys in segment.keys_by_chunk
+        ]
+        cache[req_id] = dict(
+            sig=sig, owners=list(owners), owner_keys=owner_keys,
+            columns=segment.memory_objs_by_layer,
+            starts=segment.starts, ends=segment.ends,
+            keys_by_chunk=segment.keys_by_chunk, location=segment.location,
+            layer0=layer0, last=stats["calls"], pos=None,
+        )
+        max_reqs = int(os.environ.get("SPECAGENT_VERIFY_PLAN_CACHE_MAX_REQS", "16"))
+        while len(cache) > max(1, max_reqs):
+            cache.popitem(last=False)
+            stats["evict"] += 1
         return SpecAgentPreparedLayerwiseBatch([segment])
 
     def _specagent_plan_cache_drop(self, req_id: str) -> None:
@@ -2557,7 +2767,12 @@ class LMCacheEngine:
                         tokens=tokens, mask=mask, request_configs=request_configs,
                         mask_num_falses=int(specagent_prefix_tokens) if specagent_fast_path else None,
                     ))
-                if os.environ.get("SPECAGENT_VERIFY_PLAN_CACHE") == "1":
+                if (os.environ.get("SPECAGENT_VERIFY_PLAN_CACHE") == "1"
+                        and os.environ.get("SPECAGENT_VERIFY_SCHED_FAST") == "1"):
+                    prepared = self._specagent_prepare_with_weak_plan_cache(
+                        str(req_id), plan
+                    )
+                elif os.environ.get("SPECAGENT_VERIFY_PLAN_CACHE") == "1":
                     prepared = self._specagent_prepare_with_plan_cache(
                         str(req_id), plan
                     )
@@ -2711,6 +2926,9 @@ class LMCacheEngine:
                 ):
                     assert_layerwise_gpu_connector(self.gpu_connector)
 
+                    _sa_l0 = getattr(prepared_segment, "layer0_sources", None)
+                    if _sa_l0 is not None:
+                        kwargs["specagent_layer0_sources"] = _sa_l0
                     mem_obj_consumer = self.gpu_connector.batched_to_gpu(
                         starts, ends, **kwargs
                     )
