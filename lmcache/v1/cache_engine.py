@@ -1353,6 +1353,10 @@ class LMCacheEngine:
             else -1
         )
         merge_source_objs: Optional[List[MemoryObj]] = None
+        # Set when the merge target chunk is skipped below because every layer
+        # of it is already in CPU: an earlier save of this same observation
+        # (e.g. before a preemption) already wrote it merged.
+        merge_target_stored = False
         if merge_chunk_start >= 0:
             source_key = None
             source_start = source_end = -1
@@ -1411,6 +1415,8 @@ class LMCacheEngine:
                 self.storage_manager.contains(key_layer, self.retrieve_locations)
                 for key_layer in ([key] if grouped_layers else keys_multi_layer)
             ):
+                if start == merge_chunk_start:
+                    merge_target_stored = True
                 continue
 
             # Allocate the memory object
@@ -1545,7 +1551,7 @@ class LMCacheEngine:
                         merged = True
                         break
                     source_obj.ref_count_down()
-                    if not merged:
+                    if not merged and not merge_target_stored:
                         raise RuntimeError(
                             "SpecAgent observation-tail target chunk was not "
                             f"scheduled: req={req_id} layer={layer_id} "
@@ -1653,6 +1659,11 @@ class LMCacheEngine:
                 tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
             )
         else:
+            if merge_source_objs is not None:
+                # Nothing to store, so no commit_layer releases the merge
+                # sources fetched above.
+                for obj in merge_source_objs:
+                    obj.ref_count_down()
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
             for layer_id in range(self.num_layers):
