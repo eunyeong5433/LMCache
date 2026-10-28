@@ -99,6 +99,7 @@ class SpecAgentNativeBulkGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ends,
                 kvcaches=kvcaches,
                 slot_mapping=masked_slots,
+                link_delay_path="paged_restore",
             )
         finally:
             # A later chunk can fail after an earlier async copy was submitted.

@@ -34,6 +34,17 @@ from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 
+# Emulated slower CPU<->GPU link (PCIe experiment, 2026-10-29): the vLLM module
+# vllm.v1.specagent.link_delay owns the factor, the delay formula, the kernel
+# and the counters. With the default factor 1 nothing below is imported.
+_LINK_DELAY = float(os.environ.get("SPECAGENT_LINK_FACTOR", "1") or 1) > 1.0
+
+
+def _link_delay():
+    from vllm.v1.specagent import link_delay
+
+    return link_delay
+
 if torch.cuda.is_available():
     # First Party
     import lmcache.c_ops as lmc_ops
@@ -600,16 +611,39 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             # NOTE: for better performance, we may not want to sync for every
             # memory object
             self.store_stream.synchronize()
+            if _LINK_DELAY:
+                # Emulated slower link: the D2H of this chunk is complete; the
+                # slot mapping never holds -1 here (see the docstring).
+                tokens = end - start
+                _link_delay().stall("store", tokens, tokens * self._link_bytes_per_token(memory_obj))
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        link_path = kwargs.pop("link_delay_path", "restore")
+        moved = None
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
+            if _LINK_DELAY and memory_objs:
+                # Tokens the H2D kernel read: slots >= 0 past the vLLM-cached
+                # prefix, the same test the kernel applies (mem_kernels.cu).
+                slot_mapping = kwargs["slot_mapping"]
+                vllm_cached = kwargs.get("vllm_cached_tokens", 0)
+                moved = sum(
+                    (slot_mapping[start + min(end - start, max(0, vllm_cached - start)):end] >= 0).sum()
+                    for start, end in zip(starts, ends, strict=False)
+                )
         self.load_stream.synchronize()
+        if moved is not None:
+            tokens = int(moved.item())
+            _link_delay().stall(link_path, tokens, tokens * self._link_bytes_per_token(memory_objs[0]))
+
+    def _link_bytes_per_token(self, memory_obj: MemoryObj) -> int:
+        """KV bytes of one token over all layers ([2, L, T, D] objects)."""
+        return 2 * self.num_layers * self.hidden_dim_size * memory_obj.tensor.element_size()
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
@@ -1945,6 +1979,17 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         mapping = plan["slot_mapping"]
                         direct_mappings.append(mapping[base:] if base else mapping)
                         start = end
+            if _LINK_DELAY:
+                # Emulated slower link, enqueued ahead of the scatter on the
+                # same stream: the ready event recorded after the scatter
+                # then covers copy + delay. Each plan's mapping holds every
+                # token of the plan once, -1 where the token is resident.
+                with torch.cuda.stream(self.load_stream):
+                    for plan in plans:
+                        _link_delay().delay_slots(
+                            "fetch_eager", plan["slot_mapping"],
+                            2 * self.hidden_dim_size * plan["target_kv_cache"].element_size(),
+                        )
             direct_submit(
                 direct_sources,
                 direct_offsets,
