@@ -1985,6 +1985,14 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 # then covers copy + delay. Each plan's mapping holds every
                 # token of the plan once, -1 where the token is resident.
                 with torch.cuda.stream(self.load_stream):
+                    # The submit op waits for the scratch ring slot before
+                    # its copy. Enqueued ahead of that wait, the delay ran
+                    # while the slot was still busy and overlapped the wait
+                    # (max instead of sum, 2026-10-29); wait first, so the
+                    # emulated link time adds to the copy as on the graph
+                    # path.
+                    if scratch_free_event is not None:
+                        self.load_stream.wait_event(scratch_free_event)
                     for plan in plans:
                         _link_delay().delay_slots(
                             "fetch_eager", plan["slot_mapping"],
