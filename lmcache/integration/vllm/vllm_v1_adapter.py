@@ -37,6 +37,7 @@ import torch
 # Use LMCache's own math utilities instead of vllm's
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
 from lmcache import utils
+from lmcache.integration.vllm.specagent_external_load import SpecAgentExternalLoad
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
@@ -778,6 +779,7 @@ class ReqMeta:
 @dataclass
 class LMCacheConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta] = field(default_factory=list)
+    specagent_external_loads: list[SpecAgentExternalLoad] = field(default_factory=list)
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -1261,6 +1263,16 @@ class LMCacheConnectorV1Impl:
             return
 
         assert self.lmcache_engine is not None
+        # An observation scratch LoadSpec describes only CPU-snapshot holes.
+        # Preserve accepted external tokens in their existing paged slots;
+        # scheduler residency includes this synchronous load's promise.
+        for external_load in metadata.specagent_external_loads:
+            external_load.restore(
+                self.lmcache_engine,
+                kvcaches,
+                self._lmcache_chunk_size,
+                layerwise=self.use_layerwise,
+            )
         if sa_scratch_reuse_event is not None:
             load_stream = getattr(
                 getattr(self.lmcache_engine, "gpu_connector", None),
@@ -4566,6 +4578,24 @@ class LMCacheConnectorV1Impl:
         specagent_fetch_reqs = (
             getattr(scheduler_output, "specagent_fetch_reqs", None) or {}
         )
+        external_ranges = (
+            getattr(scheduler_output, "specagent_external_loads", None) or {}
+        )
+        external_sources: dict[str, int] = {}
+        for req_id, (start, end) in external_ranges.items():
+            original = self.load_specs.get(req_id)
+            if not (
+                req_id in specagent_fetch_reqs
+                and original is not None
+                and original.can_load
+                and original.vllm_cached_tokens == start
+                and start < end <= original.lmcache_cached_tokens
+            ):
+                raise RuntimeError(
+                    f"SpecAgent external load lacks an admitted LoadSpec: {req_id}"
+                )
+            # Snapshot before the scratch override pops/replaces LoadSpec.
+            external_sources[req_id] = original.lmcache_cached_tokens
         specagent_token_counts = (
             getattr(scheduler_output, "specagent_fetch_token_counts", None) or {}
         )
@@ -5576,6 +5606,31 @@ class LMCacheConnectorV1Impl:
             builtins, "_lmc_ms_tracker_loop", 0.0) + (
             time.perf_counter() - _tl_t0) * 1000.0
         emit_missing_specagent_fetch_meta()
+        for req_id, source_end in external_sources.items():
+            tracker = self._request_trackers.get(req_id)
+            if tracker is None or len(tracker.token_ids) < source_end:
+                raise RuntimeError(
+                    f"SpecAgent external load has incomplete tokens: {req_id}"
+                )
+            tokens = tracker.token_ids[:source_end]
+            if tracker.mm_hashes:
+                token_tensor = torch.tensor(tokens)
+                apply_mm_hashes_to_token_ids(
+                    token_tensor, tracker.mm_hashes, tracker.mm_positions
+                )
+                tokens = token_tensor.tolist()
+            start, end = external_ranges[req_id]
+            meta.specagent_external_loads.append(
+                SpecAgentExternalLoad(
+                    req_id=req_id,
+                    token_ids=tokens,
+                    block_ids=list(tracker.allocated_block_ids),
+                    block_size=self._block_size,
+                    start=start,
+                    end=end,
+                    request_configs=tracker.request_configs,
+                )
+            )
         return meta
 
     @_lmcache_nvtx_annotate
