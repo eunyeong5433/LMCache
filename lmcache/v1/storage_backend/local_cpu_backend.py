@@ -29,6 +29,7 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
+from lmcache.v1 import specagent_job_free as _sa_jobfree
 from lmcache.v1.system_detection import NUMADetector, SystemMemoryDetector
 
 if TYPE_CHECKING:
@@ -711,6 +712,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
         if os.environ.get("SPECAGENT_CPU_PRESSURE_LOG") == "1":
             _specagent_note_cpu_pressure(evict_keys_count, memory_obj is None)
+        _sa_jobfree.note_cpu_alloc(evict_keys_count, memory_obj is None)
         return memory_obj
 
     @_lmcache_nvtx_annotate
@@ -842,6 +844,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
         if os.environ.get("SPECAGENT_CPU_PRESSURE_LOG") == "1":
             _specagent_note_cpu_pressure(evict_keys_count, memory_objs is None)
+        _sa_jobfree.note_cpu_alloc(evict_keys_count, memory_objs is None)
         return memory_objs
 
     def get_full_chunk_size_bytes(self) -> int:

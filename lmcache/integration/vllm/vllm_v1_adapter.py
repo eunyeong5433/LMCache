@@ -37,6 +37,7 @@ import torch
 # Use LMCache's own math utilities instead of vllm's
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
 from lmcache import utils
+from lmcache.v1 import specagent_job_free as _sa_jobfree
 from lmcache.integration.vllm.specagent_external_load import SpecAgentExternalLoad
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
@@ -780,6 +781,11 @@ class ReqMeta:
 class LMCacheConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta] = field(default_factory=list)
     specagent_external_loads: list[SpecAgentExternalLoad] = field(default_factory=list)
+    # Finished-task CPU KV drop (lmcache.v1.specagent_job_free): the job of
+    # every request in this step's metadata, and jobs whose last request has
+    # released its blocks (its turn-end save is complete).
+    specagent_req_jobs: dict[str, str] = field(default_factory=dict)
+    specagent_free_jobs: list[str] = field(default_factory=list)
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -789,6 +795,39 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
             req_meta (ReqMeta): the request metadata.
         """
         self.requests.append(req_meta)
+
+
+def _specagent_worker_sync_jobs(impl) -> Optional["LMCacheConnectorMetadata"]:
+    """Worker side: take this step's request -> job map (and each new job's
+    first token ids for the common-prefix bound); lmcache specagent_job_free."""
+    parent = getattr(impl, "_parent", None)
+    try:
+        meta = parent._get_connector_metadata()
+    except Exception:
+        return None
+    if not isinstance(meta, LMCacheConnectorMetadata):
+        return None
+    engine = getattr(impl, "lmcache_engine", None)
+    if meta.specagent_req_jobs and engine is not None:
+        _sa_jobfree.registry_for(engine).note_requests(
+            meta.specagent_req_jobs,
+            {r.req_id: r.token_ids for r in meta.requests},
+        )
+    return meta
+
+
+def _specagent_worker_free_jobs(impl, meta) -> None:
+    """Worker side, end of a step: drop the CPU KV of finished jobs."""
+    if meta is None or not meta.specagent_free_jobs:
+        return
+    engine = getattr(impl, "lmcache_engine", None)
+    if engine is None:
+        return
+    # Any async save of this step must be published before removal.
+    impl._specagent_join_save_futures()
+    reg = _sa_jobfree.registry_for(engine)
+    for job in meta.specagent_free_jobs:
+        reg.free(job, engine.storage_manager)
 
 
 @dataclass
@@ -1194,6 +1233,7 @@ class LMCacheConnectorV1Impl:
             record_function_or_nullcontext if detailed_nvtx else nullcontext
         )
         self.current_layer = 0
+        _specagent_worker_sync_jobs(self)
         with detail_record("lmcache adapter detail: join_prefetch_future"):
             self._specagent_join_prefetch_future()
         with detail_record("lmcache adapter detail: join_save_futures"):
@@ -3703,6 +3743,7 @@ class LMCacheConnectorV1Impl:
         )
         t0 = time.perf_counter() if timing or verify_sync_active else 0.0
 
+        _specagent_worker_sync_jobs(self)
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
@@ -4131,6 +4172,8 @@ class LMCacheConnectorV1Impl:
                         )
         finished_sending = set(self._specagent_finished_save_completed)
         self._specagent_finished_save_completed.clear()
+        # Finished tasks: drop their CPU KV after this step's stores.
+        _specagent_worker_free_jobs(self, _specagent_worker_sync_jobs(self))
         return finished_sending or None, None
 
     def build_connector_worker_meta(
@@ -4228,6 +4271,7 @@ class LMCacheConnectorV1Impl:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
+        self.specagent_note_request_job(request)
         timing = _specagent_timing_enabled()
         t0 = time.perf_counter() if timing else 0.0
         lookup_cached = False
@@ -4560,6 +4604,54 @@ class LMCacheConnectorV1Impl:
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(
+        self, scheduler_output: SchedulerOutput
+    ) -> KVConnectorMetadata:
+        meta = self._build_connector_meta_inner(scheduler_output)
+        if isinstance(meta, LMCacheConnectorMetadata):
+            req_job = getattr(self, "_sa_req_job", None) or {}
+            if req_job:
+                req_ids = [r.req_id for r in meta.requests]
+                req_ids += [x.req_id for x in meta.specagent_external_loads]
+                meta.specagent_req_jobs = {
+                    rid: req_job[rid] for rid in req_ids if rid in req_job
+                }
+            pending = getattr(self, "_sa_pending_free_jobs", None)
+            if pending:
+                meta.specagent_free_jobs = list(pending)
+                pending.clear()
+        return meta
+
+    def specagent_note_request_job(self, request: "Request") -> None:
+        """Scheduler side: remember the job of a request this connector sees."""
+        job = getattr(request, "job_id", None)
+        if job is None:
+            return
+        if not hasattr(self, "_sa_req_job"):
+            self._sa_req_job: dict[str, str] = {}
+            self._sa_job_req_ids: dict[str, set[str]] = {}
+        self._sa_req_job[request.request_id] = str(job)
+        self._sa_job_req_ids.setdefault(str(job), set()).add(request.request_id)
+
+    def specagent_job_finished(self, job_id: str) -> None:
+        """Scheduler side: the job's last request released its blocks, so its
+        turn-end CPU save is complete; the worker drops the job's CPU KV at the
+        end of the next step."""
+        job = str(job_id)
+        done = getattr(self, "_sa_finished_jobs", None)
+        if done is None:
+            done = self._sa_finished_jobs = set()
+            self._sa_pending_free_jobs: list[str] = []
+        if job in done:
+            return
+        done.add(job)
+        self._sa_pending_free_jobs.append(job)
+        # The request ids stay mapped until this meta is built; the worker
+        # drops its own copy when it frees the job.
+        for rid in getattr(self, "_sa_job_req_ids", {}).pop(job, ()):
+            if rid not in getattr(self, "_specagent_finished_save_metas", {}):
+                self._sa_req_job.pop(rid, None)
+
+    def _build_connector_meta_inner(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         """Attach the connector metadata to the request object.
@@ -5639,6 +5731,7 @@ class LMCacheConnectorV1Impl:
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
+        self.specagent_note_request_job(request)
         # Layerwise save uses request-scoped generators. If request finishes
         # without entering wait_for_save (abort/error/evict path), make sure
         # we release the generator entry to avoid leaking state.

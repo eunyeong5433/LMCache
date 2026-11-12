@@ -37,6 +37,7 @@ from lmcache.logging import init_logger
 from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
 from lmcache.usage_context import InitializeUsageContext
 from lmcache.v1.specagent_layer_group import LayerGroup, chunk_key
+from lmcache.v1 import specagent_job_free as _sa_jobfree
 from lmcache.v1.specagent_bulk_view import (
     BorrowedBulkLayerView, acquire_bulk_layer_views, borrow_bulk_layer_views,
     merge_native_bulk_prefix,
@@ -1221,6 +1222,7 @@ class LMCacheEngine:
 
         with store_stats.profile_put():
             transfer_spec = kwargs.get("transfer_spec", None)
+            _sa_sizes = [mo.get_size() for mo in memory_objs]
             # TODO: we implicitly rely on batched_put to call ref_count_down
             # this management should be done in a cleaner way
             self.storage_manager.batched_put(
@@ -1229,6 +1231,10 @@ class LMCacheEngine:
                 transfer_spec=transfer_spec,
                 location=self.store_location,
             )
+            # Record the chunks under the storing request's job so they can be
+            # dropped when the task finishes (specagent_job_free).
+            _sa_jobfree.registry_for(self).register(
+                kwargs.get("req_id"), keys, ends, _sa_sizes)
 
         if getattr(self, "native_bulk_spec", False) or os.environ.get("SPECAGENT_BULK_CPU_PROOF") == "1":
             if tokens is None:
@@ -1563,9 +1569,12 @@ class LMCacheEngine:
                     f"chunks={len(keys[layer_id])}"
                 ):
                     if not grouped_layers:
+                        _sa_sizes = [mo.get_size() for mo in memory_objs[layer_id]]
                         self.storage_manager.batched_put(
                             keys[layer_id], memory_objs[layer_id], location=self.store_location,
                         )
+                        _sa_jobfree.registry_for(self).register(
+                            req_id, keys[layer_id], ends, _sa_sizes)
                 with _lmc_record(
                     "lmcache store_layer: fingerprint "
                     f"req={req_id} layer={layer_id} "
@@ -1594,9 +1603,15 @@ class LMCacheEngine:
                         # One owner consumes the initial reference of each child;
                         # layer readers acquire independent references on demand.
                         groups = [LayerGroup(list(objects)) for objects in zip(*memory_objs, strict=True)]
+                        _sa_sizes = [
+                            sum(mo.get_size() for mo in objects)
+                            for objects in zip(*memory_objs, strict=True)
+                        ]
                         self.storage_manager.batched_put(
                             group_keys, groups, location=self.store_location,
                         )
+                        _sa_jobfree.registry_for(self).register(
+                            req_id, group_keys, ends, _sa_sizes)
                     with _lmc_record(
                         "lmcache store_layer: cpu_store_proof "
                         f"req={req_id} layer={layer_id} "
