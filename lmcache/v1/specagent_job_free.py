@@ -25,6 +25,8 @@ from typing import Any, Iterable, Optional
 _STATS_KEYS = (
     "evicted",  # keys LRU-evicted by CPU allocation (any nonzero = pressure)
     "alloc_failed",  # CPU allocations that failed even after eviction
+    "finish_reported",  # scheduler: jobs whose last request released its blocks
+    "free_sent",  # scheduler: of those, sent to the worker (a step ran after)
     "freed_jobs",
     "freed_keys",
     "freed_bytes",

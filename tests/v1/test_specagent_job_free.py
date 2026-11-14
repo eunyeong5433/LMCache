@@ -141,8 +141,10 @@ def test_adapter_wiring_scheduler_to_worker():
     sched.specagent_job_finished("A")
     sched.specagent_job_finished("A")  # deduplicated
     sched._build_connector_meta_inner = lambda out: inner(out, [])
+    assert jf.stats()["finish_reported"] == 1 and jf.stats()["free_sent"] == 0
     meta2 = sched.build_connector_meta(None)
     assert meta2.specagent_free_jobs == ["A"]
+    assert jf.stats()["free_sent"] == 1
     assert "ra" not in sched._sa_req_job and "rb" in sched._sa_req_job
     meta3 = sched.build_connector_meta(None)
     assert meta3.specagent_free_jobs == []

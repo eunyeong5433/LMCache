@@ -4618,6 +4618,7 @@ class LMCacheConnectorV1Impl:
             pending = getattr(self, "_sa_pending_free_jobs", None)
             if pending:
                 meta.specagent_free_jobs = list(pending)
+                _sa_jobfree.stats()["free_sent"] += len(pending)
                 pending.clear()
         return meta
 
@@ -4645,6 +4646,9 @@ class LMCacheConnectorV1Impl:
             return
         done.add(job)
         self._sa_pending_free_jobs.append(job)
+        # A job finishing after the engine's last step stays queued until a
+        # later step (finish_reported - free_sent at an idle engine).
+        _sa_jobfree.stats()["finish_reported"] += 1
         # The request ids stay mapped until this meta is built; the worker
         # drops its own copy when it frees the job.
         for rid in getattr(self, "_sa_job_req_ids", {}).pop(job, ()):
