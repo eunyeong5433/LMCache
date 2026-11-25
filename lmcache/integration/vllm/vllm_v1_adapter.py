@@ -4719,6 +4719,9 @@ class LMCacheConnectorV1Impl:
         specagent_current_block_ids = (
             getattr(scheduler_output, "specagent_current_block_ids", None) or {}
         )
+        specagent_obs_prefill_starts = (
+            getattr(scheduler_output, "specagent_obs_prefill_starts", None) or {}
+        )
         emitted_req_ids: set[str] = set()
         specagent_scratch_safe_suffix_starts: dict[str, int] = {}
         specagent_scratch_merge_prefix_starts: dict[str, int] = {}
@@ -4887,6 +4890,14 @@ class LMCacheConnectorV1Impl:
                 safe_suffix_start = max(
                     0, len(request_tracker.token_ids) - n_scheduled,
                 )
+                # An observation prefill that took several steps: the earlier
+                # steps wrote their tokens into paged slots too and were not
+                # saved then, so the safe range starts where the prefill began.
+                prefill_start = specagent_obs_prefill_starts.get(req_id)
+                if prefill_start is not None:
+                    safe_suffix_start = min(
+                        safe_suffix_start, max(0, int(prefill_start)),
+                    )
 
             min_save_start = max(old_saved_tokens, safe_suffix_start)
             specagent_scratch_safe_suffix_starts[req_id] = int(
